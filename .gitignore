@@ -1,5 +1,7 @@
 node_modules/
-dist/
-*.tgz
-.env
-config.env
+.DS_Store
+*.log
+coverage/
+.nyc_output/
+.tmp/
+ref/
