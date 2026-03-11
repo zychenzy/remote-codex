@@ -2,7 +2,7 @@
 
 ## Local setup
 
-1. Use Node.js 20+.
+1. Use Node.js 24 LTS+.
 2. Run `npm test` before opening a PR.
 3. Use `npm run tool -- setup` for local daemon configuration.
 

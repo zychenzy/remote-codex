@@ -19,7 +19,7 @@ This repository contains an IM-first Codex remote-control daemon.
 
 ## Development workflow
 
-1. Use Node.js 20+.
+1. Use Node.js 24 LTS+.
 2. Run tests with `npm test` after changes.
 3. Keep interfaces stable between modules:
 - `RuntimeEngine`
