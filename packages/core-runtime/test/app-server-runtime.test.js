@@ -50,3 +50,71 @@ test("runtime emits notification events during turn flow", async () => {
 
   await runtime.stop();
 });
+
+test("runtime exposes extended thread, review, model, and skills wrappers", async () => {
+  const runtime = buildRuntime();
+  await runtime.initialize();
+
+  const started = await runtime.startThread({ cwd: process.cwd() });
+  const threadId = started.thread.id;
+
+  const read = await runtime.readThread({ threadId, includeTurns: false });
+  assert.equal(read.thread.id, threadId);
+
+  const forked = await runtime.forkThread({ threadId, ephemeral: false });
+  assert.equal(typeof forked.thread.id, "string");
+
+  const loaded = await runtime.listLoadedThreads();
+  assert.equal(Array.isArray(loaded.data), true);
+
+  const unsubscribed = await runtime.unsubscribeThread(threadId);
+  assert.equal(typeof unsubscribed.status, "string");
+
+  const compacted = await runtime.compactThread(threadId);
+  assert.deepEqual(compacted, {});
+
+  const rolledBack = await runtime.rollbackThread({ threadId, numTurns: 1 });
+  assert.equal(rolledBack.thread.id, threadId);
+
+  const turn = await runtime.startTurn({ threadId, input: [{ type: "text", text: "hello again" }] });
+  const steer = await runtime.steerTurn({
+    threadId,
+    expectedTurnId: turn.turn.id,
+    input: [{ type: "text", text: "continue" }],
+  });
+  assert.equal(steer.turnId, turn.turn.id);
+
+  const review = await runtime.startReview({
+    threadId,
+    delivery: "inline",
+    target: { type: "uncommittedChanges" },
+  });
+  assert.equal(typeof review.turn.id, "string");
+
+  const models = await runtime.listModels({ limit: 10, includeHidden: false });
+  assert.equal(Array.isArray(models.data), true);
+  assert.equal(models.data.length >= 1, true);
+
+  const modes = await runtime.listCollaborationModes();
+  assert.equal(Array.isArray(modes.data), true);
+  assert.equal(modes.data.length >= 1, true);
+
+  const skills = await runtime.listSkills({
+    cwds: [process.cwd()],
+    forceReload: true,
+  });
+  assert.equal(Array.isArray(skills.data), true);
+  assert.equal(skills.data.length >= 1, true);
+
+  const skillWrite = await runtime.writeSkillConfig({
+    path: "/tmp/skill-creator/SKILL.md",
+    enabled: false,
+  });
+  assert.equal(skillWrite.ok, true);
+
+  await runtime.archiveThread(threadId);
+  const unarchived = await runtime.unarchiveThread(threadId);
+  assert.equal(unarchived.thread.id, threadId);
+
+  await runtime.stop();
+});

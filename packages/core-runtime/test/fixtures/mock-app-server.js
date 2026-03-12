@@ -41,7 +41,7 @@ rl.on("line", (line) => {
 
   if (method === "thread/start") {
     const id = `thread-${threadCounter++}`;
-    threads.set(id, { id, turns: [] });
+    threads.set(id, { id, cwd: msg.params?.cwd || process.cwd(), turns: [] });
     send({
       id: msg.id,
       result: {
@@ -81,9 +81,89 @@ rl.on("line", (line) => {
     send({
       id: msg.id,
       result: {
-        threads: [...threads.values()].map((t) => ({ id: t.id })),
+        threads: [...threads.values()].map((t) => ({ id: t.id, cwd: t.cwd || process.cwd(), status: { type: "idle" } })),
+        nextCursor: null,
       },
     });
+    return;
+  }
+
+  if (method === "thread/read") {
+    const id = msg.params?.threadId;
+    const includeTurns = Boolean(msg.params?.includeTurns);
+    if (!threads.has(id)) {
+      send({ id: msg.id, error: { code: -32600, message: "thread not found" } });
+      return;
+    }
+    const thread = threads.get(id);
+    send({
+      id: msg.id,
+      result: {
+        thread: {
+          id,
+          name: thread.name || null,
+          cwd: thread.cwd || process.cwd(),
+          status: { type: "idle" },
+          turns: includeTurns ? [...thread.turns] : undefined,
+        },
+      },
+    });
+    return;
+  }
+
+  if (method === "thread/fork") {
+    const sourceId = msg.params?.threadId;
+    if (!threads.has(sourceId)) {
+      send({ id: msg.id, error: { code: -32600, message: "thread not found" } });
+      return;
+    }
+    const id = `thread-${threadCounter++}`;
+    const source = threads.get(sourceId);
+    threads.set(id, { id, cwd: source.cwd || process.cwd(), turns: [...(source.turns || [])] });
+    send({ id: msg.id, result: { thread: { id, cwd: source.cwd || process.cwd() } } });
+    send({ method: "thread/started", params: { thread: { id } } });
+    return;
+  }
+
+  if (method === "thread/loaded/list") {
+    send({ id: msg.id, result: { data: [...threads.keys()] } });
+    return;
+  }
+
+  if (method === "thread/unsubscribe") {
+    send({ id: msg.id, result: { status: "unsubscribed" } });
+    send({ method: "thread/status/changed", params: { threadId: msg.params?.threadId, status: { type: "notLoaded" } } });
+    send({ method: "thread/closed", params: { threadId: msg.params?.threadId } });
+    return;
+  }
+
+  if (method === "thread/archive") {
+    send({ id: msg.id, result: {} });
+    send({ method: "thread/archived", params: { threadId: msg.params?.threadId } });
+    return;
+  }
+
+  if (method === "thread/unarchive") {
+    const id = msg.params?.threadId;
+    const thread = threads.get(id) || { id, cwd: process.cwd(), turns: [] };
+    threads.set(id, thread);
+    send({ id: msg.id, result: { thread: { id, cwd: thread.cwd || process.cwd() } } });
+    send({ method: "thread/unarchived", params: { threadId: id } });
+    return;
+  }
+
+  if (method === "thread/compact/start") {
+    send({ id: msg.id, result: {} });
+    return;
+  }
+
+  if (method === "thread/rollback") {
+    const id = msg.params?.threadId;
+    if (!threads.has(id)) {
+      send({ id: msg.id, error: { code: -32600, message: "thread not found" } });
+      return;
+    }
+    send({ id: msg.id, result: { thread: { id, name: null, ephemeral: false } } });
     return;
   }
 
@@ -95,6 +175,7 @@ rl.on("line", (line) => {
     }
 
     const turnId = `turn-${turnCounter++}`;
+    threads.get(threadId).turns.push({ id: turnId });
     send({ id: msg.id, result: { turn: { id: turnId, status: "inProgress" } } });
     send({ method: "turn/started", params: { threadId, turn: { id: turnId, status: "inProgress" } } });
 
@@ -119,8 +200,93 @@ rl.on("line", (line) => {
     return;
   }
 
+  if (method === "turn/steer") {
+    send({ id: msg.id, result: { turnId: msg.params?.expectedTurnId || null } });
+    return;
+  }
+
+  if (method === "review/start") {
+    const threadId = msg.params?.threadId;
+    if (!threads.has(threadId)) {
+      send({ id: msg.id, error: { code: -32600, message: "thread not found" } });
+      return;
+    }
+    const turnId = `turn-${turnCounter++}`;
+    send({
+      id: msg.id,
+      result: {
+        turn: { id: turnId, status: "inProgress", items: [], error: null },
+        reviewThreadId: threadId,
+      },
+    });
+    send({ method: "turn/started", params: { threadId, turn: { id: turnId, status: "inProgress" } } });
+    return;
+  }
+
   if (method === "turn/interrupt") {
     send({ id: msg.id, result: { ok: true } });
+    return;
+  }
+
+  if (method === "model/list") {
+    send({
+      id: msg.id,
+      result: {
+        data: [{
+          id: "gpt-5.4",
+          model: "gpt-5.4",
+          hidden: false,
+          isDefault: true,
+          supportedReasoningEfforts: [
+            { reasoningEffort: "low" },
+            { reasoningEffort: "medium" },
+            { reasoningEffort: "high" },
+          ],
+        }],
+        nextCursor: null,
+      },
+    });
+    return;
+  }
+
+  if (method === "collaborationMode/list") {
+    send({
+      id: msg.id,
+      result: {
+        data: [
+          { mode: "default" },
+          { mode: "plan" },
+        ],
+      },
+    });
+    return;
+  }
+
+  if (method === "skills/list") {
+    const cwd = msg.params?.cwds?.[0] || process.cwd();
+    send({
+      id: msg.id,
+      result: {
+        data: [{
+          cwd,
+          skills: [
+            {
+              name: "skill-creator",
+              path: "/tmp/skill-creator/SKILL.md",
+              enabled: true,
+              scope: "user",
+            },
+          ],
+          errors: [],
+        }],
+      },
+    });
+    return;
+  }
+
+  if (method === "skills/config/write") {
+    send({ id: msg.id, result: { ok: true, path: msg.params?.path, enabled: msg.params?.enabled } });
+    send({ method: "skills/changed", params: {} });
     return;
   }
 
