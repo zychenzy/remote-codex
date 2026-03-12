@@ -23,6 +23,12 @@ function toTextInput(input) {
   return [{ type: "text", text: input }];
 }
 
+function pickDefined(value) {
+  return Object.fromEntries(
+    Object.entries(value).filter(([, v]) => v !== undefined && v !== null)
+  );
+}
+
 export class AppServerRuntime {
   constructor({
     launchSpec,
@@ -74,30 +80,61 @@ export class AppServerRuntime {
     this.events.emit("ready", { initialized: true });
   }
 
-  async startThread({ cwd, approvalPolicy = "on-request", sandbox = "workspace-write", model = null } = {}) {
+  async startThread({
+    cwd,
+    approvalPolicy = "on-request",
+    sandbox = "workspace-write",
+    model = null,
+    personality = null,
+    serviceName = null,
+    persistExtendedHistory = null,
+    dynamicTools = null,
+  } = {}) {
     await this.initialize();
-    return this.rpc.request("thread/start", {
+    return this.rpc.request("thread/start", pickDefined({
       cwd,
       approvalPolicy,
       sandbox,
       model,
-    });
+      personality,
+      serviceName,
+      persistExtendedHistory,
+      dynamicTools,
+    }));
   }
 
-  async resumeThread(threadId) {
+  async resumeThread(threadId, overrides = {}) {
     await this.initialize();
-    return this.rpc.request("thread/resume", { threadId });
+    return this.rpc.request("thread/resume", pickDefined({ threadId, ...overrides }));
   }
 
-  async startTurn({ threadId, input, approvalPolicy = null, cwd = null, model = null } = {}) {
+  async startTurn({
+    threadId,
+    input,
+    approvalPolicy = null,
+    cwd = null,
+    model = null,
+    effort = null,
+    collaborationMode = null,
+    personality = null,
+    sandboxPolicy = null,
+    outputSchema = null,
+    summary = null,
+  } = {}) {
     await this.initialize();
-    return this.rpc.request("turn/start", {
+    return this.rpc.request("turn/start", pickDefined({
       threadId,
       input: Array.isArray(input) ? input : toTextInput(String(input || "")),
       approvalPolicy,
       cwd,
       model,
-    });
+      effort,
+      collaborationMode,
+      personality,
+      sandboxPolicy,
+      outputSchema,
+      summary,
+    }));
   }
 
   async steerTurn({ threadId, expectedTurnId, input } = {}) {
@@ -117,9 +154,104 @@ export class AppServerRuntime {
     });
   }
 
-  async listThreads({ limit = 50, archived = false } = {}) {
+  async listThreads({
+    cursor = null,
+    limit = 50,
+    archived = false,
+    sortKey = null,
+    modelProviders = null,
+    sourceKinds = null,
+    cwd = null,
+    searchTerm = null,
+  } = {}) {
     await this.initialize();
-    return this.rpc.request("thread/list", { limit, archived });
+    return this.rpc.request("thread/list", pickDefined({
+      cursor,
+      limit,
+      archived,
+      sortKey,
+      modelProviders,
+      sourceKinds,
+      cwd,
+      searchTerm,
+    }));
+  }
+
+  async archiveThread(threadId) {
+    await this.initialize();
+    return this.rpc.request("thread/archive", { threadId });
+  }
+
+  async unarchiveThread(threadId) {
+    await this.initialize();
+    return this.rpc.request("thread/unarchive", { threadId });
+  }
+
+  async readThread({ threadId, includeTurns = false } = {}) {
+    await this.initialize();
+    return this.rpc.request("thread/read", { threadId, includeTurns });
+  }
+
+  async forkThread({ threadId, ephemeral = false } = {}) {
+    await this.initialize();
+    return this.rpc.request("thread/fork", { threadId, ephemeral });
+  }
+
+  async listLoadedThreads({ cursor = null, limit = null } = {}) {
+    await this.initialize();
+    return this.rpc.request("thread/loaded/list", pickDefined({ cursor, limit }));
+  }
+
+  async unsubscribeThread(threadId) {
+    await this.initialize();
+    return this.rpc.request("thread/unsubscribe", { threadId });
+  }
+
+  async compactThread(threadId) {
+    await this.initialize();
+    return this.rpc.request("thread/compact/start", { threadId });
+  }
+
+  async rollbackThread({ threadId, numTurns = 1 } = {}) {
+    await this.initialize();
+    return this.rpc.request("thread/rollback", { threadId, numTurns });
+  }
+
+  async startReview({
+    threadId,
+    delivery = "inline",
+    target = { type: "uncommittedChanges" },
+  } = {}) {
+    await this.initialize();
+    return this.rpc.request("review/start", { threadId, delivery, target });
+  }
+
+  async listModels({ cursor = null, limit = 20, includeHidden = false } = {}) {
+    await this.initialize();
+    return this.rpc.request("model/list", pickDefined({ cursor, limit, includeHidden }));
+  }
+
+  async listCollaborationModes() {
+    await this.initialize();
+    return this.rpc.request("collaborationMode/list", {});
+  }
+
+  async listSkills({
+    cwds = null,
+    forceReload = false,
+    perCwdExtraUserRoots = null,
+  } = {}) {
+    await this.initialize();
+    return this.rpc.request("skills/list", pickDefined({
+      cwds,
+      forceReload,
+      perCwdExtraUserRoots,
+    }));
+  }
+
+  async writeSkillConfig({ path, enabled } = {}) {
+    await this.initialize();
+    return this.rpc.request("skills/config/write", { path, enabled });
   }
 
   async commandExec({ command, cwd = null } = {}) {

@@ -128,6 +128,10 @@ export class StateStore {
       allowlist: binding.policyProfile?.allowlist || existing.policyProfile?.allowlist || [],
       autoApprove: Boolean(binding.policyProfile?.autoApprove ?? existing.policyProfile?.autoApprove ?? false),
       desktopSyncEnabled: Boolean(binding.policyProfile?.desktopSyncEnabled ?? existing.policyProfile?.desktopSyncEnabled ?? false),
+      model: binding.policyProfile?.model ?? existing.policyProfile?.model ?? null,
+      reasoningEffort: binding.policyProfile?.reasoningEffort ?? existing.policyProfile?.reasoningEffort ?? null,
+      collaborationMode: binding.policyProfile?.collaborationMode ?? existing.policyProfile?.collaborationMode ?? null,
+      skillsContext: binding.policyProfile?.skillsContext ?? existing.policyProfile?.skillsContext ?? null,
     };
 
     const next = {

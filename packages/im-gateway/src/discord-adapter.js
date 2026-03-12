@@ -11,6 +11,7 @@ export class DiscordAdapter extends BaseAdapter {
     this.running = false;
     this.loopTimer = null;
     this.lastSeenByChannel = new Map();
+    this.invalidChannels = new Set();
   }
 
   async start() {
@@ -50,8 +51,12 @@ export class DiscordAdapter extends BaseAdapter {
       return;
     }
 
-    try {
-      for (const channelId of this.allowedChannels) {
+    for (const channelId of this.allowedChannels) {
+      if (this.invalidChannels.has(channelId)) {
+        continue;
+      }
+
+      try {
         const messages = await this.#api(`/channels/${channelId}/messages?limit=10`);
         const newestFirst = Array.isArray(messages) ? messages : [];
         const chronological = [...newestFirst].reverse();
@@ -83,9 +88,17 @@ export class DiscordAdapter extends BaseAdapter {
             raw: msg,
           });
         }
+      } catch (error) {
+        if (isUnknownChannelError(error)) {
+          this.invalidChannels.add(channelId);
+          this.logger.error(
+            `[discord] channel ${channelId} is invalid/inaccessible (code 10003). ` +
+            "Use the actual text-channel ID and restart daemon after updating config."
+          );
+          continue;
+        }
+        this.logger.error(`[discord] polling error for channel ${channelId}: ${error.message}`);
       }
-    } catch (error) {
-      this.logger.error(`[discord] polling error: ${error.message}`);
     }
 
     this.loopTimer = setTimeout(() => {
@@ -114,4 +127,9 @@ export class DiscordAdapter extends BaseAdapter {
 
     return response.json();
   }
+}
+
+function isUnknownChannelError(error) {
+  const message = String(error?.message || "");
+  return message.includes("failed: 404") && /"code"\s*:\s*10003/.test(message);
 }

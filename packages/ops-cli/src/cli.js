@@ -38,6 +38,7 @@ const store = new StateStore({ baseDir: BASE_DIR });
 
 const PID_FILE = path.join(store.runtimeDir, "daemon.pid");
 const STATUS_FILE = path.join(store.runtimeDir, "status.json");
+const DISCORD_API = "https://discord.com/api/v10";
 
 const HELP_TOPICS = {
   setup: {
@@ -77,10 +78,12 @@ const HELP_TOPICS = {
   },
   logs: {
     summary: "Show recent daemon logs.",
-    usage: "reco logs [lines]",
+    usage: "reco logs [lines] | reco logs chat [lines]",
     examples: [
       "reco logs",
       "reco logs 200",
+      "reco logs chat",
+      "reco logs chat 200",
     ],
   },
   doctor: {
@@ -95,8 +98,17 @@ const HELP_TOPICS = {
     usage: "reco bind <channel> [chatId] [--chat <id>] [--user <id>] [--cwd <dir>]",
     examples: [
       "reco bind discord",
+      "reco bind discord 123456789012345678",
       "reco bind discord 123456789012345678 --user 99887766",
       "reco bind telegram 123456 --user 123456 --cwd ~/code/my-repo",
+    ],
+  },
+  discord: {
+    summary: "Discord diagnostics helpers (list channels, verify configured channel IDs).",
+    usage: "reco discord <channels|verify>",
+    examples: [
+      "reco discord channels",
+      "reco discord verify",
     ],
   },
   unbind: {
@@ -122,11 +134,13 @@ const HELP_TOPICS = {
     ],
   },
   policy: {
-    summary: "Update binding policy options (approval mode, auto-approve, allowlist).",
-    usage: "reco policy set <channel> <chatId> [--approval <mode>] [--auto-approve <bool>] [--desktop-sync <bool>] [--allowlist <csv>]",
+    summary: "Update binding policy options (approval, model profile, allowlist, desktop sync).",
+    usage: "reco policy set <channel> <chatId> [--approval <mode>] [--auto-approve <bool>] [--desktop-sync <bool>] [--allowlist <csv>] [--model <id>] [--effort <level>] [--mode <name>]",
     examples: [
       "reco policy set discord 123456789012345678 --approval on-request --auto-approve false",
       "reco policy set telegram 123456 --allowlist 123456,789012",
+      "reco policy set discord 123456789012345678 --model gpt-5.3-codex",
+      "reco policy set discord 123456789012345678 --effort high --mode default",
     ],
   },
   help: {
@@ -142,7 +156,7 @@ const HELP_TOPICS = {
 function printGeneralHelp() {
   const ordered = [
     "setup", "start", "stop", "restart", "status", "logs", "doctor",
-    "bind", "unbind", "threads", "resume", "policy", "help",
+    "bind", "discord", "unbind", "threads", "resume", "policy", "help",
   ];
 
   console.log("reco - IM-first Codex remote control CLI");
@@ -159,6 +173,7 @@ function printGeneralHelp() {
   console.log("  reco setup");
   console.log("  reco start");
   console.log("  reco bind discord");
+  console.log("  reco discord channels");
   console.log("  reco policy set discord <chatId> --approval on-request");
   console.log("  reco help bind");
 }
@@ -392,8 +407,11 @@ async function cmdStatus() {
 }
 
 async function cmdLogs(args) {
-  const lines = Number(args[0] || 80);
-  const log = tailFile(path.join(store.logsDir, "daemon.log"), lines);
+  const chatMode = args[0] === "chat" || args[0] === "history";
+  const linesArg = chatMode ? args[1] : args[0];
+  const lines = Number.isFinite(Number(linesArg)) && Number(linesArg) > 0 ? Number(linesArg) : 80;
+  const target = chatMode ? path.join(store.logsDir, "chat-history.jsonl") : path.join(store.logsDir, "daemon.log");
+  const log = tailFile(target, lines);
   if (!log) {
     console.log("No logs yet.");
     return;
@@ -448,7 +466,103 @@ async function cmdBind(args) {
     },
   });
 
+  if (channel === "discord" && chatIdArg) {
+    const existingChannels = config.channels?.discord?.allowedChannels || [];
+    if (!existingChannels.includes(resolved.chatId)) {
+      const updatedConfig = {
+        ...config,
+        channels: {
+          ...config.channels,
+          discord: {
+            ...config.channels.discord,
+            allowedChannels: [resolved.chatId, ...existingChannels],
+          },
+        },
+      };
+      store.writeConfig(updatedConfig);
+    }
+  }
+
   console.log(JSON.stringify(binding, null, 2));
+}
+
+async function discordApi(token, path) {
+  const response = await fetch(`${DISCORD_API}${path}`, {
+    method: "GET",
+    headers: {
+      authorization: `Bot ${token}`,
+    },
+  });
+
+  const text = await response.text();
+  const payload = text ? JSON.parse(text) : null;
+  if (!response.ok) {
+    throw new Error(`discord ${path} failed: ${response.status} ${text}`);
+  }
+  return payload;
+}
+
+async function cmdDiscord(args) {
+  const sub = args[0];
+  const config = store.readConfig();
+  const token = config.channels?.discord?.botToken || "";
+  if (!token) {
+    console.log("Discord bot token missing. Run `reco setup` first.");
+    return;
+  }
+
+  if (sub === "channels") {
+    const guilds = await discordApi(token, "/users/@me/guilds?limit=200");
+    const rows = [];
+    for (const guild of guilds) {
+      const channels = await discordApi(token, `/guilds/${guild.id}/channels`);
+      for (const ch of channels) {
+        if (![0, 5].includes(ch.type)) {
+          continue;
+        }
+        rows.push({
+          guildId: String(guild.id),
+          guildName: guild.name,
+          channelId: String(ch.id),
+          channelName: ch.name || "(unnamed)",
+          type: ch.type === 0 ? "GUILD_TEXT" : "GUILD_ANNOUNCEMENT",
+        });
+      }
+    }
+    console.log(JSON.stringify({ channels: rows }, null, 2));
+    return;
+  }
+
+  if (sub === "verify") {
+    const ids = config.channels?.discord?.allowedChannels || [];
+    if (ids.length === 0) {
+      console.log("No Discord allowedChannels configured.");
+      return;
+    }
+
+    const checks = [];
+    for (const id of ids) {
+      try {
+        const ch = await discordApi(token, `/channels/${id}`);
+        checks.push({
+          channelId: String(id),
+          ok: true,
+          name: ch?.name || null,
+          guildId: ch?.guild_id || null,
+        });
+      } catch (error) {
+        checks.push({
+          channelId: String(id),
+          ok: false,
+          error: error.message,
+        });
+      }
+    }
+    console.log(JSON.stringify({ checks }, null, 2));
+    return;
+  }
+
+  console.log("Usage: reco discord <channels|verify>");
 }
 
 async function cmdUnbind(args) {
@@ -509,7 +623,7 @@ async function cmdThreads(args) {
 async function cmdPolicy(args) {
   const sub = args[0];
   if (sub !== "set") {
-    console.log("Usage: reco policy set <channel> <chatId> [--approval <mode>] [--auto-approve <bool>] [--desktop-sync <bool>] [--allowlist <csv>]");
+    console.log("Usage: reco policy set <channel> <chatId> [--approval <mode>] [--auto-approve <bool>] [--desktop-sync <bool>] [--allowlist <csv>] [--model <id>] [--effort <level>] [--mode <name>]");
     return;
   }
 
@@ -526,14 +640,30 @@ async function cmdPolicy(args) {
   const desktopSyncEnabled = toBoolean(getArgValue(args, "--desktop-sync", String(binding.policyProfile.desktopSyncEnabled)), binding.policyProfile.desktopSyncEnabled);
   const allowlistRaw = getArgValue(args, "--allowlist", null);
   const allowlist = allowlistRaw == null ? binding.policyProfile.allowlist : splitCsv(allowlistRaw);
+  const modelRaw = getArgValue(args, "--model", null);
+  const model = modelRaw == null ? (binding.policyProfile.model ?? null) : (String(modelRaw).trim() || null);
+  const effortRaw = getArgValue(args, "--effort", null);
+  const normalizedEffortRaw = effortRaw == null ? null : String(effortRaw).trim().toLowerCase();
+  const reasoningEffort = effortRaw == null
+    ? (binding.policyProfile.reasoningEffort ?? null)
+    : (["default", "auto"].includes(normalizedEffortRaw) ? null : (String(effortRaw).trim() || null));
+  const modeRaw = getArgValue(args, "--mode", null);
+  const normalizedModeRaw = modeRaw == null ? null : String(modeRaw).trim().toLowerCase();
+  const collaborationMode = modeRaw == null
+    ? (binding.policyProfile.collaborationMode ?? null)
+    : (["default", "auto"].includes(normalizedModeRaw) ? null : (String(modeRaw).trim() || null));
 
   const updated = store.upsertBinding({
     ...binding,
     policyProfile: {
+      ...binding.policyProfile,
       approvalMode,
       autoApprove,
       desktopSyncEnabled,
       allowlist,
+      model,
+      reasoningEffort,
+      collaborationMode,
     },
   });
 
@@ -583,6 +713,9 @@ async function main() {
       break;
     case "bind":
       await cmdBind(args);
+      break;
+    case "discord":
+      await cmdDiscord(args);
       break;
     case "unbind":
       await cmdUnbind(args);
