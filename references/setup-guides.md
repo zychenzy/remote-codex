@@ -39,6 +39,7 @@ When prompted:
 - `Discord bot token` -> paste token
 - `Discord allowlist user IDs` -> comma-separated user IDs
 - `Discord allowed channel IDs for polling` -> comma-separated channel IDs
+- `Default working directory` -> press Enter to use home directory (`~`) or set your own
 
 6. Start daemon and verify.
 
@@ -57,6 +58,12 @@ If there is no response, run:
 
 ```bash
 npm run tool -- doctor
+```
+
+If you change config later, restart daemon:
+
+```bash
+npm run tool -- restart
 ```
 
 ## Bind shortcut after setup
@@ -78,3 +85,16 @@ npm run tool -- bind discord <channelId>
 # or
 npm run tool -- bind discord --chat <channelId>
 ```
+
+## Update workspace directory from Discord chat
+
+Use slash command:
+
+```text
+/cwd ~/code/my-repo
+```
+
+Notes:
+- `~` is expanded to your home directory.
+- Relative paths are resolved from current binding workspace.
+- Path must exist and be a directory.

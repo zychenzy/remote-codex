@@ -10,6 +10,7 @@
     "tool": "node ./packages/ops-cli/src/cli.js",
     "start": "node ./packages/ops-cli/src/cli.js start",
     "stop": "node ./packages/ops-cli/src/cli.js stop",
+    "restart": "node ./packages/ops-cli/src/cli.js restart",
     "status": "node ./packages/ops-cli/src/cli.js status",
     "doctor": "node ./packages/ops-cli/src/cli.js doctor",
     "test": "node --test packages/*/test/*.test.js"

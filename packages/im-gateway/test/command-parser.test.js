@@ -21,3 +21,9 @@ test("parser handles approve command", () => {
   assert.equal(result.requestId, "req-1");
   assert.equal(result.decision, "allow");
 });
+
+test("parser handles cwd command", () => {
+  const result = parseIncomingCommand("/cwd ~/projects/demo");
+  assert.equal(result.type, "cwd");
+  assert.equal(result.path, "~/projects/demo");
+});

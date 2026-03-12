@@ -212,6 +212,24 @@ async function cmdStop() {
   console.log(`Sent SIGTERM to daemon pid ${pid}`);
 }
 
+async function cmdRestart() {
+  const existingPid = readPid();
+  if (existingPid && isPidRunning(existingPid)) {
+    process.kill(existingPid, "SIGTERM");
+    console.log(`Sent SIGTERM to daemon pid ${existingPid}`);
+
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      if (!isPidRunning(existingPid)) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
+
+  await cmdStart();
+}
+
 async function cmdStatus() {
   const status = readStatus();
   const pid = readPid();
@@ -393,6 +411,9 @@ async function main() {
     case "stop":
       await cmdStop();
       break;
+    case "restart":
+      await cmdRestart();
+      break;
     case "status":
       await cmdStatus();
       break;
@@ -425,7 +446,7 @@ async function main() {
       await cmdPolicy(args);
       break;
     default:
-      console.log("Usage: tool <setup|start|stop|status|logs|doctor|bind|unbind|threads|resume|policy>");
+      console.log("Usage: tool <setup|start|stop|restart|status|logs|doctor|bind|unbind|threads|resume|policy>");
   }
 }
 

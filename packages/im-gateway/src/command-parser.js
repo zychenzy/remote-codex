@@ -38,5 +38,9 @@ export function parseIncomingCommand(text = "") {
     return { type: "status" };
   }
 
+  if (cmd === "/cwd" || cmd === "/workspace") {
+    return { type: "cwd", path: trimmed.slice(parts[0].length).trim() };
+  }
+
   return { type: "unknown", raw: trimmed };
 }

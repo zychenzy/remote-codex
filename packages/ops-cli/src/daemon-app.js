@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 
@@ -43,6 +45,31 @@ function makeLaunchSpec(config) {
   }
 
   return null;
+}
+
+function resolveWorkspacePath(inputPath, currentWorkingDir) {
+  const trimmed = String(inputPath || "").trim();
+  if (!trimmed) {
+    return { value: currentWorkingDir };
+  }
+
+  let candidate = trimmed;
+  if (candidate.startsWith("~")) {
+    candidate = path.join(os.homedir(), candidate.slice(1));
+  } else if (!path.isAbsolute(candidate)) {
+    candidate = path.resolve(currentWorkingDir, candidate);
+  }
+
+  try {
+    const stat = fs.statSync(candidate);
+    if (!stat.isDirectory()) {
+      return { error: `Not a directory: ${candidate}` };
+    }
+  } catch {
+    return { error: `Directory does not exist: ${candidate}` };
+  }
+
+  return { value: candidate };
 }
 
 export class DaemonApp {
@@ -265,6 +292,7 @@ export class DaemonApp {
       await adapter.sendMessage(context, [
         `Binding: ${bKey}`,
         `Thread: ${binding.threadId || "none"}`,
+        `Workspace: ${binding.workingDir}`,
         `Active turn: ${active || "none"}`,
         `Pending approvals: ${pending}`,
       ].join("\n"));
@@ -334,6 +362,24 @@ export class DaemonApp {
       return;
     }
 
+    if (command.type === "cwd") {
+      const resolved = resolveWorkspacePath(command.path, binding.workingDir);
+      if (resolved.error) {
+        await adapter.sendMessage(context, resolved.error);
+        return;
+      }
+
+      const updated = this.store.upsertBinding({
+        ...binding,
+        workingDir: resolved.value,
+      });
+      await adapter.sendMessage(
+        context,
+        `Workspace set to: ${updated.workingDir}`
+      );
+      return;
+    }
+
     if (command.type === "ask") {
       if (!command.prompt) {
         await adapter.sendMessage(context, "Usage: /ask <prompt>");
@@ -382,7 +428,7 @@ export class DaemonApp {
 
     await adapter.sendMessage(
       context,
-      "Supported commands: /new, /resume <id>, /ask <prompt>, /interrupt, /approve <id> <allow|deny>, /status"
+      "Supported commands: /new, /resume <id>, /ask <prompt>, /cwd <path>, /interrupt, /approve <id> <allow|deny>, /status"
     );
   }
 

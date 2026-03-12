@@ -69,7 +69,7 @@ export class StateStore {
         },
       },
       defaults: {
-        workingDir: process.cwd(),
+        workingDir: os.homedir(),
         approvalMode: "on-request",
       },
       channels: {
@@ -135,7 +135,7 @@ export class StateStore {
       chatId: String(binding.chatId),
       userId: binding.userId ? String(binding.userId) : existing.userId || null,
       threadId: binding.threadId ?? existing.threadId ?? null,
-      workingDir: binding.workingDir || existing.workingDir || process.cwd(),
+      workingDir: binding.workingDir || existing.workingDir || os.homedir(),
       policyProfile,
       updatedAt: nowIso(),
     };

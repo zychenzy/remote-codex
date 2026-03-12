@@ -23,6 +23,7 @@ npm run tool -- status
 npm run tool -- setup
 npm run tool -- start
 npm run tool -- stop
+npm run tool -- restart
 npm run tool -- status
 npm run tool -- logs
 npm run tool -- doctor
@@ -40,5 +41,7 @@ npm run tool -- policy set telegram 123456 --approval on-request --auto-approve 
 - Daemon logs are in `~/.im-codex-tool/logs/daemon.log`.
 - Discord setup walkthrough: `references/setup-guides.md`.
 - `bind discord` auto-uses configured Discord channel/user defaults when unambiguous.
+- Default workspace for new setup is your home directory (`~`).
+- In chat, use `/cwd <path>` to update the binding workspace directory.
 - Reference repos are kept under `./ref/Claude-to-IM-skill` and `./ref/remodex`.
 - Developer and commit conventions are documented in `AGENTS.md` and `CONTRIBUTING.md`.

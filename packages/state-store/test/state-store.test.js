@@ -51,3 +51,10 @@ test("pending approval create and resolve", () => {
   pending = store.getPendingApprovals();
   assert.equal(pending["req-1"].status, "resolved");
 });
+
+test("default config uses home directory as workingDir", () => {
+  const dir = tempDir();
+  const store = new StateStore({ baseDir: dir });
+  const config = store.readConfig();
+  assert.equal(config.defaults.workingDir, os.homedir());
+});
