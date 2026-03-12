@@ -21,13 +21,14 @@ This repository contains an IM-first Codex remote-control daemon.
 
 1. Use Node.js 24 LTS+.
 2. Run tests with `npm test` after changes.
-3. Keep interfaces stable between modules:
+3. Test-only validation is sufficient for this repo; lint is optional and not required by CI.
+4. Keep interfaces stable between modules:
 - `RuntimeEngine`
 - `ApprovalBroker`
 - `ChannelAdapter`
 - `SessionBinding` / `PolicyProfile`
-4. Prefer incremental changes with tests alongside behavior changes.
-5. Keep secrets local and redacted in logs.
+5. Prefer incremental changes with tests alongside behavior changes.
+6. Keep secrets local and redacted in logs.
 
 ## Commit rules
 

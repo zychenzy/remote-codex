@@ -5,3 +5,4 @@ coverage/
 .nyc_output/
 .tmp/
 ref/
+.im-codex-tool/
