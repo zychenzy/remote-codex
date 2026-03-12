@@ -37,5 +37,6 @@ npm run tool -- policy set telegram 123456 --approval on-request --auto-approve 
 
 - Secrets are stored under `~/.im-codex-tool/config.json` with mode `0600`.
 - Daemon logs are in `~/.im-codex-tool/logs/daemon.log`.
+- Discord setup walkthrough: `references/setup-guides.md`.
 - Reference repos are kept under `./ref/Claude-to-IM-skill` and `./ref/remodex`.
 - Developer and commit conventions are documented in `AGENTS.md` and `CONTRIBUTING.md`.
