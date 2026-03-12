@@ -10,7 +10,13 @@ import { StateStore } from "../../state-store/src/index.js";
 import { AppServerRuntime } from "../../core-runtime/src/index.js";
 import { DaemonApp } from "./daemon-app.js";
 import { runDoctor } from "./doctor.js";
-import { getArgValue, splitCsv, tailFile, toBoolean } from "./utils.js";
+import {
+  getArgValue,
+  splitCsv,
+  tailFile,
+  toBoolean,
+  resolveBindTargets,
+} from "./utils.js";
 
 function resolveBaseDir() {
   if (process.env.IM_CODEX_HOME) {
@@ -241,21 +247,35 @@ async function cmdDoctor() {
 
 async function cmdBind(args) {
   const channel = args[0];
-  const chatId = args[1];
-  const userId = getArgValue(args, "--user", null);
-  const cwd = getArgValue(args, "--cwd", store.readConfig().defaults.workingDir);
+  const positionalChat = args[1] && !String(args[1]).startsWith("--") ? args[1] : null;
+  const chatIdArg = positionalChat || getArgValue(args, "--chat", null);
+  const userIdArg = getArgValue(args, "--user", null);
+  const config = store.readConfig();
+  const cwd = getArgValue(args, "--cwd", config.defaults.workingDir);
 
-  if (!channel || !chatId) {
-    console.log("Usage: tool bind <channel> <chatId> [--user <id>] [--cwd <dir>]");
+  if (!channel) {
+    console.log("Usage: tool bind <channel> [chatId] [--chat <id>] [--user <id>] [--cwd <dir>]");
     return;
   }
 
-  const config = store.readConfig();
+  const resolved = resolveBindTargets({
+    channel,
+    chatIdArg,
+    userIdArg,
+    config,
+  });
+
+  if (resolved.error) {
+    console.log(resolved.error);
+    console.log("Usage: tool bind <channel> [chatId] [--chat <id>] [--user <id>] [--cwd <dir>]");
+    return;
+  }
+
   const channelAllowlist = config.channels?.[channel]?.allowlist || [];
   const binding = store.upsertBinding({
     channel,
-    chatId,
-    userId,
+    chatId: resolved.chatId,
+    userId: resolved.userId,
     workingDir: cwd,
     policyProfile: {
       approvalMode: config.defaults.approvalMode,

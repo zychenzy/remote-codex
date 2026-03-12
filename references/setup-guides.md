@@ -58,3 +58,23 @@ If there is no response, run:
 ```bash
 npm run tool -- doctor
 ```
+
+## Bind shortcut after setup
+
+After setup, you can bind Discord without repeating IDs:
+
+```bash
+npm run tool -- bind discord
+```
+
+This auto-fills:
+- `chatId` from configured `Discord allowed channel IDs` when exactly one is set.
+- `userId` from configured Discord allowlist (first value).
+
+If multiple channel IDs are configured, pass one explicitly:
+
+```bash
+npm run tool -- bind discord <channelId>
+# or
+npm run tool -- bind discord --chat <channelId>
+```

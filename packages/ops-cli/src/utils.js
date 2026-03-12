@@ -58,3 +58,41 @@ export function detectTurnId(payload) {
 export function detectDelta(payload) {
   return payload?.delta || payload?.text || payload?.contentDelta || "";
 }
+
+export function resolveBindTargets({ channel, chatIdArg, userIdArg, config }) {
+  const channels = config?.channels || {};
+  const channelConfig = channels[channel] || {};
+
+  let chatId = chatIdArg || null;
+  let userId = userIdArg || null;
+
+  if (channel === "discord" && !chatId) {
+    const allowedChannels = channelConfig.allowedChannels || [];
+    if (allowedChannels.length === 1) {
+      chatId = String(allowedChannels[0]);
+    } else if (allowedChannels.length > 1) {
+      return {
+        error: "Multiple Discord channels are configured. Provide <chatId> or --chat.",
+      };
+    } else {
+      return {
+        error: "No Discord channel configured. Re-run setup or pass <chatId>/--chat.",
+      };
+    }
+  }
+
+  if (channel === "discord" && !userId) {
+    const allowlist = channelConfig.allowlist || [];
+    if (allowlist.length >= 1) {
+      userId = String(allowlist[0]);
+    }
+  }
+
+  if (!chatId) {
+    return {
+      error: "Missing chatId. Usage: tool bind <channel> <chatId> [--user <id>] [--cwd <dir>]",
+    };
+  }
+
+  return { chatId: String(chatId), userId: userId ? String(userId) : null };
+}
