@@ -15,6 +15,16 @@ test("parser treats plain text as ask", () => {
   assert.equal(result.prompt, "fix this bug");
 });
 
+test("parser supports reco command prefix", () => {
+  const result = parseIncomingCommand("reco status");
+  assert.equal(result.type, "status");
+});
+
+test("parser supports bare reco help", () => {
+  const result = parseIncomingCommand("reco");
+  assert.equal(result.type, "help");
+});
+
 test("parser handles approve command", () => {
   const result = parseIncomingCommand("/approve req-1 allow foo=bar");
   assert.equal(result.type, "approve");

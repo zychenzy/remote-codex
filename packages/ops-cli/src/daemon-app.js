@@ -123,6 +123,56 @@ function extractThreadCwd(thread) {
   return cwd || "";
 }
 
+function extractTextParts(content) {
+  if (!Array.isArray(content)) {
+    return "";
+  }
+  return content
+    .map((part) => {
+      if (typeof part === "string") {
+        return part;
+      }
+      if (part?.type === "text") {
+        return part.text || "";
+      }
+      return "";
+    })
+    .filter(Boolean)
+    .join(" ");
+}
+
+function firstUserTextFromTurn(turn) {
+  const items = Array.isArray(turn?.items) ? turn.items : [];
+  for (const item of items) {
+    if (item?.type === "userMessage") {
+      const fromContent = extractTextParts(item.content);
+      if (fromContent) {
+        return fromContent;
+      }
+      if (typeof item.text === "string" && item.text.trim()) {
+        return item.text.trim();
+      }
+    }
+  }
+  return "";
+}
+
+function firstAgentTextFromTurn(turn) {
+  const items = Array.isArray(turn?.items) ? turn.items : [];
+  for (const item of items) {
+    if (item?.type === "agentMessage") {
+      if (typeof item.text === "string" && item.text.trim()) {
+        return item.text.trim();
+      }
+      const fromContent = extractTextParts(item.content);
+      if (fromContent) {
+        return fromContent;
+      }
+    }
+  }
+  return "";
+}
+
 function parseArgsAndOptions(args = []) {
   const positional = [];
   const options = {};
@@ -563,6 +613,38 @@ export class DaemonApp {
     }
   }
 
+  async #renderRecentThreadHistory(threadId, { turns = 3, textLimit = 260 } = {}) {
+    try {
+      const read = await this.runtime.readThread({ threadId, includeTurns: true });
+      const allTurns = Array.isArray(read?.thread?.turns) ? read.thread.turns : [];
+      const recentTurns = allTurns.slice(-turns);
+      if (!recentTurns.length) {
+        return "";
+      }
+
+      const lines = [];
+      for (const turn of recentTurns) {
+        const userText = singleLine(firstUserTextFromTurn(turn)).slice(0, textLimit);
+        const agentText = singleLine(firstAgentTextFromTurn(turn)).slice(0, textLimit);
+        if (userText) {
+          lines.push(`You: ${userText}`);
+        }
+        if (agentText) {
+          lines.push(`Codex: ${agentText}`);
+        }
+      }
+
+      if (!lines.length) {
+        return "";
+      }
+
+      return `Recent messages:\n${lines.join("\n")}`;
+    } catch (error) {
+      this.logger.debug(`failed to load recent thread history for ${threadId}: ${error.message}`);
+      return "";
+    }
+  }
+
   #setThreadListState(bKey, state) {
     this.threadListStateByBinding.set(bKey, state);
   }
@@ -801,6 +883,10 @@ export class DaemonApp {
         await this.#sendMessage(adapter, context, `Resumed thread: ${threadId}\nWorkspace set to: ${resumedCwd}`);
       } else {
         await this.#sendMessage(adapter, context, `Resumed thread: ${threadId}`);
+      }
+      const recent = await this.#renderRecentThreadHistory(threadId, { turns: 3 });
+      if (recent) {
+        await this.#sendMessage(adapter, context, recent);
       }
       Object.assign(binding, updated);
       return true;

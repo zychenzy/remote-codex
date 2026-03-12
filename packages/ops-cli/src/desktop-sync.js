@@ -91,9 +91,9 @@ export class DesktopSyncWorkaround {
     }
 
     try {
-      await execFileAsync("open", ["codex://settings"]);
+      await execFileAsync("open", ["-g", "codex://settings"]);
       await sleep(120);
-      await execFileAsync("open", [`codex://threads/${threadId}`]);
+      await execFileAsync("open", ["-g", `codex://threads/${threadId}`]);
       this.logger.debug(`desktop sync refresh executed for ${threadId}${reason ? ` (${reason})` : ""}`);
     } catch (error) {
       this.disabled = true;
@@ -103,4 +103,3 @@ export class DesktopSyncWorkaround {
     }
   }
 }
-

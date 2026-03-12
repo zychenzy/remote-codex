@@ -4,6 +4,18 @@ export function parseIncomingCommand(text = "") {
     return { type: "empty" };
   }
 
+  const lower = trimmed.toLowerCase();
+  if (lower === "reco") {
+    return { type: "help", topic: "" };
+  }
+  if (lower.startsWith("reco ")) {
+    const tail = trimmed.slice(5).trim();
+    if (!tail) {
+      return { type: "help", topic: "" };
+    }
+    return parseIncomingCommand(`/${tail}`);
+  }
+
   if (!trimmed.startsWith("/")) {
     return { type: "ask", prompt: trimmed };
   }
