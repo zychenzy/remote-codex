@@ -12,28 +12,31 @@ A local-first daemon that controls `codex app-server` from IM channels.
 ## Quick start
 
 ```bash
-npm run tool -- setup
-npm run tool -- start
-npm run tool -- status
+./reco setup
+./reco start
+./reco status
 ```
 
 ## CLI
 
 ```bash
-npm run tool -- setup
-npm run tool -- start
-npm run tool -- stop
-npm run tool -- restart
-npm run tool -- status
-npm run tool -- logs
-npm run tool -- doctor
-npm run tool -- bind telegram 123456 --user 123456 --cwd /path/to/repo
-npm run tool -- bind discord
-npm run tool -- unbind telegram 123456
-npm run tool -- threads list
-npm run tool -- threads resume <threadId> --channel telegram --chat 123456
-npm run tool -- policy set telegram 123456 --approval on-request --auto-approve false
+./reco setup
+./reco start
+./reco stop
+./reco restart
+./reco status
+./reco logs
+./reco doctor
+./reco bind telegram 123456 --user 123456 --cwd /path/to/repo
+./reco bind discord
+./reco unbind telegram 123456
+./reco threads list
+./reco threads resume <threadId> --channel telegram --chat 123456
+./reco policy set telegram 123456 --approval on-request --auto-approve false
 ```
+
+You can optionally run `npm link` once in this repo and then use `reco ...`
+without `./`.
 
 ## Notes
 

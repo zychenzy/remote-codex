@@ -272,7 +272,7 @@ async function cmdBind(args) {
   const cwd = getArgValue(args, "--cwd", config.defaults.workingDir);
 
   if (!channel) {
-    console.log("Usage: tool bind <channel> [chatId] [--chat <id>] [--user <id>] [--cwd <dir>]");
+    console.log("Usage: reco bind <channel> [chatId] [--chat <id>] [--user <id>] [--cwd <dir>]");
     return;
   }
 
@@ -285,7 +285,7 @@ async function cmdBind(args) {
 
   if (resolved.error) {
     console.log(resolved.error);
-    console.log("Usage: tool bind <channel> [chatId] [--chat <id>] [--user <id>] [--cwd <dir>]");
+    console.log("Usage: reco bind <channel> [chatId] [--chat <id>] [--user <id>] [--cwd <dir>]");
     return;
   }
 
@@ -310,7 +310,7 @@ async function cmdUnbind(args) {
   const channel = args[0];
   const chatId = args[1];
   if (!channel || !chatId) {
-    console.log("Usage: tool unbind <channel> <chatId>");
+    console.log("Usage: reco unbind <channel> <chatId>");
     return;
   }
   store.removeBinding(channel, chatId);
@@ -343,7 +343,7 @@ async function cmdThreads(args) {
       const chatId = getArgValue(args, "--chat", null);
 
       if (!threadId) {
-        console.log("Usage: tool threads resume <threadId> [--channel <name> --chat <id>]");
+        console.log("Usage: reco threads resume <threadId> [--channel <name> --chat <id>]");
         return;
       }
 
@@ -355,7 +355,7 @@ async function cmdThreads(args) {
       return;
     }
 
-    console.log("Usage: tool threads <list|resume>");
+    console.log("Usage: reco threads <list|resume>");
   } finally {
     await runtime.stop();
   }
@@ -364,7 +364,7 @@ async function cmdThreads(args) {
 async function cmdPolicy(args) {
   const sub = args[0];
   if (sub !== "set") {
-    console.log("Usage: tool policy set <channel> <chatId> [--approval <mode>] [--auto-approve <bool>] [--desktop-sync <bool>] [--allowlist <csv>]");
+    console.log("Usage: reco policy set <channel> <chatId> [--approval <mode>] [--auto-approve <bool>] [--desktop-sync <bool>] [--allowlist <csv>]");
     return;
   }
 
@@ -435,7 +435,7 @@ async function main() {
     case "resume": {
       const [threadId, channel, chatId] = args;
       if (!threadId || !channel || !chatId) {
-        console.log("Usage: tool resume <threadId> <channel> <chatId>");
+        console.log("Usage: reco resume <threadId> <channel> <chatId>");
         break;
       }
       store.setBindingThread(channel, chatId, threadId);
@@ -446,7 +446,7 @@ async function main() {
       await cmdPolicy(args);
       break;
     default:
-      console.log("Usage: tool <setup|start|stop|restart|status|logs|doctor|bind|unbind|threads|resume|policy>");
+      console.log("Usage: reco <setup|start|stop|restart|status|logs|doctor|bind|unbind|threads|resume|policy>");
   }
 }
 

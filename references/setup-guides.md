@@ -31,7 +31,7 @@ channel/user to copy IDs.
 5. Run setup and provide Discord values.
 
 ```bash
-npm run tool -- setup
+./reco setup
 ```
 
 When prompted:
@@ -44,9 +44,9 @@ When prompted:
 6. Start daemon and verify.
 
 ```bash
-npm run tool -- start
-npm run tool -- status
-npm run tool -- logs
+./reco start
+./reco status
+./reco logs
 ```
 
 In an allowed channel, send:
@@ -57,13 +57,13 @@ In an allowed channel, send:
 If there is no response, run:
 
 ```bash
-npm run tool -- doctor
+./reco doctor
 ```
 
 If you change config later, restart daemon:
 
 ```bash
-npm run tool -- restart
+./reco restart
 ```
 
 ## Bind shortcut after setup
@@ -71,7 +71,7 @@ npm run tool -- restart
 After setup, you can bind Discord without repeating IDs:
 
 ```bash
-npm run tool -- bind discord
+./reco bind discord
 ```
 
 This auto-fills:
@@ -81,9 +81,9 @@ This auto-fills:
 If multiple channel IDs are configured, pass one explicitly:
 
 ```bash
-npm run tool -- bind discord <channelId>
+./reco bind discord <channelId>
 # or
-npm run tool -- bind discord --chat <channelId>
+./reco bind discord --chat <channelId>
 ```
 
 ## Update workspace directory from Discord chat
