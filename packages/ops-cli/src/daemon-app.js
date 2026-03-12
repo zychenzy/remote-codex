@@ -11,7 +11,6 @@ import {
 } from "../../im-gateway/src/index.js";
 import { StateStore } from "../../state-store/src/index.js";
 import { ApprovalBroker } from "./approval-broker.js";
-import { DesktopSyncWorkaround } from "./desktop-sync.js";
 import { commandManual } from "./help-manual.js";
 import { createLogger } from "./logger.js";
 import { detectDelta, detectThreadId, detectTurnId } from "./utils.js";
@@ -296,12 +295,6 @@ export class DaemonApp {
       logger: this.logger,
       reconnect: true,
     });
-    this.desktopSync = new DesktopSyncWorkaround({
-      logger: this.logger,
-      platform: process.platform,
-      debounceMs: Number(process.env.IM_CODEX_DESKTOP_SYNC_DEBOUNCE_MS || 1200),
-      commandTemplate: process.env.IM_CODEX_DESKTOP_SYNC_COMMAND || "",
-    });
 
     this.approvalBroker = new ApprovalBroker({ timeoutMs: 5 * 60 * 1000 });
     this.adapters = [];
@@ -339,7 +332,6 @@ export class DaemonApp {
   async stop() {
     this.running = false;
     this.approvalBroker.clearAll();
-    this.desktopSync.stop();
 
     for (const adapter of this.adapters) {
       await adapter.stop();
@@ -456,7 +448,6 @@ export class DaemonApp {
         approvalMode: this.config.defaults?.approvalMode || "on-request",
         allowlist: this.#channelAllowlist(context.channel),
         autoApprove: false,
-        desktopSyncEnabled: Boolean(this.config.security?.desktopSyncEnabled),
       },
     });
 
@@ -488,36 +479,6 @@ export class DaemonApp {
 
   #getAdapter(channel) {
     return this.adapters.find((adapter) => adapter.channel === channel) || null;
-  }
-
-  #isDesktopSyncEnabledForBindingKey(bKey) {
-    const [channel, chatId] = String(bKey || "").split(":");
-    if (!channel || !chatId) {
-      return false;
-    }
-    const binding = this.store.getBinding(channel, chatId);
-    return Boolean(binding?.policyProfile?.desktopSyncEnabled);
-  }
-
-  #scheduleDesktopSync({ threadId, bKey, reason = "" } = {}) {
-    const resolvedThreadId = String(threadId || "");
-    if (!resolvedThreadId) {
-      return;
-    }
-
-    const resolvedBindingKey = bKey || this.threadToBinding.get(resolvedThreadId);
-    if (!resolvedBindingKey) {
-      return;
-    }
-
-    if (!this.#isDesktopSyncEnabledForBindingKey(resolvedBindingKey)) {
-      return;
-    }
-
-    this.desktopSync.schedule({
-      threadId: resolvedThreadId,
-      reason,
-    });
   }
 
   #appendChatHistory(entry) {
@@ -907,7 +868,6 @@ export class DaemonApp {
         this.turnToBinding.set(turnId, bKey);
         this.activeTurnByBinding.set(bKey, turnId);
       }
-      this.#scheduleDesktopSync({ threadId, bKey, reason: "turn started" });
       await this.#sendMessage(adapter, context, `Turn started: ${turnId || "unknown"}`);
       this.store.appendAudit({
         type: "turn_started",
@@ -1562,7 +1522,6 @@ export class DaemonApp {
         return;
       }
 
-      this.#scheduleDesktopSync({ threadId, bKey, reason: "turn streaming delta" });
       await this.#sendStreamingDelta(adapter, { channel, chatId, turnId }, delta);
       return;
     }
@@ -1592,8 +1551,6 @@ export class DaemonApp {
         const status = params?.turn?.status || "completed";
         await this.#sendMessage(adapter, { channel, chatId, turnId }, `Turn completed (${status}).`);
       }
-      this.#scheduleDesktopSync({ threadId, bKey, reason: "turn completed" });
-
       this.turnToBinding.delete(turnId);
       this.activeTurnByBinding.delete(bKey);
       return;

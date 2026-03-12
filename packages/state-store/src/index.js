@@ -61,34 +61,36 @@ export class StateStore {
   }
 
   readConfig() {
-    return readJson(this.configPath, {
+    const raw = readJson(this.configPath, {});
+    const normalized = {
       runtime: {
         appServer: {
-          command: "codex",
-          args: ["app-server", "--listen", "stdio://"],
+          command: raw?.runtime?.appServer?.command || "codex",
+          args: raw?.runtime?.appServer?.args || ["app-server", "--listen", "stdio://"],
         },
       },
       defaults: {
-        workingDir: os.homedir(),
-        approvalMode: "on-request",
+        workingDir: raw?.defaults?.workingDir || os.homedir(),
+        approvalMode: raw?.defaults?.approvalMode || "on-request",
       },
       channels: {
         telegram: {
-          enabled: false,
-          botToken: "",
-          allowlist: [],
+          enabled: Boolean(raw?.channels?.telegram?.enabled),
+          botToken: raw?.channels?.telegram?.botToken || "",
+          allowlist: raw?.channels?.telegram?.allowlist || [],
         },
         discord: {
-          enabled: false,
-          botToken: "",
-          allowlist: [],
-          allowedChannels: [],
+          enabled: Boolean(raw?.channels?.discord?.enabled),
+          botToken: raw?.channels?.discord?.botToken || "",
+          allowlist: raw?.channels?.discord?.allowlist || [],
+          allowedChannels: raw?.channels?.discord?.allowedChannels || [],
         },
       },
-      security: {
-        desktopSyncEnabled: false,
-      },
-    });
+    };
+    if (JSON.stringify(raw || {}) !== JSON.stringify(normalized)) {
+      this.writeConfig(normalized);
+    }
+    return normalized;
   }
 
   writeConfig(config) {
@@ -101,7 +103,27 @@ export class StateStore {
   }
 
   getBindings() {
-    return readJson(this.bindingsPath, {});
+    const raw = readJson(this.bindingsPath, {});
+    let changed = false;
+    const normalized = {};
+
+    for (const [key, binding] of Object.entries(raw || {})) {
+      const policy = { ...(binding?.policyProfile || {}) };
+      if (Object.prototype.hasOwnProperty.call(policy, "desktopSyncEnabled")) {
+        delete policy.desktopSyncEnabled;
+        changed = true;
+      }
+      normalized[key] = {
+        ...binding,
+        policyProfile: policy,
+      };
+    }
+
+    if (changed) {
+      writeJson(this.bindingsPath, normalized, 0o600);
+    }
+
+    return normalized;
   }
 
   listBindings() {
@@ -127,7 +149,6 @@ export class StateStore {
       approvalMode: binding.policyProfile?.approvalMode || existing.policyProfile?.approvalMode || "on-request",
       allowlist: binding.policyProfile?.allowlist || existing.policyProfile?.allowlist || [],
       autoApprove: Boolean(binding.policyProfile?.autoApprove ?? existing.policyProfile?.autoApprove ?? false),
-      desktopSyncEnabled: Boolean(binding.policyProfile?.desktopSyncEnabled ?? existing.policyProfile?.desktopSyncEnabled ?? false),
       model: binding.policyProfile?.model ?? existing.policyProfile?.model ?? null,
       reasoningEffort: binding.policyProfile?.reasoningEffort ?? existing.policyProfile?.reasoningEffort ?? null,
       collaborationMode: binding.policyProfile?.collaborationMode ?? existing.policyProfile?.collaborationMode ?? null,

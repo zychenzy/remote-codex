@@ -13,7 +13,6 @@ export function commandManual(topic = "") {
       "/resume <threadId> - attach to an existing thread.",
       "/ask <prompt> - start a turn with prompt text.",
       "plain text message - same as /ask <text>.",
-      "`reco <command>` - slash-free command mode for Discord (example: reco status).",
       "/cwd <path> or /workspace <path> - set workspace directory.",
       "/thread ... - thread operations (list/read/fork/archive/unarchive/rollback/compact).",
       "/turn ... - turn operations (ask/steer/interrupt/review).",

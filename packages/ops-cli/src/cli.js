@@ -134,8 +134,8 @@ const HELP_TOPICS = {
     ],
   },
   policy: {
-    summary: "Update binding policy options (approval, model profile, allowlist, desktop sync).",
-    usage: "reco policy set <channel> <chatId> [--approval <mode>] [--auto-approve <bool>] [--desktop-sync <bool>] [--allowlist <csv>] [--model <id>] [--effort <level>] [--mode <name>]",
+    summary: "Update binding policy options (approval, model profile, allowlist).",
+    usage: "reco policy set <channel> <chatId> [--approval <mode>] [--auto-approve <bool>] [--allowlist <csv>] [--model <id>] [--effort <level>] [--mode <name>]",
     examples: [
       "reco policy set discord 123456789012345678 --approval on-request --auto-approve false",
       "reco policy set telegram 123456 --allowlist 123456,789012",
@@ -257,8 +257,6 @@ async function cmdSetup() {
     ? splitCsv((await rl.question(`Discord allowed channel IDs for polling (csv) [${(existing.channels.discord.allowedChannels || []).join(",")}]: `)).trim() || (existing.channels.discord.allowedChannels || []).join(","))
     : [];
 
-  const desktopSyncEnabled = toBoolean((await rl.question(`Enable desktop sync workaround? (y/n) [${existing.security.desktopSyncEnabled ? "y" : "n"}]: `)).trim() || (existing.security.desktopSyncEnabled ? "y" : "n"));
-
   rl.close();
 
   store.writeConfig({
@@ -279,9 +277,6 @@ async function cmdSetup() {
         allowlist: discordAllowlist,
         allowedChannels: discordChannels,
       },
-    },
-    security: {
-      desktopSyncEnabled,
     },
   });
 
@@ -462,7 +457,6 @@ async function cmdBind(args) {
       approvalMode: config.defaults.approvalMode,
       allowlist: channelAllowlist,
       autoApprove: false,
-      desktopSyncEnabled: Boolean(config.security.desktopSyncEnabled),
     },
   });
 
@@ -623,7 +617,7 @@ async function cmdThreads(args) {
 async function cmdPolicy(args) {
   const sub = args[0];
   if (sub !== "set") {
-    console.log("Usage: reco policy set <channel> <chatId> [--approval <mode>] [--auto-approve <bool>] [--desktop-sync <bool>] [--allowlist <csv>] [--model <id>] [--effort <level>] [--mode <name>]");
+    console.log("Usage: reco policy set <channel> <chatId> [--approval <mode>] [--auto-approve <bool>] [--allowlist <csv>] [--model <id>] [--effort <level>] [--mode <name>]");
     return;
   }
 
@@ -637,7 +631,6 @@ async function cmdPolicy(args) {
 
   const approvalMode = getArgValue(args, "--approval", binding.policyProfile.approvalMode);
   const autoApprove = toBoolean(getArgValue(args, "--auto-approve", String(binding.policyProfile.autoApprove)), binding.policyProfile.autoApprove);
-  const desktopSyncEnabled = toBoolean(getArgValue(args, "--desktop-sync", String(binding.policyProfile.desktopSyncEnabled)), binding.policyProfile.desktopSyncEnabled);
   const allowlistRaw = getArgValue(args, "--allowlist", null);
   const allowlist = allowlistRaw == null ? binding.policyProfile.allowlist : splitCsv(allowlistRaw);
   const modelRaw = getArgValue(args, "--model", null);
@@ -659,7 +652,6 @@ async function cmdPolicy(args) {
       ...binding.policyProfile,
       approvalMode,
       autoApprove,
-      desktopSyncEnabled,
       allowlist,
       model,
       reasoningEffort,
