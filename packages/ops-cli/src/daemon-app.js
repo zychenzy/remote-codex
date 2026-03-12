@@ -1108,7 +1108,7 @@ export class DaemonApp {
           const marker = binding.threadId && id === binding.threadId ? " (current)" : "";
           const title = threadDisplayTitle(thread);
           const cwd = extractThreadCwd(thread) || "unknown";
-          return `${index + 1}. ${title} | ${cwd} | ${id}${marker}`;
+          return `${index + 1}. ${title}\t\t${cwd}\t\t${id}${marker}`;
         });
         await this.#sendMessage(
           adapter,
