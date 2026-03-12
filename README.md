@@ -1,4 +1,4 @@
-# codex-remote
+# remote-codex
 
 IM-first remote control daemon for Codex, backed by `codex app-server`.
 
@@ -31,8 +31,8 @@ Reference projects are kept in `ref/` for lookup only.
 ## Install
 
 ```bash
-git clone https://github.com/zycheny/codex-remote.git
-cd codex-remote
+git clone https://github.com/zycheny/remote-codex.git
+cd remote-codex
 npm ci
 ```
 
