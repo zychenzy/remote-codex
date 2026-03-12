@@ -19,6 +19,42 @@ This project lets you run Codex on your host machine and control it from chat ap
 - `packages/state-store`: local config/state/audit persistence.
 - `packages/ops-cli`: daemon orchestration, runtime wiring, CLI commands.
 
+System view (module-first, non-Mermaid):
+
+```text
++-----------------------+       +-----------------------+
+| Discord Adapter       |       | Telegram Adapter      |
+| (im-gateway)          |       | (im-gateway)          |
++-----------+-----------+       +-----------+-----------+
+            \                           /
+             \                         /
+              v                       v
+        +-----+-----------------------+--------------------+
+        |           Daemon Orchestrator (ops-cli)         |
+        | - command routing (/thread,/turn,/model,/skills)|
+        | - binding allowlist + approval gating            |
+        | - thread/turn maps + chat streaming              |
+        +--------------------+-----------------------------+
+                             |
+                             v
+        +--------------------+-----------------------------+
+        |      Runtime Engine (core-runtime)               |
+        | - starts/stops codex app-server                  |
+        | - JSON-RPC request/response + notifications      |
+        +--------------------+-----------------------------+
+                             |
+                             v
+                   +---------+---------+
+                   | codex app-server  |
+                   +-------------------+
+
+        +-----------------------------------------------+
+        | State Store (state-store)                     |
+        | config.json / bindings.json / approvals.json  |
+        | sessions.json / audit.jsonl / daemon logs     |
+        +-----------------------------------------------+
+```
+
 Reference projects are kept in `ref/` for lookup only.
 
 ## Requirements
