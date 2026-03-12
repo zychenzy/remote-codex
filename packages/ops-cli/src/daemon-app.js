@@ -13,6 +13,8 @@ import { StateStore } from "../../state-store/src/index.js";
 import { ApprovalBroker } from "./approval-broker.js";
 import { commandManual } from "./help-manual.js";
 import { createLogger } from "./logger.js";
+import { handleModelAndSkillsCommand } from "./model-skills-handler.js";
+import { reconcileRuntimeState } from "./runtime-state-reconciler.js";
 import { detectDelta, detectThreadId, detectTurnId } from "./utils.js";
 
 function bindingKey(channel, chatId) {
@@ -311,17 +313,12 @@ export class DaemonApp {
   async start() {
     this.running = true;
 
-    for (const binding of this.store.listBindings()) {
-      if (binding.threadId) {
-        this.threadToBinding.set(binding.threadId, bindingKey(binding.channel, binding.chatId));
-      }
-    }
-
     this.#wireRuntimeEvents();
     this.#wireApprovalBroker();
 
     await this.runtime.initialize();
     this.logger.info("runtime initialized");
+    await this.#rehydrateRuntimeState("startup");
 
     await this.#startAdapters();
     this.logger.info("adapters started", this.adapters.map((adapter) => adapter.channel).join(","));
@@ -364,7 +361,32 @@ export class DaemonApp {
 
     this.runtime.on("reconnected", () => {
       this.logger.warn("runtime reconnected");
+      this.#rehydrateRuntimeState("reconnected").catch((error) => {
+        this.logger.error("runtime state reconciliation failed after reconnect", error);
+      });
     });
+  }
+
+  async #rehydrateRuntimeState(reason) {
+    const summary = await reconcileRuntimeState({
+      store: this.store,
+      runtime: this.runtime,
+      logger: this.logger,
+      threadToBinding: this.threadToBinding,
+      turnToBinding: this.turnToBinding,
+      activeTurnByBinding: this.activeTurnByBinding,
+      bindingKeyFn: bindingKey,
+      isThreadNotFoundError,
+      extractThreadCwd,
+    });
+    this.store.appendAudit({
+      type: "runtime_state_rehydrated",
+      reason,
+      ...summary,
+    });
+    this.logger.info(
+      `runtime state reconciled (${reason}): loaded=${summary.loadedCount}, verified=${summary.verifiedThreads}, cwd_updated=${summary.refreshedCwd}, stale_cleared=${summary.clearedBindings}`
+    );
   }
 
   #wireApprovalBroker() {
@@ -1247,203 +1269,27 @@ export class DaemonApp {
       return;
     }
 
-    if (command.type === "modelNs") {
-      const { positional } = parseArgsAndOptions(command.args);
-      if (command.action === "show") {
-        await this.#sendMessage(adapter, context, [
-          `Model: ${binding.policyProfile?.model || "runtime default"}`,
-          `Effort: ${binding.policyProfile?.reasoningEffort || "runtime default"}`,
-          `Mode: ${binding.policyProfile?.collaborationMode || "runtime default"}`,
-        ].join("\n"));
-        return;
-      }
-      if (command.action === "list") {
-        const response = await this.runtime.listModels({ includeHidden: false, limit: 30 });
-        const models = modelListFromResponse(response);
-        if (!models.length) {
-          await this.#sendMessage(adapter, context, "No models returned by runtime.");
-          return;
-        }
-        const lines = models.map((item) => {
-          const efforts = (item.supportedReasoningEfforts || [])
-            .map((entry) => (typeof entry === "string" ? entry : entry?.reasoningEffort))
-            .filter(Boolean)
-            .join(",");
-          const hidden = Boolean(item.hidden ?? item.isHidden);
-          return `${item.model || item.id}${item.isDefault ? " (default)" : ""}${hidden ? " (hidden)" : ""}${efforts ? ` | efforts:${efforts}` : ""}`;
-        });
-        await this.#sendMessage(adapter, context, `Models:\n${lines.join("\n")}`);
-        return;
-      }
-      if (command.action === "set") {
-        const nextModelRaw = String(positional[0] || "").trim();
-        if (!nextModelRaw) {
-          await this.#sendMessage(adapter, context, "Usage: /model set <modelId|default>");
-          return;
-        }
-        const nextModel = ["default", "auto"].includes(nextModelRaw.toLowerCase()) ? null : nextModelRaw;
-        const updated = this.store.upsertBinding({
-          ...binding,
-          policyProfile: {
-            ...binding.policyProfile,
-            model: nextModel,
-          },
-        });
-        Object.assign(binding, updated);
-        await this.#sendMessage(adapter, context, `Model set to: ${updated.policyProfile?.model || "runtime default"}`);
-        return;
-      }
-      if (command.action === "effort") {
-        const mode = String(positional[0] || "show").toLowerCase();
-        if (["show", "get"].includes(mode)) {
-          await this.#sendMessage(adapter, context, `Effort: ${binding.policyProfile?.reasoningEffort || "runtime default"}`);
-          return;
-        }
-        if (mode !== "set" || !positional[1]) {
-          await this.#sendMessage(adapter, context, "Usage: /model effort set <low|medium|high|xhigh|default>");
-          return;
-        }
-        const raw = String(positional[1]).trim().toLowerCase();
-        const effort = ["default", "auto"].includes(raw) ? null : raw;
-        const updated = this.store.upsertBinding({
-          ...binding,
-          policyProfile: {
-            ...binding.policyProfile,
-            reasoningEffort: effort,
-          },
-        });
-        Object.assign(binding, updated);
-        await this.#sendMessage(adapter, context, `Effort set to: ${updated.policyProfile?.reasoningEffort || "runtime default"}`);
-        return;
-      }
-      if (command.action === "mode") {
-        const mode = String(positional[0] || "show").toLowerCase();
-        if (mode === "list") {
-          const response = await this.runtime.listCollaborationModes();
-          const modes = collaborationModesFromResponse(response);
-          const lines = modes.map((item) => `${item.mode || item.name || "unknown"}${item.model ? ` | model:${item.model}` : ""}`);
-          await this.#sendMessage(adapter, context, lines.length ? `Modes:\n${lines.join("\n")}` : "No collaboration modes returned.");
-          return;
-        }
-        if (["show", "get"].includes(mode)) {
-          await this.#sendMessage(adapter, context, `Mode: ${binding.policyProfile?.collaborationMode || "runtime default"}`);
-          return;
-        }
-        if (mode !== "set" || !positional[1]) {
-          await this.#sendMessage(adapter, context, "Usage: /model mode <list|show|set <mode|default>>");
-          return;
-        }
-        const raw = String(positional[1]).trim();
-        const collaborationMode = ["default", "auto"].includes(raw.toLowerCase()) ? null : raw;
-        const updated = this.store.upsertBinding({
-          ...binding,
-          policyProfile: {
-            ...binding.policyProfile,
-            collaborationMode,
-          },
-        });
-        Object.assign(binding, updated);
-        await this.#sendMessage(adapter, context, `Mode set to: ${updated.policyProfile?.collaborationMode || "runtime default"}`);
-        return;
-      }
-      await this.#sendMessage(adapter, context, "Usage: /model <show|list|set|effort|mode>");
-      return;
-    }
-
-    if (command.type === "skills") {
-      const action = command.action || "";
-      const { positional, options } = parseArgsAndOptions(command.args);
-      const cwdResolved = options.cwd ? resolveWorkspacePath(options.cwd, binding.workingDir) : { value: binding.workingDir };
-      if (cwdResolved.error) {
-        await this.#sendMessage(adapter, context, cwdResolved.error);
-        return;
-      }
-      const skillsCwd = cwdResolved.value;
-
-      if (action === "list" || action === "reload") {
-        const forceReload = action === "reload" || toBoolean(options.reload, false) || toBoolean(options.forceReload, false);
-        const payload = await this.#loadSkillsForCwd(skillsCwd, { forceReload });
-        this.#touchSkillsContext(binding, skillsCwd, payload.skills);
-        if (!payload.skills.length) {
-          await this.#sendMessage(adapter, context, `No skills found for ${skillsCwd}.`);
-          return;
-        }
-        const limit = toInt(options.limit, 20, 1, 200);
-        const lines = payload.skills.slice(0, limit).map((skill) => (
-          `${skill.name}${skill.enabled === false ? " (disabled)" : ""} | ${skill.scope || "user"} | ${skill.path || ""}`
-        ));
-        await this.#sendMessage(adapter, context, `Skills (${skillsCwd}):\n${lines.join("\n")}`);
-        return;
-      }
-
-      if (action === "use") {
-        const skillName = positional[0];
-        const prompt = positional.slice(1).join(" ").trim();
-        if (!skillName || !prompt) {
-          await this.#sendMessage(adapter, context, "Usage: /skills use <skill-name> <prompt...>");
-          return;
-        }
-        const skill = await this.#resolveSkillByName(binding, skillsCwd, skillName, { forceReload: false });
-        if (!skill?.path) {
-          await this.#sendMessage(adapter, context, `Skill not found: ${skillName}. Use /skills list first.`);
-          return;
-        }
-        const text = prompt.includes(`$${skill.name}`) ? prompt : `$${skill.name} ${prompt}`;
-        await runAsk(text, {
-          cwd: skillsCwd,
-          model: options.model || null,
-          effort: options.effort || null,
-          collaborationMode: options.mode || null,
-          input: [
-            { type: "text", text },
-            { type: "skill", name: skill.name, path: skill.path },
-          ],
-        });
-        return;
-      }
-
-      if (action === "enable" || action === "disable") {
-        const ref = positional[0];
-        if (!ref) {
-          await this.#sendMessage(adapter, context, "Usage: /skills enable|disable <skill-name-or-path>");
-          return;
-        }
-        const enabled = action === "enable";
-        let skillPath = ref;
-        if (!ref.includes("/") && !ref.includes("\\")) {
-          const skill = await this.#resolveSkillByName(binding, skillsCwd, ref, { forceReload: false });
-          if (!skill?.path) {
-            await this.#sendMessage(adapter, context, `Skill not found: ${ref}. Use /skills list first.`);
-            return;
-          }
-          skillPath = skill.path;
-        }
-        await this.runtime.writeSkillConfig({ path: skillPath, enabled });
-        this.skillsCacheByCwd.delete(skillsCwd);
-        await this.#sendMessage(adapter, context, `${enabled ? "Enabled" : "Disabled"} skill: ${skillPath}`);
-        return;
-      }
-
-      await this.#sendMessage(adapter, context, "Usage: /skills <list|use|enable|disable|reload>");
-      return;
-    }
-
-    if (command.type === "model") {
-      const nextModelRaw = String(command.value || "").trim();
-      if (!nextModelRaw) {
-        await this.#sendMessage(adapter, context, `Model: ${binding.policyProfile?.model || "runtime default"}`);
-        return;
-      }
-
-      const nextModel = ["default", "auto"].includes(nextModelRaw.toLowerCase()) ? null : nextModelRaw;
-      const updated = this.store.upsertBinding({
-        ...binding,
-        policyProfile: {
-          ...binding.policyProfile,
-          model: nextModel,
-        },
-      });
-      await this.#sendMessage(adapter, context, `Model set to: ${updated.policyProfile?.model || "runtime default"}`);
+    const modelOrSkillsHandled = await handleModelAndSkillsCommand({
+      command,
+      adapter,
+      context,
+      binding,
+      runtime: this.runtime,
+      store: this.store,
+      sendMessage: (targetAdapter, targetContext, message) => this.#sendMessage(targetAdapter, targetContext, message),
+      parseArgsAndOptions,
+      resolveWorkspacePath,
+      toBoolean,
+      toInt,
+      modelListFromResponse,
+      collaborationModesFromResponse,
+      loadSkillsForCwd: (cwd, options) => this.#loadSkillsForCwd(cwd, options),
+      touchSkillsContext: (targetBinding, cwd, skills) => this.#touchSkillsContext(targetBinding, cwd, skills),
+      resolveSkillByName: (targetBinding, cwd, name, options) => this.#resolveSkillByName(targetBinding, cwd, name, options),
+      runAsk,
+      clearSkillCache: (cwd) => this.skillsCacheByCwd.delete(cwd),
+    });
+    if (modelOrSkillsHandled) {
       return;
     }
 
