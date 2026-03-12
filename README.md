@@ -1,52 +1,191 @@
-# IM-First Codex Remote Control Tool
+# codex-remote
 
-A local-first daemon that controls `codex app-server` from IM channels.
+IM-first remote control daemon for Codex, backed by `codex app-server`.
 
-## v1 scope
+This project lets you run Codex on your host machine and control it from chat apps (Discord/Telegram), while keeping operations local and policy-gated.
 
-- Runtime: `codex app-server` only
-- Channels: Telegram + Discord
-- Control surface: CLI-only
-- Deployment: single host (no relay/control-plane required)
+## Highlights
 
-## Quick start
+- Native `codex app-server` integration (JSON-RPC, thread/turn/model/skills methods).
+- IM-first operator flow (Discord + Telegram).
+- Local single-host deployment (no relay/control plane required).
+- Approval-gated risky operations and allowlist-based access control.
+- Persistent bindings, thread mapping, approvals, and audit logs.
+- Optional desktop sync workaround (disabled by default).
+
+## Architecture
+
+- `packages/core-runtime`: app-server process lifecycle + JSON-RPC client.
+- `packages/im-gateway`: Discord/Telegram adapters + IM command parsing.
+- `packages/state-store`: local config/state/audit persistence.
+- `packages/ops-cli`: daemon orchestration, runtime wiring, CLI commands.
+
+Reference projects are kept in `ref/` for lookup only.
+
+## Requirements
+
+- macOS or Linux
+- Node.js 24 LTS or newer
+- `codex` CLI installed and authenticated (`codex login`)
+- Discord and/or Telegram bot credentials
+
+## Install
+
+```bash
+git clone https://github.com/zycheny/codex-remote.git
+cd codex-remote
+npm ci
+```
+
+Optional global command:
+
+```bash
+npm link
+reco help
+```
+
+## Quick Start
+
+1. Run interactive setup:
 
 ```bash
 ./reco setup
+```
+
+2. Start daemon:
+
+```bash
 ./reco start
 ./reco status
 ```
 
-## CLI
+3. Bind a channel:
 
 ```bash
-./reco setup
-./reco start
-./reco stop
-./reco restart
-./reco status
-./reco help
-./reco help bind
-./reco logs
-./reco doctor
-./reco bind telegram 123456 --user 123456 --cwd /path/to/repo
 ./reco bind discord
-./reco unbind telegram 123456
-./reco threads list
-./reco threads resume <threadId> --channel telegram --chat 123456
-./reco policy set telegram 123456 --approval on-request --auto-approve false
+# or
+./reco bind telegram <chatId> --user <userId>
 ```
 
-You can optionally run `npm link` once in this repo and then use `reco ...`
-without `./`.
+4. In your IM chat:
 
-## Notes
+```text
+/status
+/new
+/ask summarize this repo
+```
 
-- Secrets are stored under `~/.im-codex-tool/config.json` with mode `0600`.
-- Daemon logs are in `~/.im-codex-tool/logs/daemon.log`.
-- Discord setup walkthrough: `references/setup-guides.md`.
-- `bind discord` auto-uses configured Discord channel/user defaults when unambiguous.
-- Default workspace for new setup is your home directory (`~`).
-- In chat, use `/cwd <path>` to update the binding workspace directory.
-- Reference repos are kept under `./ref/Claude-to-IM-skill` and `./ref/remodex`.
-- Developer and commit conventions are documented in `AGENTS.md` and `CONTRIBUTING.md`.
+If settings change, restart:
+
+```bash
+./reco restart
+```
+
+## CLI Commands
+
+Core:
+
+- `reco setup`
+- `reco start|stop|restart|status`
+- `reco logs [lines]`
+- `reco logs chat [lines]`
+- `reco doctor`
+- `reco help [command]`
+
+Bindings and policy:
+
+- `reco bind <channel> [chatId] [--chat <id>] [--user <id>] [--cwd <dir>]`
+- `reco unbind <channel> <chatId>`
+- `reco policy set <channel> <chatId> [--approval <mode>] [--auto-approve <bool>] [--desktop-sync <bool>] [--allowlist <csv>] [--model <id>] [--effort <level>] [--mode <name>]`
+
+Discord diagnostics:
+
+- `reco discord channels`
+- `reco discord verify`
+
+Thread admin:
+
+- `reco threads list`
+- `reco threads resume <threadId> --channel <name> --chat <id>`
+- `reco resume <threadId> <channel> <chatId>`
+
+## IM Commands
+
+Namespaced commands:
+
+- `/thread start|resume|list|more|read|fork|loaded|unsubscribe|archive|unarchive|compact|rollback`
+- `/turn ask|steer|interrupt|review`
+- `/model show|list|set|effort|mode`
+- `/skills list|use|enable|disable|reload`
+
+Shortcuts/aliases:
+
+- `/new`, `/ask`, `/resume`, `/interrupt`, `/stop`
+- `/threads`, `/archive`, `/status`, `/help`, `/approve`, `/cwd`
+
+## Security Model
+
+- Allowlist required per channel/binding before command execution.
+- Approval required by default for command/file/tool approval requests.
+- Local secrets/config stored with strict file permissions.
+- Audit and chat-history logs are local-only.
+
+## Runtime Paths
+
+Default base directory: `~/.im-codex-tool`
+
+- Config: `~/.im-codex-tool/config.json`
+- Bindings/state: `~/.im-codex-tool/data/`
+- Daemon log: `~/.im-codex-tool/logs/daemon.log`
+- Chat history log: `~/.im-codex-tool/logs/chat-history.jsonl`
+
+Override base dir with `IM_CODEX_HOME`.
+
+## Desktop Sync Workaround (Optional)
+
+When enabled on a binding, daemon can trigger a debounced refresh in Codex desktop during turn activity.
+
+- Default: disabled
+- Enable per binding:
+
+```bash
+./reco policy set discord <chatId> --desktop-sync true
+```
+
+Optional env overrides:
+
+- `IM_CODEX_DESKTOP_SYNC_DEBOUNCE_MS=1200`
+- `IM_CODEX_DESKTOP_SYNC_COMMAND='open "codex://settings"; sleep 0.12; open "codex://threads/{threadId}"'`
+
+## CI and Quality
+
+- `npm test` (node test runner)
+- `npm run test:coverage`
+- `npm run ci` (tests)
+
+GitHub Actions CI runs tests on Node 24/25.
+
+## Development
+
+```bash
+npm ci
+npm test
+```
+
+Contribution and commit conventions:
+
+- [CONTRIBUTING.md](CONTRIBUTING.md)
+- [AGENTS.md](AGENTS.md)
+
+## Documentation
+
+- Docs index: [references/README.md](references/README.md)
+- Architecture: [references/architecture.md](references/architecture.md)
+- Setup: [references/setup-guides.md](references/setup-guides.md)
+- Usage: [references/usage.md](references/usage.md)
+- Troubleshooting: [references/troubleshooting.md](references/troubleshooting.md)
+- Token validation: [references/token-validation.md](references/token-validation.md)
+
+## License
+
+MIT - see [LICENSE](LICENSE).

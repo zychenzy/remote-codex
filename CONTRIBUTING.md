@@ -33,3 +33,9 @@ Good examples:
 - `feat: add thread resume command in CLI`
 - `fix: recover from stale daemon pid state`
 - `test: add command approval timeout case`
+
+## CI alignment
+
+- Keep CI green across Node 24/25.
+- For behavior changes, include or update tests in the same PR.
+- Prefer small, focused PRs that align with the commit rules above.

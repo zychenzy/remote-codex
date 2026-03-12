@@ -1,100 +1,118 @@
-# Setup guides
+# Setup Guides
 
-`tool setup` collects credentials interactively, but for Discord you still need
-to configure the bot correctly in the Discord Developer Portal first.
+`reco setup` is interactive, but your bot/channel provisioning must be done first.
 
-## Discord setup (v1)
+## Prerequisites
 
-1. Create a bot app.
-- Go to https://discord.com/developers/applications
-- Create a new application.
-- Open the **Bot** tab and create/reset the bot token.
+- Node.js 24+
+- `codex` installed and logged in (`codex login`)
+- Bot token(s) for channel(s) you plan to use
 
-2. Enable required privileged intent.
-- In **Bot** settings, enable **Message Content Intent**.
-- Save changes.
-
-3. Invite bot to your server.
-- Open **OAuth2** -> **URL Generator**.
-- Select scope: `bot`.
-- Select bot permissions: `View Channels`, `Send Messages`, `Read Message History`.
-- Open generated URL and add the bot to your target server.
-
-4. Collect IDs required by this project.
-- `Discord Bot Token`: from Bot tab.
-- `Allowed Channel IDs`: channels where polling should read messages.
-- `Allowed User IDs`: users allowed to execute commands.
-
-Tip: In Discord, enable **Developer Mode** in user settings, then right-click a
-channel/user to copy IDs.
-
-5. Run setup and provide Discord values.
+## Quick bootstrap
 
 ```bash
 ./reco setup
-```
-
-When prompted:
-- `Enable Discord?` -> `y`
-- `Discord bot token` -> paste token
-- `Discord allowlist user IDs` -> comma-separated user IDs
-- `Discord allowed channel IDs for polling` -> comma-separated channel IDs
-- `Default working directory` -> press Enter to use home directory (`~`) or set your own
-
-6. Start daemon and verify.
-
-```bash
 ./reco start
 ./reco status
-./reco logs
 ```
 
-In an allowed channel, send:
-- `/status`
-- `/new`
-- `/ask hello`
-
-If there is no response, run:
+After setup, run:
 
 ```bash
 ./reco doctor
 ```
 
-If you change config later, restart daemon:
+## Discord setup
+
+1. Create app + bot:
+- Open <https://discord.com/developers/applications>
+- Create application
+- Open `Bot` tab and create/reset bot token
+
+2. Enable intent:
+- In `Bot` settings, enable `Message Content Intent`
+
+3. Invite bot:
+- Open `OAuth2` -> `URL Generator`
+- Scope: `bot`
+- Permissions: `View Channels`, `Send Messages`, `Read Message History`
+- Invite to target server
+
+4. Collect IDs:
+- Bot token
+- Text channel ID(s) where bot should poll
+- Allowed user ID(s) for command execution
+
+Tip: enable Discord Developer Mode to copy IDs.
+
+5. Run setup:
+- `Enable Discord?` -> `y`
+- Paste Discord bot token
+- Set Discord allowlist user IDs (csv)
+- Set Discord allowed channel IDs for polling (csv)
+
+6. Optional diagnostics:
 
 ```bash
-./reco restart
+./reco discord channels
+./reco discord verify
 ```
 
-## Bind shortcut after setup
-
-After setup, you can bind Discord without repeating IDs:
+7. Bind:
 
 ```bash
 ./reco bind discord
 ```
 
-This auto-fills:
-- `chatId` from configured `Discord allowed channel IDs` when exactly one is set.
-- `userId` from configured Discord allowlist (first value).
-
-If multiple channel IDs are configured, pass one explicitly:
+If multiple channel IDs exist, specify one:
 
 ```bash
 ./reco bind discord <channelId>
-# or
-./reco bind discord --chat <channelId>
 ```
 
-## Update workspace directory from Discord chat
+## Telegram setup
 
-Use slash command:
+1. Create bot with `@BotFather` and get token.
+2. Get chat ID and user ID(s) allowed to control daemon.
+3. Run setup:
+- `Enable Telegram?` -> `y`
+- Paste Telegram token
+- Provide Telegram allowlist IDs (csv)
+4. Bind:
+
+```bash
+./reco bind telegram <chatId> --user <userId>
+```
+
+## Workspace defaults and overrides
+
+- Setup default workspace: chosen during `reco setup` (defaults to `~`).
+- Per-binding override:
+
+```bash
+./reco bind discord --cwd ~/my-repo
+```
+
+- Runtime override from IM:
 
 ```text
-/cwd ~/code/my-repo
+/cwd ~/my-repo
 ```
 
-Notes:
-- `~` is expanded to your home directory.
-- Relative paths are resolved from current binding workspace.
-- Path must exist and be a directory.
+## Optional desktop sync workaround
+
+When enabled, daemon can trigger a debounced Codex desktop refresh on thread/turn activity.
+
+Enable for a binding:
+
+```bash
+./reco policy set discord <chatId> --desktop-sync true
+./reco restart
+```
+
+Optional env overrides:
+
+```bash
+IM_CODEX_DESKTOP_SYNC_DEBOUNCE_MS=1200
+IM_CODEX_DESKTOP_SYNC_COMMAND='open "codex://settings"; sleep 0.12; open "codex://threads/{threadId}"'
+```
