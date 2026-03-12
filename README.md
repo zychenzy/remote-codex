@@ -11,7 +11,6 @@ This project lets you run Codex on your host machine and control it from chat ap
 - Local single-host deployment (no relay/control plane required).
 - Approval-gated risky operations and allowlist-based access control.
 - Persistent bindings, thread mapping, approvals, and audit logs.
-- Optional desktop sync workaround (disabled by default).
 
 ## Architecture
 
@@ -96,7 +95,7 @@ Bindings and policy:
 
 - `reco bind <channel> [chatId] [--chat <id>] [--user <id>] [--cwd <dir>]`
 - `reco unbind <channel> <chatId>`
-- `reco policy set <channel> <chatId> [--approval <mode>] [--auto-approve <bool>] [--desktop-sync <bool>] [--allowlist <csv>] [--model <id>] [--effort <level>] [--mode <name>]`
+- `reco policy set <channel> <chatId> [--approval <mode>] [--auto-approve <bool>] [--allowlist <csv>] [--model <id>] [--effort <level>] [--mode <name>]`
 
 Discord diagnostics:
 
@@ -122,7 +121,6 @@ Shortcuts/aliases:
 
 - `/new`, `/ask`, `/resume`, `/interrupt`, `/stop`
 - `/threads`, `/archive`, `/status`, `/help`, `/approve`, `/cwd`
-- `reco <command>` prefix is also supported in chat (for example `reco status`) to avoid slash-command UI conflicts in Discord.
 
 ## Security Model
 
@@ -141,23 +139,6 @@ Default base directory: `~/.im-codex-tool`
 - Chat history log: `~/.im-codex-tool/logs/chat-history.jsonl`
 
 Override base dir with `IM_CODEX_HOME`.
-
-## Desktop Sync Workaround (Optional)
-
-When enabled on a binding, daemon can trigger a debounced refresh in Codex desktop during turn activity.
-Default macOS behavior uses background URL opens (`open -g`) to avoid focus stealing.
-
-- Default: disabled
-- Enable per binding:
-
-```bash
-./reco policy set discord <chatId> --desktop-sync true
-```
-
-Optional env overrides:
-
-- `IM_CODEX_DESKTOP_SYNC_DEBOUNCE_MS=1200`
-- `IM_CODEX_DESKTOP_SYNC_COMMAND='open "codex://settings"; sleep 0.12; open "codex://threads/{threadId}"'`
 
 ## CI and Quality
 

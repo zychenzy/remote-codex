@@ -67,15 +67,3 @@ If expired, run the request again.
 
 Your local `codex app-server` may be older than the command surface in this project.
 Upgrade Codex and retry.
-
-## 8) Desktop sync not working
-
-- Feature is disabled by default
-- Enable per binding:
-
-```bash
-./reco policy set discord <chatId> --desktop-sync true
-./reco restart
-```
-
-- On non-macOS, provide custom command with `IM_CODEX_DESKTOP_SYNC_COMMAND`.

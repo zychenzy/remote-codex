@@ -51,5 +51,4 @@ Examples:
 ## Guardrails
 
 - Do not add external relay/mobile flows to v1 core.
-- Keep desktop sync optional and disabled by default.
 - Keep allowlist and approval gating on by default for command/file-change actions.

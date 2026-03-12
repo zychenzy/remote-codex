@@ -40,7 +40,6 @@ Each channel/chat binding stores:
   - `approvalMode`
   - `allowlist`
   - `autoApprove`
-  - `desktopSyncEnabled`
   - `model`
   - `reasoningEffort`
   - `collaborationMode`
