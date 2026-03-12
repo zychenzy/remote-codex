@@ -122,6 +122,7 @@ Shortcuts/aliases:
 
 - `/new`, `/ask`, `/resume`, `/interrupt`, `/stop`
 - `/threads`, `/archive`, `/status`, `/help`, `/approve`, `/cwd`
+- `reco <command>` prefix is also supported in chat (for example `reco status`) to avoid slash-command UI conflicts in Discord.
 
 ## Security Model
 
@@ -144,6 +145,7 @@ Override base dir with `IM_CODEX_HOME`.
 ## Desktop Sync Workaround (Optional)
 
 When enabled on a binding, daemon can trigger a debounced refresh in Codex desktop during turn activity.
+Default macOS behavior uses background URL opens (`open -g`) to avoid focus stealing.
 
 - Default: disabled
 - Enable per binding:

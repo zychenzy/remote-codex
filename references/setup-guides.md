@@ -64,6 +64,13 @@ Tip: enable Discord Developer Mode to copy IDs.
 ./reco bind discord
 ```
 
+If Discord slash UI conflicts with your workflow, use chat commands with `reco` prefix:
+
+```text
+reco status
+reco ask summarize this repo
+```
+
 If multiple channel IDs exist, specify one:
 
 ```bash
@@ -102,6 +109,7 @@ If multiple channel IDs exist, specify one:
 ## Optional desktop sync workaround
 
 When enabled, daemon can trigger a debounced Codex desktop refresh on thread/turn activity.
+Default macOS behavior runs in background mode (`open -g`) to reduce app focus jumps.
 
 Enable for a binding:
 

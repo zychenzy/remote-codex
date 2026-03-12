@@ -46,6 +46,14 @@ Change workspace later:
 /stop
 ```
 
+Slash-free alternative for Discord:
+
+```text
+reco status
+reco thread list
+reco ask summarize this repository
+```
+
 Thread management:
 
 ```text
@@ -55,6 +63,8 @@ Thread management:
 /resume <threadId>
 /thread archive <threadId> --confirm
 ```
+
+When you `/resume <threadId>`, daemon also sends a short preview of recent messages from that thread.
 
 Model and skills:
 
