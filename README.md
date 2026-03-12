@@ -25,6 +25,8 @@ A local-first daemon that controls `codex app-server` from IM channels.
 ./reco stop
 ./reco restart
 ./reco status
+./reco help
+./reco help bind
 ./reco logs
 ./reco doctor
 ./reco bind telegram 123456 --user 123456 --cwd /path/to/repo

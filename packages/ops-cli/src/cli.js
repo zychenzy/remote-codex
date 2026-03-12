@@ -39,6 +39,151 @@ const store = new StateStore({ baseDir: BASE_DIR });
 const PID_FILE = path.join(store.runtimeDir, "daemon.pid");
 const STATUS_FILE = path.join(store.runtimeDir, "status.json");
 
+const HELP_TOPICS = {
+  setup: {
+    summary: "Interactive configuration wizard for runtime and channel credentials.",
+    usage: "reco setup",
+    examples: [
+      "reco setup",
+    ],
+  },
+  start: {
+    summary: "Start daemon in background.",
+    usage: "reco start",
+    examples: [
+      "reco start",
+    ],
+  },
+  stop: {
+    summary: "Stop running daemon.",
+    usage: "reco stop",
+    examples: [
+      "reco stop",
+    ],
+  },
+  restart: {
+    summary: "Restart daemon (stop if running, then start).",
+    usage: "reco restart",
+    examples: [
+      "reco restart",
+    ],
+  },
+  status: {
+    summary: "Show daemon status, PID, and runtime baseDir.",
+    usage: "reco status",
+    examples: [
+      "reco status",
+    ],
+  },
+  logs: {
+    summary: "Show recent daemon logs.",
+    usage: "reco logs [lines]",
+    examples: [
+      "reco logs",
+      "reco logs 200",
+    ],
+  },
+  doctor: {
+    summary: "Run health checks (codex, config permissions, bindings, pending approvals).",
+    usage: "reco doctor",
+    examples: [
+      "reco doctor",
+    ],
+  },
+  bind: {
+    summary: "Create or update channel binding to workspace/thread policy.",
+    usage: "reco bind <channel> [chatId] [--chat <id>] [--user <id>] [--cwd <dir>]",
+    examples: [
+      "reco bind discord",
+      "reco bind discord 123456789012345678 --user 99887766",
+      "reco bind telegram 123456 --user 123456 --cwd ~/code/my-repo",
+    ],
+  },
+  unbind: {
+    summary: "Remove an existing channel binding.",
+    usage: "reco unbind <channel> <chatId>",
+    examples: [
+      "reco unbind discord 123456789012345678",
+    ],
+  },
+  threads: {
+    summary: "Inspect and resume Codex threads through app-server.",
+    usage: "reco threads <list|resume> [args]",
+    examples: [
+      "reco threads list",
+      "reco threads resume <threadId> --channel discord --chat 123456789012345678",
+    ],
+  },
+  resume: {
+    summary: "Shortcut: attach an existing thread id to a binding.",
+    usage: "reco resume <threadId> <channel> <chatId>",
+    examples: [
+      "reco resume 019cdd3b-cdee-7202-ba1b-b0c5713f9fb3 discord 123456789012345678",
+    ],
+  },
+  policy: {
+    summary: "Update binding policy options (approval mode, auto-approve, allowlist).",
+    usage: "reco policy set <channel> <chatId> [--approval <mode>] [--auto-approve <bool>] [--desktop-sync <bool>] [--allowlist <csv>]",
+    examples: [
+      "reco policy set discord 123456789012345678 --approval on-request --auto-approve false",
+      "reco policy set telegram 123456 --allowlist 123456,789012",
+    ],
+  },
+  help: {
+    summary: "Show general or command-specific help.",
+    usage: "reco help [command]",
+    examples: [
+      "reco help",
+      "reco help bind",
+    ],
+  },
+};
+
+function printGeneralHelp() {
+  const ordered = [
+    "setup", "start", "stop", "restart", "status", "logs", "doctor",
+    "bind", "unbind", "threads", "resume", "policy", "help",
+  ];
+
+  console.log("reco - IM-first Codex remote control CLI");
+  console.log("");
+  console.log("Usage:");
+  console.log("  reco <command> [args]");
+  console.log("");
+  console.log("Commands:");
+  for (const key of ordered) {
+    console.log(`  ${key.padEnd(9)} ${HELP_TOPICS[key].summary}`);
+  }
+  console.log("");
+  console.log("Examples:");
+  console.log("  reco setup");
+  console.log("  reco start");
+  console.log("  reco bind discord");
+  console.log("  reco policy set discord <chatId> --approval on-request");
+  console.log("  reco help bind");
+}
+
+function printCommandHelp(command) {
+  const topic = HELP_TOPICS[command];
+  if (!topic) {
+    console.log(`Unknown help topic: ${command}`);
+    console.log("Run `reco help` to list commands.");
+    return;
+  }
+
+  console.log(`reco ${command}`);
+  console.log("");
+  console.log(topic.summary);
+  console.log("");
+  console.log("Usage:");
+  console.log(`  ${topic.usage}`);
+  console.log("");
+  console.log("Examples:");
+  for (const example of topic.examples) {
+    console.log(`  ${example}`);
+  }
+}
+
 function writeStatus(status) {
   const temp = `${STATUS_FILE}.tmp`;
   fs.writeFileSync(temp, JSON.stringify(status, null, 2));
@@ -397,8 +542,21 @@ async function cmdPolicy(args) {
 
 async function main() {
   const [command, ...args] = process.argv.slice(2);
+  const normalized = command || "help";
 
-  switch (command) {
+  if (normalized === "--help" || normalized === "-h") {
+    printGeneralHelp();
+    return;
+  }
+
+  switch (normalized) {
+    case "help":
+      if (args[0]) {
+        printCommandHelp(args[0]);
+      } else {
+        printGeneralHelp();
+      }
+      break;
     case "setup":
       await cmdSetup();
       break;
@@ -446,7 +604,9 @@ async function main() {
       await cmdPolicy(args);
       break;
     default:
-      console.log("Usage: reco <setup|start|stop|restart|status|logs|doctor|bind|unbind|threads|resume|policy>");
+      console.log(`Unknown command: ${normalized}`);
+      console.log("");
+      printGeneralHelp();
   }
 }
 
