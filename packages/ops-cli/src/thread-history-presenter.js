@@ -25,8 +25,8 @@ function sleep(ms) {
 }
 
 export class ThreadHistoryPresenter {
-  constructor({ runtime, logger = console, sendMessage, sendLongMessage } = {}) {
-    this.runtime = runtime;
+  constructor({ runtime, getRuntime, logger = console, sendMessage, sendLongMessage } = {}) {
+    this.getRuntime = typeof getRuntime === "function" ? getRuntime : () => runtime;
     this.logger = logger;
     this.sendMessage = sendMessage;
     this.sendLongMessage = sendLongMessage;
@@ -34,7 +34,8 @@ export class ThreadHistoryPresenter {
 
   async renderMessages(threadId, { turns = null, textLimit = null } = {}) {
     try {
-      const read = await this.runtime.readThread({ threadId, includeTurns: true });
+      const runtime = this.getRuntime();
+      const read = await runtime.readThread({ threadId, includeTurns: true });
       const allTurns = Array.isArray(read?.thread?.turns) ? read.thread.turns : [];
       const selectedTurns = Number.isFinite(Number(turns))
         ? allTurns.slice(-Math.max(0, Number(turns)))

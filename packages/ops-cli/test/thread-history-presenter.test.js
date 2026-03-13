@@ -63,3 +63,36 @@ test("thread history presenter sends long blocks via sendLongMessage", async () 
   assert.equal(sent[0].startsWith("Thread history"), true);
   assert.equal(longSent.length, 1);
 });
+
+test("thread history presenter resolves runtime dynamically from getter", async () => {
+  const oldRuntime = {
+    readThread: async () => {
+      throw new Error("old runtime should not be used");
+    },
+  };
+  const newRuntime = {
+    readThread: async () => ({
+      thread: {
+        turns: [
+          {
+            items: [
+              { type: "agentMessage", content: [{ type: "text", text: "from-new-runtime" }] },
+            ],
+          },
+        ],
+      },
+    }),
+  };
+
+  const runtimeRef = { current: oldRuntime };
+  const presenter = new ThreadHistoryPresenter({
+    getRuntime: () => runtimeRef.current,
+    logger: { debug: () => {} },
+    sendMessage: async () => {},
+    sendLongMessage: async () => {},
+  });
+
+  runtimeRef.current = newRuntime;
+  const messages = await presenter.renderMessages("thread-dynamic");
+  assert.equal(messages.some((text) => text.includes("from-new-runtime")), true);
+});

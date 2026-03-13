@@ -223,6 +223,16 @@ test("daemon emits file-change diffs as fenced code blocks without persisting th
     await sleep(20);
 
     runtime.emit("notification", {
+      method: "turn/diff/updated",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-5",
+        diff: "diff --git a/src/example.js b/src/example.js\n@@ -1 +1 @@\n-console.log('a')\n+console.log('b')",
+      },
+    });
+    await sleep(20);
+
+    runtime.emit("notification", {
       method: "item/completed",
       params: {
         threadId: "thread-1",
@@ -247,10 +257,108 @@ test("daemon emits file-change diffs as fenced code blocks without persisting th
   }
 
   assert.equal(adapter.messages.some((item) => item.text.includes("```diff")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Turn diff (aggregated)")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("diff --git a/src/example.js b/src/example.js")), true);
   const historyPath = app.chatHistoryPath;
   const historyText = fs.existsSync(historyPath) ? fs.readFileSync(historyPath, "utf8") : "";
   assert.equal(historyText.includes("```diff"), false);
   assert.equal(historyText.includes("src/example.js"), false);
+});
+
+test("daemon falls back to fileChange outputDelta when completed item has no diff field", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+  try {
+    runtime.emit("notification", {
+      method: "turn/started",
+      params: { threadId: "thread-1", turnId: "turn-6" },
+    });
+    await sleep(20);
+
+    runtime.emit("notification", {
+      method: "item/fileChange/outputDelta",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-6",
+        itemId: "file-2",
+        delta: "@@ -10,2 +10,3 @@\n-const oldValue = 1;\n+const oldValue = 2;\n+const added = true;",
+      },
+    });
+    await sleep(20);
+
+    runtime.emit("notification", {
+      method: "item/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-6",
+        item: {
+          id: "file-2",
+          type: "fileChange",
+          status: "completed",
+          changes: [
+            {
+              path: "src/fallback.js",
+              kind: "modified",
+              diff: "",
+            },
+          ],
+        },
+      },
+    });
+    await sleep(40);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(adapter.messages.some((item) => item.text.includes("Patch diff")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("+const added = true;")), true);
+  const historyText = fs.existsSync(app.chatHistoryPath) ? fs.readFileSync(app.chatHistoryPath, "utf8") : "";
+  assert.equal(historyText.includes("Patch diff"), false);
+});
+
+test("daemon summarizes whole-file add/remove changes with compact +/- placeholders", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+  try {
+    runtime.emit("notification", {
+      method: "turn/started",
+      params: { threadId: "thread-1", turnId: "turn-7" },
+    });
+    await sleep(20);
+
+    runtime.emit("notification", {
+      method: "item/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-7",
+        item: {
+          id: "file-3",
+          type: "fileChange",
+          status: "completed",
+          changes: [
+            {
+              path: "src/new-file.js",
+              kind: "added",
+              diff: "@@ -0,0 +1,200 @@\n+const veryLarge = true;\n+more lines...",
+            },
+            {
+              path: "src/old-file.js",
+              kind: "deleted",
+              diff: "@@ -1,200 +0,0 @@\n-const removed = true;\n-more lines...",
+            },
+          ],
+        },
+      },
+    });
+    await sleep(40);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(adapter.messages.some((item) => item.text.includes("Path: src/new-file.js (added)")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Path: src/old-file.js (deleted)")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("+ [full file content omitted]")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("- [full file content omitted]")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("+const veryLarge = true")), false);
+  assert.equal(adapter.messages.some((item) => item.text.includes("-const removed = true")), false);
 });
 
 test("daemon requeues chat history after flush failure and persists after path recovery", async () => {

@@ -10,16 +10,50 @@ function normalizeTurnStatus(status) {
   return "completed";
 }
 
+function normalizeChangeKind(kind) {
+  return String(kind || "").trim().toLowerCase();
+}
+
+function isWholeFileChange(kind) {
+  const normalized = normalizeChangeKind(kind);
+  return ["added", "deleted", "removed"].includes(normalized);
+}
+
+function wholeFilePlaceholderDiff(kind, filePath) {
+  const normalized = normalizeChangeKind(kind);
+  const safePath = String(filePath || "").trim();
+  if (normalized === "added") {
+    const rhs = safePath ? `b/${safePath}` : "/dev/null";
+    return [
+      `+++ ${rhs}`,
+      "+ [full file content omitted]",
+    ].join("\n");
+  }
+  const lhs = safePath ? `a/${safePath}` : "/dev/null";
+  return [
+    `--- ${lhs}`,
+    "- [full file content omitted]",
+  ].join("\n");
+}
+
 function fileChangeDiffText(item) {
   const changes = Array.isArray(item?.changes) ? item.changes : [];
   const blocks = [];
   for (const change of changes) {
+    const kind = normalizeChangeKind(change?.kind);
+    const filePath = String(change?.path || "").trim();
+    const header = filePath
+      ? `Path: ${filePath}${kind ? ` (${kind})` : ""}`
+      : `Path: (unknown)${kind ? ` (${kind})` : ""}`;
+    if (isWholeFileChange(kind)) {
+      blocks.push(formatDiffBlock(header, wholeFilePlaceholderDiff(kind, filePath)));
+      continue;
+    }
+
     const diff = String(change?.diff || "").trim();
     if (!diff) {
       continue;
     }
-    const filePath = String(change?.path || "").trim();
-    const header = filePath ? `Path: ${filePath}` : "Path: (unknown)";
     blocks.push([
       header,
       "```diff",
@@ -28,6 +62,48 @@ function fileChangeDiffText(item) {
     ].join("\n"));
   }
   return blocks.join("\n\n");
+}
+
+function trimToLimit(text, maxLen = 120_000) {
+  const input = String(text || "");
+  if (!input) {
+    return "";
+  }
+  if (input.length <= maxLen) {
+    return input;
+  }
+  return input.slice(input.length - maxLen);
+}
+
+function cacheKeyFromIds(threadId, turnId) {
+  const turn = String(turnId || "").trim();
+  if (turn) {
+    return `turn:${turn}`;
+  }
+  const thread = String(threadId || "").trim();
+  if (thread) {
+    return `thread:${thread}`;
+  }
+  return "";
+}
+
+function hasWholeFileChanges(item) {
+  const changes = Array.isArray(item?.changes) ? item.changes : [];
+  return changes.some((change) => isWholeFileChange(change?.kind));
+}
+
+function isUnifiedDiffText(text) {
+  const input = String(text || "");
+  return /(^|\n)(diff --git |@@ |--- |\+\+\+ )/.test(input);
+}
+
+function formatDiffBlock(header, diffText) {
+  return [
+    header,
+    "```diff",
+    String(diffText || "").trim(),
+    "```",
+  ].join("\n");
 }
 
 export class TurnEventRouter {
@@ -64,6 +140,9 @@ export class TurnEventRouter {
     this.allAgentTextFromTurn = allAgentTextFromTurn;
     this.onSkillsChanged = onSkillsChanged;
     this.deliveredFileChangeItemIds = new Set();
+    this.fileChangeOutputByItemId = new Map();
+    this.latestTurnDiffByKey = new Map();
+    this.deliveredTurnDiffByKey = new Set();
   }
 
   async handle(notification) {
@@ -84,6 +163,16 @@ export class TurnEventRouter {
 
     if (method === "item/completed") {
       await this.#handleItemCompleted(params);
+      return;
+    }
+
+    if (method === "item/fileChange/outputDelta") {
+      this.#handleFileChangeOutputDelta(params);
+      return;
+    }
+
+    if (method === "turn/diff/updated") {
+      this.#handleTurnDiffUpdated(params);
       return;
     }
 
@@ -220,7 +309,34 @@ export class TurnEventRouter {
       return;
     }
 
-    const diffText = fileChangeDiffText(item);
+    const cacheKey = cacheKeyFromIds(threadId, turnId);
+    const turnDiffText = cacheKey ? String(this.latestTurnDiffByKey.get(cacheKey) || "").trim() : "";
+    const toolOutputText = itemId ? String(this.fileChangeOutputByItemId.get(itemId) || "").trim() : "";
+    if (itemId) {
+      this.fileChangeOutputByItemId.delete(itemId);
+    }
+
+    const perItemDiff = fileChangeDiffText(item);
+    const preferPerItem = hasWholeFileChanges(item);
+    let diffText = "";
+    if (preferPerItem && perItemDiff) {
+      diffText = perItemDiff;
+    } else if (turnDiffText && !this.deliveredTurnDiffByKey.has(cacheKey) && isUnifiedDiffText(turnDiffText)) {
+      diffText = formatDiffBlock("Turn diff (aggregated)", turnDiffText);
+      this.deliveredTurnDiffByKey.add(cacheKey);
+      if (this.deliveredTurnDiffByKey.size > 2000) {
+        const oldest = this.deliveredTurnDiffByKey.values().next().value;
+        if (oldest) {
+          this.deliveredTurnDiffByKey.delete(oldest);
+        }
+      }
+    } else {
+      if (perItemDiff) {
+        diffText = perItemDiff;
+      } else if (toolOutputText && isUnifiedDiffText(toolOutputText)) {
+        diffText = formatDiffBlock("Patch diff", toolOutputText);
+      }
+    }
     if (!diffText) {
       return;
     }
@@ -249,6 +365,11 @@ export class TurnEventRouter {
   async #handleTurnCompleted(params) {
     const threadId = detectThreadId(params);
     const turnId = detectTurnId(params);
+    const cacheKey = cacheKeyFromIds(threadId, turnId);
+    if (cacheKey) {
+      this.latestTurnDiffByKey.delete(cacheKey);
+      this.deliveredTurnDiffByKey.delete(cacheKey);
+    }
     const suppressed = Boolean(turnId && this.suppressedTurnIds.has(String(turnId)));
     const bKey = turnId ? this.turnToBinding.get(turnId) : this.threadToBinding.get(threadId);
     const finalFromStream = this.turnOutput.takeFinal(threadId, turnId);
@@ -296,6 +417,45 @@ export class TurnEventRouter {
     }
     this.turnToBinding.delete(turnId);
     this.activeTurnByBinding.delete(bKey);
+  }
+
+  #handleFileChangeOutputDelta(params) {
+    const itemId = String(params?.itemId || params?.item?.id || "").trim();
+    if (!itemId) {
+      return;
+    }
+    const delta = detectDelta(params) || params?.outputDelta || "";
+    if (!delta) {
+      return;
+    }
+    const existing = String(this.fileChangeOutputByItemId.get(itemId) || "");
+    this.fileChangeOutputByItemId.set(itemId, trimToLimit(`${existing}${String(delta)}`));
+    if (this.fileChangeOutputByItemId.size > 2000) {
+      const oldest = this.fileChangeOutputByItemId.keys().next().value;
+      if (oldest) {
+        this.fileChangeOutputByItemId.delete(oldest);
+      }
+    }
+  }
+
+  #handleTurnDiffUpdated(params) {
+    const threadId = detectThreadId(params);
+    const turnId = detectTurnId(params);
+    const key = cacheKeyFromIds(threadId, turnId);
+    if (!key) {
+      return;
+    }
+    const diff = String(params?.diff || detectDelta(params) || "").trim();
+    if (!diff) {
+      return;
+    }
+    this.latestTurnDiffByKey.set(key, trimToLimit(diff));
+    if (this.latestTurnDiffByKey.size > 2000) {
+      const oldest = this.latestTurnDiffByKey.keys().next().value;
+      if (oldest) {
+        this.latestTurnDiffByKey.delete(oldest);
+      }
+    }
   }
 
   #handleThreadClosed(params) {

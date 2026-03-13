@@ -367,7 +367,7 @@ export class DaemonApp {
     });
 
     this.threadHistoryPresenter = new ThreadHistoryPresenter({
-      runtime: this.runtime,
+      getRuntime: () => this.runtime,
       logger: this.logger,
       sendMessage: (adapter, context, text) => this.#sendMessage(adapter, context, text),
       sendLongMessage: (adapter, context, text, options) => this.#sendLongMessage(adapter, context, text, options),
