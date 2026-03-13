@@ -12,7 +12,7 @@ test("approval broker resolves pending request once", async () => {
       method: "item/commandExecution/requestApproval",
       params: { threadId: "t1" },
     },
-    binding: { channel: "telegram", chatId: "1" },
+    binding: { channel: "discord", chatId: "1" },
     autoApprove: false,
   });
 

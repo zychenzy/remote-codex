@@ -35,14 +35,7 @@ Common Discord error:
 
 - `Unknown Channel (code 10003)` means configured channel ID is wrong/inaccessible.
 
-## 4) Telegram connected but no replies
-
-- Confirm token is valid
-- Confirm chat ID and user ID are correct
-- Check allowlist in config
-- Restart daemon after config updates
-
-## 5) `thread not found` in logs
+## 4) `thread not found` in logs
 
 This can happen when a stored thread is stale/unavailable in runtime.
 The daemon has stale-thread recovery on ask/start flows, but you can also:
@@ -52,7 +45,7 @@ The daemon has stale-thread recovery on ask/start flows, but you can also:
 /ask <prompt>
 ```
 
-## 6) Approval requests time out
+## 5) Approval requests time out
 
 - Pending approvals expire (default: 5 minutes)
 - Approve quickly from IM:
@@ -63,7 +56,7 @@ The daemon has stale-thread recovery on ask/start flows, but you can also:
 
 If expired, run the request again.
 
-## 7) Model/skill command returns unsupported method
+## 6) Model/skill command returns unsupported method
 
 Your local `codex app-server` may be older than the command surface in this project.
 Upgrade Codex and retry.

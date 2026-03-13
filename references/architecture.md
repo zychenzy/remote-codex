@@ -5,7 +5,7 @@
 - Single local daemon process
 - Single Codex backend: `codex app-server`
 - JSON-RPC transport over stdio
-- IM adapters (Discord/Telegram) as ingress/egress channels
+- IM adapter (Discord) as ingress/egress channel
 
 ## Core modules
 

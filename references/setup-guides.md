@@ -6,7 +6,7 @@
 
 - Node.js 24+
 - `codex` installed and logged in (`codex login`)
-- Bot token(s) for channel(s) you plan to use
+- Discord bot token for your target server
 
 ## Quick bootstrap
 
@@ -68,20 +68,6 @@ If multiple channel IDs exist, specify one:
 
 ```bash
 ./reco bind discord <channelId>
-```
-
-## Telegram setup
-
-1. Create bot with `@BotFather` and get token.
-2. Get chat ID and user ID(s) allowed to control daemon.
-3. Run setup:
-- `Enable Telegram?` -> `y`
-- Paste Telegram token
-- Provide Telegram allowlist IDs (csv)
-4. Bind:
-
-```bash
-./reco bind telegram <chatId> --user <userId>
 ```
 
 ## Workspace defaults and overrides

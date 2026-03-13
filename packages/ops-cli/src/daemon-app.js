@@ -5,7 +5,6 @@ import process from "node:process";
 
 import { AppServerRuntime } from "../../core-runtime/src/index.js";
 import {
-  TelegramAdapter,
   DiscordAdapter,
   parseIncomingCommand,
 } from "../../im-gateway/src/index.js";
@@ -505,17 +504,6 @@ export class DaemonApp {
 
   async #startAdapters() {
     const channels = this.config.channels || {};
-
-    if (channels.telegram?.enabled && channels.telegram.botToken) {
-      const telegram = new TelegramAdapter({
-        token: channels.telegram.botToken,
-        logger: this.logger,
-      });
-      telegram.registerInboundHandler((context) => {
-        this.#handleInboundSafe(context).catch((error) => this.logger.error("telegram inbound failed", error));
-      });
-      this.adapters.push(telegram);
-    }
 
     if (channels.discord?.enabled && channels.discord.botToken) {
       const discord = new DiscordAdapter({

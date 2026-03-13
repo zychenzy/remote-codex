@@ -9,7 +9,7 @@
 ## Development expectations
 
 - Keep runtime integration centered on `codex app-server`.
-- Keep Telegram/Discord adapters aligned with the `ChannelAdapter` interface.
+- Keep the Discord adapter aligned with the `ChannelAdapter` interface.
 - Preserve secure defaults:
   - allowlists for command execution
   - approval prompts for command/file-change operations

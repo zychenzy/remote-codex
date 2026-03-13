@@ -74,11 +74,6 @@ export class StateStore {
         approvalMode: raw?.defaults?.approvalMode || "on-request",
       },
       channels: {
-        telegram: {
-          enabled: Boolean(raw?.channels?.telegram?.enabled),
-          botToken: raw?.channels?.telegram?.botToken || "",
-          allowlist: raw?.channels?.telegram?.allowlist || [],
-        },
         discord: {
           enabled: Boolean(raw?.channels?.discord?.enabled),
           botToken: raw?.channels?.discord?.botToken || "",

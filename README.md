@@ -2,12 +2,12 @@
 
 IM-first remote control daemon for Codex, backed by `codex app-server`.
 
-This project lets you run Codex on your host machine and control it from chat apps (Discord/Telegram), while keeping operations local and policy-gated.
+This project lets you run Codex on your host machine and control it from Discord, while keeping operations local and policy-gated.
 
 ## Highlights
 
 - Native `codex app-server` integration (JSON-RPC, thread/turn/model/skills methods).
-- IM-first operator flow (Discord + Telegram).
+- IM-first operator flow (Discord).
 - Discord turn output streams by editing a single message (lower message burst/rate pressure).
 - Local single-host deployment (no relay/control plane required).
 - Approval-gated risky operations and allowlist-based access control.
@@ -16,21 +16,20 @@ This project lets you run Codex on your host machine and control it from chat ap
 ## Architecture
 
 - `packages/core-runtime`: app-server process lifecycle + JSON-RPC client.
-- `packages/im-gateway`: Discord/Telegram adapters + IM command parsing.
+- `packages/im-gateway`: Discord adapter + IM command parsing.
 - `packages/state-store`: local config/state/audit persistence.
 - `packages/ops-cli`: daemon orchestration, runtime wiring, CLI commands.
 
 System view (module-first, non-Mermaid):
 
 ```text
-+-----------------------+       +-----------------------+
-| Discord Adapter       |       | Telegram Adapter      |
-| (im-gateway)          |       | (im-gateway)          |
-+-----------+-----------+       +-----------+-----------+
-            \                           /
-             \                         /
-              v                       v
-        +-----+-----------------------+--------------------+
++-----------------------+
+| Discord Adapter       |
+| (im-gateway)          |
++-----------+-----------+
+            |
+            v
+        +---+--------------------------------------------+
         |           Daemon Orchestrator (ops-cli)         |
         | - command routing (/thread,/turn,/model,/skills)|
         | - binding allowlist + approval gating            |
@@ -63,7 +62,7 @@ Reference projects are kept in `ref/` for lookup only.
 - macOS or Linux
 - Node.js 24 LTS or newer
 - `codex` CLI installed and authenticated (`codex login`)
-- Discord and/or Telegram bot credentials
+- Discord bot credentials
 
 ## Install
 
@@ -99,8 +98,6 @@ reco help
 
 ```bash
 ./reco bind discord
-# or
-./reco bind telegram <chatId> --user <userId>
 ```
 
 4. In your IM chat:
@@ -130,9 +127,8 @@ Core:
 
 Bindings and policy:
 
-- `reco bind <channel> [chatId] [--chat <id>] [--user <id>] [--cwd <dir>]`
+- `reco bind discord [chatId] [--chat <id>] [--user <id>] [--cwd <dir>]`
 - `reco unbind <channel> <chatId>`
-- `reco policy set <channel> <chatId> [--approval <mode>] [--auto-approve <bool>] [--allowlist <csv>] [--model <id>] [--effort <level>] [--mode <name>]`
 - `reco policy set <channel> <chatId> [--approval <mode>] [--auto-approve <bool>] [--allowlist <csv>] [--model <id>] [--effort <level>] [--mode <name>]`
 
 Discord diagnostics:

@@ -74,7 +74,7 @@ test("reconcileRuntimeState clears stale bindings and resets turn maps", async (
 
 test("reconcileRuntimeState refreshes binding cwd from runtime thread metadata", async () => {
   const binding = {
-    channel: "telegram",
+    channel: "discord",
     chatId: "77",
     threadId: "thread-1",
     workingDir: "/old-cwd",
@@ -111,4 +111,3 @@ test("reconcileRuntimeState refreshes binding cwd from runtime thread metadata",
   assert.equal(upserts.length, 1);
   assert.equal(upserts[0].workingDir, "/new-cwd");
 });
-

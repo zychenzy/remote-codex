@@ -14,11 +14,6 @@ This project validates channel credentials by performing lightweight API calls d
 
 to validate configured channel IDs against the current bot token.
 
-## Telegram
-
-- Validation occurs via Telegram Bot API calls (`getUpdates`, `sendMessage`).
-- Token issues appear as adapter polling/sending errors in daemon logs.
-
 ## Security Notes
 
 - Tokens are stored locally in `~/.im-codex-tool/config.json`.

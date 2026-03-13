@@ -5,7 +5,7 @@ This repository contains an IM-first Codex remote-control daemon.
 ## Project intent
 
 - Runtime backend is `codex app-server` only.
-- v1 channels are Telegram and Discord.
+- v1 channel is Discord.
 - Deployment model is local/single-host daemon (no external control plane).
 - CLI is the operator surface.
 

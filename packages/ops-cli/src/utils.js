@@ -90,7 +90,7 @@ export function resolveBindTargets({ channel, chatIdArg, userIdArg, config }) {
 
   if (!chatId) {
     return {
-      error: "Missing chatId. Usage: tool bind <channel> <chatId> [--user <id>] [--cwd <dir>]",
+      error: "Missing chatId. Usage: reco bind discord [chatId] [--chat <id>] [--user <id>] [--cwd <dir>]",
     };
   }
 

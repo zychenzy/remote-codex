@@ -15,7 +15,7 @@ test("binding persistence across store reload", () => {
   const store1 = new StateStore({ baseDir: dir });
 
   store1.upsertBinding({
-    channel: "telegram",
+    channel: "discord",
     chatId: "123",
     userId: "u1",
     workingDir: "/tmp",
@@ -34,8 +34,8 @@ test("binding persistence across store reload", () => {
   });
 
   const store2 = new StateStore({ baseDir: dir });
-  const binding = store2.getBinding("telegram", "123");
-  assert.equal(binding.channel, "telegram");
+  const binding = store2.getBinding("discord", "123");
+  assert.equal(binding.channel, "discord");
   assert.deepEqual(binding.policyProfile.allowlist, ["u1"]);
   assert.equal(binding.policyProfile.model, "gpt-5.3-codex");
   assert.equal(binding.policyProfile.reasoningEffort, "medium");
@@ -51,7 +51,7 @@ test("pending approval create and resolve", () => {
     localRequestId: "req-1",
     serverRequestId: "srv-1",
     method: "item/commandExecution/requestApproval",
-    binding: { channel: "telegram", chatId: "1" },
+    binding: { channel: "discord", chatId: "1" },
   });
 
   let pending = store.getPendingApprovals();

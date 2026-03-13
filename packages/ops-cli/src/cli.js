@@ -95,12 +95,11 @@ const HELP_TOPICS = {
   },
   bind: {
     summary: "Create or update channel binding to workspace/thread policy.",
-    usage: "reco bind <channel> [chatId] [--chat <id>] [--user <id>] [--cwd <dir>]",
+    usage: "reco bind discord [chatId] [--chat <id>] [--user <id>] [--cwd <dir>]",
     examples: [
       "reco bind discord",
       "reco bind discord 123456789012345678",
       "reco bind discord 123456789012345678 --user 99887766",
-      "reco bind telegram 123456 --user 123456 --cwd ~/code/my-repo",
     ],
   },
   discord: {
@@ -138,7 +137,6 @@ const HELP_TOPICS = {
     usage: "reco policy set <channel> <chatId> [--approval <mode>] [--auto-approve <bool>] [--allowlist <csv>] [--model <id>] [--effort <level>] [--mode <name>]",
     examples: [
       "reco policy set discord 123456789012345678 --approval on-request --auto-approve false",
-      "reco policy set telegram 123456 --allowlist 123456,789012",
       "reco policy set discord 123456789012345678 --model gpt-5.3-codex",
       "reco policy set discord 123456789012345678 --effort high --mode default",
     ],
@@ -238,14 +236,6 @@ async function cmdSetup() {
   const workingDir = (await rl.question(`Default working directory [${existing.defaults.workingDir}]: `)).trim() || existing.defaults.workingDir;
   const approvalMode = (await rl.question(`Default approval mode (on-request|never|untrusted) [${existing.defaults.approvalMode}]: `)).trim() || existing.defaults.approvalMode;
 
-  const telegramEnabled = toBoolean((await rl.question(`Enable Telegram? (y/n) [${existing.channels.telegram.enabled ? "y" : "n"}]: `)).trim() || (existing.channels.telegram.enabled ? "y" : "n"));
-  const telegramToken = telegramEnabled
-    ? ((await rl.question(`Telegram bot token [${existing.channels.telegram.botToken ? "***" : ""}]: `)).trim() || existing.channels.telegram.botToken)
-    : "";
-  const telegramAllowlist = telegramEnabled
-    ? splitCsv((await rl.question(`Telegram allowlist user IDs (csv) [${(existing.channels.telegram.allowlist || []).join(",")}]: `)).trim() || (existing.channels.telegram.allowlist || []).join(","))
-    : [];
-
   const discordEnabled = toBoolean((await rl.question(`Enable Discord? (y/n) [${existing.channels.discord.enabled ? "y" : "n"}]: `)).trim() || (existing.channels.discord.enabled ? "y" : "n"));
   const discordToken = discordEnabled
     ? ((await rl.question(`Discord bot token [${existing.channels.discord.botToken ? "***" : ""}]: `)).trim() || existing.channels.discord.botToken)
@@ -266,11 +256,6 @@ async function cmdSetup() {
       approvalMode,
     },
     channels: {
-      telegram: {
-        enabled: telegramEnabled,
-        botToken: telegramToken,
-        allowlist: telegramAllowlist,
-      },
       discord: {
         enabled: discordEnabled,
         botToken: discordToken,
@@ -430,7 +415,13 @@ async function cmdBind(args) {
   const cwd = getArgValue(args, "--cwd", config.defaults.workingDir);
 
   if (!channel) {
-    console.log("Usage: reco bind <channel> [chatId] [--chat <id>] [--user <id>] [--cwd <dir>]");
+    console.log("Usage: reco bind discord [chatId] [--chat <id>] [--user <id>] [--cwd <dir>]");
+    return;
+  }
+
+  if (channel !== "discord") {
+    console.log(`Unsupported channel: ${channel}. Only discord is supported.`);
+    console.log("Usage: reco bind discord [chatId] [--chat <id>] [--user <id>] [--cwd <dir>]");
     return;
   }
 
@@ -443,7 +434,7 @@ async function cmdBind(args) {
 
   if (resolved.error) {
     console.log(resolved.error);
-    console.log("Usage: reco bind <channel> [chatId] [--chat <id>] [--user <id>] [--cwd <dir>]");
+    console.log("Usage: reco bind discord [chatId] [--chat <id>] [--user <id>] [--cwd <dir>]");
     return;
   }
 

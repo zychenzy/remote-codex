@@ -7,7 +7,7 @@
 
 ## Access control
 
-- Telegram/Discord allowlists gate inbound command handling.
+- Discord allowlist gates inbound command handling.
 - Command/file change approvals default to explicit user confirmation.
 
 ## Logging

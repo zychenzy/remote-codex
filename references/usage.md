@@ -24,12 +24,6 @@ Bind Discord (auto-infers IDs when unambiguous):
 ./reco bind discord
 ```
 
-Bind Telegram:
-
-```bash
-./reco bind telegram <chatId> --user <userId> --cwd ~/my-repo
-```
-
 Change workspace later:
 
 ```text
