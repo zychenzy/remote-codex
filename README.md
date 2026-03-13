@@ -8,7 +8,7 @@ This project lets you run Codex on your host machine and control it from Discord
 
 - Native `codex app-server` integration (JSON-RPC, thread/turn/model/skills methods).
 - IM-first operator flow (Discord).
-- Discord turn output streams by editing a single message (lower message burst/rate pressure).
+- Discord turn output is delivered progressively by completed sections; only any unfinished tail is sent at completion.
 - Local single-host deployment (no relay/control plane required).
 - Approval-gated risky operations and allowlist-based access control.
 - Persistent bindings, thread mapping, approvals, and audit logs.

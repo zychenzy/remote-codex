@@ -52,3 +52,9 @@ Examples:
 
 - Do not add external relay/mobile flows to v1 core.
 - Keep allowlist and approval gating on by default for command/file-change actions.
+
+## Output behavior
+
+- Treat live Codex turn replies and resume chat history as different delivery modes.
+- Live Codex replies can use progressive section streaming for readability.
+- Resume chat history (`/resume`, `/thread read` history views) should preserve full turn blocks and must not be reformatted into progressive section chunks, except when a single block exceeds platform message limits.

@@ -10,11 +10,17 @@ import {
 } from "../../im-gateway/src/index.js";
 import { StateStore } from "../../state-store/src/index.js";
 import { ApprovalBroker } from "./approval-broker.js";
-import { commandManual } from "./help-manual.js";
+import { ChatHistoryStore } from "./chat-history-store.js";
+import { InboundCommandService } from "./inbound-command-service.js";
 import { createLogger } from "./logger.js";
 import { handleModelAndSkillsCommand } from "./model-skills-handler.js";
 import { reconcileRuntimeState } from "./runtime-state-reconciler.js";
-import { detectDelta, detectThreadId, detectTurnId } from "./utils.js";
+import { ThreadHistoryPresenter } from "./thread-history-presenter.js";
+import { allAgentTextFromTurn } from "./turn-text-utils.js";
+import { TurnEventRouter } from "./turn-event-router.js";
+import { TurnOutputService } from "./turn-output-service.js";
+import { startTurnWithRecovery } from "./turn-recovery.js";
+import { detectThreadId, detectTurnId } from "./utils.js";
 
 function bindingKey(channel, chatId) {
   return `${channel}:${chatId}`;
@@ -121,56 +127,6 @@ function extractThreadId(thread) {
 function extractThreadCwd(thread) {
   const cwd = singleLine(thread?.cwd || "");
   return cwd || "";
-}
-
-function extractTextParts(content) {
-  if (!Array.isArray(content)) {
-    return "";
-  }
-  return content
-    .map((part) => {
-      if (typeof part === "string") {
-        return part;
-      }
-      if (part?.type === "text") {
-        return part.text || "";
-      }
-      return "";
-    })
-    .filter(Boolean)
-    .join("\n");
-}
-
-function firstUserTextFromTurn(turn) {
-  const items = Array.isArray(turn?.items) ? turn.items : [];
-  for (const item of items) {
-    if (item?.type === "userMessage") {
-      const fromContent = extractTextParts(item.content);
-      if (fromContent) {
-        return fromContent.trim();
-      }
-      if (typeof item.text === "string" && item.text.trim()) {
-        return item.text.trim();
-      }
-    }
-  }
-  return "";
-}
-
-function firstAgentTextFromTurn(turn) {
-  const items = Array.isArray(turn?.items) ? turn.items : [];
-  for (const item of items) {
-    if (item?.type === "agentMessage") {
-      if (typeof item.text === "string" && item.text.trim()) {
-        return item.text.trim();
-      }
-      const fromContent = extractTextParts(item.content);
-      if (fromContent) {
-        return fromContent.trim();
-      }
-    }
-  }
-  return "";
 }
 
 function parseArgsAndOptions(args = []) {
@@ -289,79 +245,61 @@ function splitTextIntoChunks(text, maxLen = 1600) {
     return [input];
   }
 
+  const lines = input.split("\n");
   const chunks = [];
-  let remaining = input;
-  while (remaining.length > maxLen) {
-    let splitAt = remaining.lastIndexOf("\n", maxLen);
-    if (splitAt < Math.floor(maxLen * 0.5)) {
-      splitAt = maxLen;
+  let current = "";
+  let inFence = false;
+  let fenceHeader = "```";
+
+  const pushCurrent = () => {
+    const out = current.trimEnd();
+    if (out) {
+      chunks.push(out);
     }
-    chunks.push(remaining.slice(0, splitAt).trimEnd());
-    remaining = remaining.slice(splitAt).trimStart();
+    current = "";
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine;
+    const lineWithNl = `${line}\n`;
+    const trimmed = line.trim();
+    const isFenceLine = trimmed.startsWith("```");
+
+    if (current.length > 0 && current.length + lineWithNl.length > maxLen) {
+      if (inFence) {
+        current += "```\n";
+        pushCurrent();
+        current = `${fenceHeader}\n`;
+      } else {
+        pushCurrent();
+      }
+    }
+
+    current += lineWithNl;
+
+    if (isFenceLine) {
+      if (!inFence) {
+        inFence = true;
+        fenceHeader = trimmed || "```";
+      } else {
+        inFence = false;
+        fenceHeader = "```";
+      }
+    }
   }
-  if (remaining) {
-    chunks.push(remaining);
+
+  if (current.trim()) {
+    if (inFence) {
+      current += "\n```";
+    }
+    pushCurrent();
   }
   return chunks;
-}
-
-function clipText(text, maxLen = 400) {
-  const input = String(text || "");
-  if (!maxLen || input.length <= maxLen) {
-    return input;
-  }
-  return `${input.slice(0, maxLen - 3)}...`;
-}
-
-function prefixFirstLineOnly(marker, text) {
-  const lines = String(text || "").split(/\r?\n/);
-  if (!lines.length) {
-    return "";
-  }
-  const [first, ...rest] = lines;
-  return [
-    `${marker} ${first}`,
-    ...rest.map((line) => `  ${line}`),
-  ].join("\n");
 }
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
-
-function truncateWithNotice(text, maxLen = 1800) {
-  const input = String(text || "");
-  if (!input || input.length <= maxLen) {
-    return input;
-  }
-  const suffix = "\n...[truncated]";
-  const keep = Math.max(0, maxLen - suffix.length);
-  return `${input.slice(0, keep)}${suffix}`;
-}
-
-function normalizeTurnStatus(status) {
-  if (typeof status === "string" && status.trim()) {
-    return status;
-  }
-  if (status && typeof status === "object" && typeof status.type === "string" && status.type.trim()) {
-    return status.type;
-  }
-  return "completed";
-}
-
-function turnOutputKey(threadId, turnId) {
-  const tid = String(turnId || "").trim();
-  if (tid) {
-    return `turn:${tid}`;
-  }
-  const thid = String(threadId || "").trim();
-  if (thid) {
-    return `thread:${thid}`;
-  }
-  return "";
-}
-
-const RESUME_HISTORY_MAX_TURNS = 20;
 
 export class DaemonApp {
   constructor({ baseDir } = {}) {
@@ -372,7 +310,23 @@ export class DaemonApp {
       filePath: path.join(this.store.logsDir, "daemon.log"),
       level: process.env.IM_CODEX_LOG_LEVEL || "info",
     });
+
+    const outputConfig = this.config.defaults?.output || {};
+    this.outputPolicy = {
+      resumeHistoryTurns: toInt(outputConfig.resumeHistoryTurns, 5, 1, 100),
+      chatHistoryFlushIntervalMs: toInt(outputConfig.chatHistoryFlushIntervalMs, 250, 10, 10_000),
+      turnOutputMinChunkChars: toInt(outputConfig.turnOutputMinChunkChars, 160, 40, 8_000),
+      turnOutputSoftChunkChars: toInt(outputConfig.turnOutputSoftChunkChars, 280, 40, 8_000),
+      liveSectionMaxLen: toInt(outputConfig.liveSectionMaxLen, 1400, 200, 1900),
+      liveSectionDelayMs: toInt(outputConfig.liveSectionDelayMs, 250, 0, 10_000),
+    };
+
     this.chatHistoryPath = path.join(this.store.logsDir, "chat-history.jsonl");
+    this.chatHistory = new ChatHistoryStore({
+      getFilePath: () => this.chatHistoryPath,
+      flushIntervalMs: this.outputPolicy.chatHistoryFlushIntervalMs,
+      logger: this.logger,
+    });
 
     this.runtime = new AppServerRuntime({
       launchSpec: makeLaunchSpec(this.config),
@@ -386,9 +340,88 @@ export class DaemonApp {
     this.threadToBinding = new Map();
     this.turnToBinding = new Map();
     this.activeTurnByBinding = new Map();
-    this.turnOutputByKey = new Map();
+    this.suppressedTurnIds = new Set();
+    this.turnOutput = new TurnOutputService({
+      minChunkChars: this.outputPolicy.turnOutputMinChunkChars,
+      softChunkChars: this.outputPolicy.turnOutputSoftChunkChars,
+    });
     this.threadListStateByBinding = new Map();
     this.skillsCacheByCwd = new Map();
+
+    this.turnEventRouter = new TurnEventRouter({
+      threadToBinding: this.threadToBinding,
+      turnToBinding: this.turnToBinding,
+      activeTurnByBinding: this.activeTurnByBinding,
+      suppressedTurnIds: this.suppressedTurnIds,
+      turnOutput: this.turnOutput,
+      store: this.store,
+      outputPolicy: this.outputPolicy,
+      getAdapter: (channel) => this.#getAdapter(channel),
+      sendMessage: (adapter, context, text) => this.#sendMessage(adapter, context, text),
+      sendLongMessage: (adapter, context, text, options) => this.#sendLongMessage(adapter, context, text, options),
+      sendMessageRaw: (adapter, context, text) => this.#sendMessageRaw(adapter, context, text),
+      sendLongMessageRaw: (adapter, context, text, options) => this.#sendLongMessageRaw(adapter, context, text, options),
+      sendStreamingDelta: (adapter, context, delta) => this.#sendStreamingDelta(adapter, context, delta),
+      allAgentTextFromTurn,
+      onSkillsChanged: () => this.skillsCacheByCwd.clear(),
+    });
+
+    this.threadHistoryPresenter = new ThreadHistoryPresenter({
+      runtime: this.runtime,
+      logger: this.logger,
+      sendMessage: (adapter, context, text) => this.#sendMessage(adapter, context, text),
+      sendLongMessage: (adapter, context, text, options) => this.#sendLongMessage(adapter, context, text, options),
+    });
+
+    this.inboundCommands = new InboundCommandService({
+      parseIncomingCommand,
+      handleModelAndSkillsCommand,
+      getRuntime: () => this.runtime,
+      getStore: () => this.store,
+      getApprovalBroker: () => this.approvalBroker,
+      getOutputPolicy: () => this.outputPolicy,
+      threadToBinding: this.threadToBinding,
+      turnToBinding: this.turnToBinding,
+      activeTurnByBinding: this.activeTurnByBinding,
+      suppressedTurnIds: this.suppressedTurnIds,
+      getAdapter: (channel) => this.#getAdapter(channel),
+      ensureBinding: (context) => this.#ensureBinding(context),
+      appendChatHistory: (entry) => this.chatHistory.append(entry),
+      sendMessage: (adapter, context, text) => this.#sendMessage(adapter, context, text),
+      sendMessageRaw: (adapter, context, text) => this.#sendMessageRaw(adapter, context, text),
+      sendLongMessageRaw: (adapter, context, text, options) => this.#sendLongMessageRaw(adapter, context, text, options),
+      isAuthorized: (binding, context) => this.#isAuthorized(binding, context),
+      startTurnWithRecovery: (adapter, context, binding, bKey, prompt, overrides) => (
+        this.#startTurnWithRecovery(adapter, context, binding, bKey, prompt, overrides)
+      ),
+      startFreshThreadForBinding: (binding, bKey) => this.#startFreshThreadForBinding(binding, bKey),
+      sendThreadHistory: (adapter, context, threadId, options) => (
+        this.threadHistoryPresenter.send(adapter, context, threadId, options)
+      ),
+      setThreadListState: (bKey, state) => this.#setThreadListState(bKey, state),
+      getThreadListState: (bKey) => this.#getThreadListState(bKey),
+      resolveThreadCwd: (threadId) => this.#resolveThreadCwd(threadId),
+      loadSkillsForCwd: (cwd, options) => this.#loadSkillsForCwd(cwd, options),
+      touchSkillsContext: (binding, cwd, skills) => this.#touchSkillsContext(binding, cwd, skills),
+      resolveSkillByName: (binding, cwd, name, options) => this.#resolveSkillByName(binding, cwd, name, options),
+      clearSkillCache: (cwd) => this.skillsCacheByCwd.delete(cwd),
+      bindingKeyFn: bindingKey,
+      parseArgsAndOptions,
+      resolveWorkspacePath,
+      toBoolean,
+      toInt,
+      isThreadNotFoundError,
+      riskyThreadActionRequiresConfirm,
+      threadIdFromResponse,
+      turnIdFromResponse,
+      threadListFromResponse,
+      nextCursorFromResponse,
+      extractThreadId,
+      threadDisplayTitle,
+      extractThreadCwd,
+      modelListFromResponse,
+      collaborationModesFromResponse,
+    });
 
     this.running = false;
   }
@@ -412,13 +445,17 @@ export class DaemonApp {
   async stop() {
     this.running = false;
     this.approvalBroker.clearAll();
+    this.#resetEphemeralTurnState();
 
     for (const adapter of this.adapters) {
       await adapter.stop();
     }
 
+    await this.chatHistory.flush({ force: true });
+    await this.store.flush();
     await this.runtime.stop();
     this.store.appendAudit({ type: "daemon_stopped", pid: process.pid });
+    await this.store.flush();
   }
 
   #wireRuntimeEvents() {
@@ -451,6 +488,7 @@ export class DaemonApp {
   }
 
   async #rehydrateRuntimeState(reason) {
+    this.#resetEphemeralTurnState();
     const summary = await reconcileRuntimeState({
       store: this.store,
       runtime: this.runtime,
@@ -575,20 +613,15 @@ export class DaemonApp {
     return this.adapters.find((adapter) => adapter.channel === channel) || null;
   }
 
-  #appendChatHistory(entry) {
-    try {
-      const line = JSON.stringify({
-        timestamp: new Date().toISOString(),
-        ...entry,
-      });
-      fs.appendFileSync(this.chatHistoryPath, `${line}\n`);
-    } catch (error) {
-      this.logger.warn(`failed to append chat history: ${error.message}`);
-    }
+  #resetEphemeralTurnState() {
+    this.turnToBinding.clear();
+    this.activeTurnByBinding.clear();
+    this.turnOutput.reset();
+    this.suppressedTurnIds.clear();
   }
 
   async #sendMessage(adapter, context, text) {
-    this.#appendChatHistory({
+    this.chatHistory.append({
       direction: "outbound",
       type: "message",
       channel: context.channel,
@@ -597,6 +630,10 @@ export class DaemonApp {
       turnId: context.turnId || null,
       text: String(text || ""),
     });
+    await adapter.sendMessage(context, text);
+  }
+
+  async #sendMessageRaw(adapter, context, text) {
     await adapter.sendMessage(context, text);
   }
 
@@ -614,8 +651,22 @@ export class DaemonApp {
     }
   }
 
+  async #sendLongMessageRaw(adapter, context, text, { maxLen = 1600, delayMs = 350 } = {}) {
+    const chunks = splitTextIntoChunks(text, maxLen);
+    if (!chunks.length) {
+      return;
+    }
+    for (let index = 0; index < chunks.length; index += 1) {
+      const chunk = chunks[index];
+      await this.#sendMessageRaw(adapter, context, chunk);
+      if (delayMs > 0 && index < chunks.length - 1) {
+        await sleep(delayMs);
+      }
+    }
+  }
+
   async #sendStreamingDelta(adapter, context, delta) {
-    this.#appendChatHistory({
+    this.chatHistory.append({
       direction: "outbound",
       type: "stream_delta",
       channel: context.channel,
@@ -628,7 +679,7 @@ export class DaemonApp {
   }
 
   async #sendApprovalPrompt(adapter, context, payload) {
-    this.#appendChatHistory({
+    this.chatHistory.append({
       direction: "outbound",
       type: "approval_prompt",
       channel: context.channel,
@@ -640,53 +691,6 @@ export class DaemonApp {
       kind: payload?.kind || "",
     });
     await adapter.sendApprovalPrompt(context, payload);
-  }
-
-  #appendTurnOutput(threadId, turnId, bKey, delta) {
-    const key = turnOutputKey(threadId, turnId);
-    if (!key || !delta) {
-      return;
-    }
-    const existing = this.turnOutputByKey.get(key) || { bindingKey: bKey, text: "" };
-    existing.bindingKey = bKey || existing.bindingKey;
-    existing.text += String(delta);
-    this.turnOutputByKey.set(key, existing);
-  }
-
-  #consumeTurnOutput(threadId, turnId) {
-    const candidates = [turnOutputKey(threadId, turnId)];
-    const turnOnly = turnOutputKey("", turnId);
-    const threadOnly = turnOutputKey(threadId, "");
-    if (turnOnly && !candidates.includes(turnOnly)) {
-      candidates.push(turnOnly);
-    }
-    if (threadOnly && !candidates.includes(threadOnly)) {
-      candidates.push(threadOnly);
-    }
-
-    for (const key of candidates) {
-      if (!key) {
-        continue;
-      }
-      const existing = this.turnOutputByKey.get(key);
-      if (!existing) {
-        continue;
-      }
-      this.turnOutputByKey.delete(key);
-      return String(existing.text || "");
-    }
-    return "";
-  }
-
-  #clearTurnOutputsForBinding(bKey) {
-    if (!bKey) {
-      return;
-    }
-    for (const [key, value] of this.turnOutputByKey.entries()) {
-      if (value?.bindingKey === bKey) {
-        this.turnOutputByKey.delete(key);
-      }
-    }
   }
 
   async #startFreshThreadForBinding(binding, bKey) {
@@ -726,63 +730,6 @@ export class DaemonApp {
       return extractThreadCwd(match);
     } catch {
       return "";
-    }
-  }
-
-  async #renderThreadHistoryMessages(threadId, { turns = null, textLimit = null } = {}) {
-    try {
-      const read = await this.runtime.readThread({ threadId, includeTurns: true });
-      const allTurns = Array.isArray(read?.thread?.turns) ? read.thread.turns : [];
-      const selectedTurns = Number.isFinite(Number(turns))
-        ? allTurns.slice(-Math.max(0, Number(turns)))
-        : allTurns;
-      if (!selectedTurns.length) {
-        return [];
-      }
-
-      const messages = [];
-      if (selectedTurns.length < allTurns.length) {
-        messages.push(`Thread history (${selectedTurns.length}/${allTurns.length} turns shown):`);
-      } else {
-        messages.push(`Thread history (${allTurns.length} turns):`);
-      }
-
-      for (const turn of selectedTurns) {
-        const lines = [];
-        const userRaw = String(firstUserTextFromTurn(turn) || "").trim();
-        const agentRaw = String(firstAgentTextFromTurn(turn) || "").trim();
-        const userText = textLimit ? clipText(userRaw, textLimit) : userRaw;
-        const agentText = textLimit ? clipText(agentRaw, textLimit) : agentRaw;
-        if (userText) {
-          lines.push(prefixFirstLineOnly("◇", userText));
-        }
-        if (agentText) {
-          lines.push(prefixFirstLineOnly("•", agentText));
-        }
-        if (!userText && !agentText) {
-          lines.push("(no visible text content)");
-        }
-        messages.push(truncateWithNotice(lines.join("\n"), 1800));
-      }
-
-      return messages.filter(Boolean);
-    } catch (error) {
-      this.logger.debug(`failed to load thread history for ${threadId}: ${error.message}`);
-      return [];
-    }
-  }
-
-  async #sendThreadHistory(adapter, context, threadId, options = {}) {
-    const messages = await this.#renderThreadHistoryMessages(threadId, options);
-    if (!messages.length) {
-      return;
-    }
-    const delayMs = adapter.channel === "discord" ? 450 : 0;
-    for (let index = 0; index < messages.length; index += 1) {
-      await this.#sendMessage(adapter, context, messages[index]);
-      if (delayMs > 0 && index < messages.length - 1) {
-        await sleep(delayMs);
-      }
     }
   }
 
@@ -884,7 +831,6 @@ export class DaemonApp {
     const cwd = overrides.cwd || binding.workingDir;
     const input = overrides.input || await this.#buildTurnInput(adapter, context, binding, prompt, cwd);
     const baseParams = {
-      threadId,
       input,
       approvalPolicy: binding.policyProfile.approvalMode,
       cwd,
@@ -893,27 +839,48 @@ export class DaemonApp {
       collaborationMode: overrides.collaborationMode ?? binding.policyProfile.collaborationMode ?? null,
     };
 
-    try {
-      const turnResponse = await this.runtime.startTurn(baseParams);
-      return { threadId, turnResponse };
-    } catch (error) {
-      if (!isThreadNotFoundError(error)) {
-        throw error;
-      }
-
-      this.logger.warn(`stale thread detected for ${bKey}: ${threadId}`);
-      this.threadToBinding.delete(threadId);
-      await this.#sendMessage(adapter, context, `Thread expired: ${threadId}. Starting a new thread...`);
-
-      threadId = await this.#startFreshThreadForBinding(binding, bKey);
-      if (!threadId) {
-        await this.#sendMessage(adapter, context, "Failed to recover thread. Run /new and retry.");
-        return null;
-      }
-
-      const turnResponse = await this.runtime.startTurn({ ...baseParams, threadId });
-      return { threadId, turnResponse };
-    }
+    return startTurnWithRecovery({
+      threadId,
+      baseParams,
+      startTurn: (params) => this.runtime.startTurn(params),
+      resumeThread: (candidateThreadId) => this.runtime.resumeThread(candidateThreadId),
+      startFreshThread: async () => {
+        this.logger.warn(`stale thread detected for ${bKey}: ${threadId}`);
+        this.threadToBinding.delete(threadId);
+        await this.#sendMessage(adapter, context, `Thread expired: ${threadId}. Starting a new thread...`);
+        const freshThreadId = await this.#startFreshThreadForBinding(binding, bKey);
+        if (!freshThreadId) {
+          await this.#sendMessage(adapter, context, "Failed to recover thread. Run /new and retry.");
+          return null;
+        }
+        return freshThreadId;
+      },
+      isThreadNotFoundError,
+      onRecovered: async ({ threadId: recoveredThreadId, resumeResponse }) => {
+        this.logger.warn(`thread not found on turn/start for ${bKey}: ${recoveredThreadId}; attempting resume`);
+        this.threadToBinding.set(recoveredThreadId, bKey);
+        let resumedCwd = extractThreadCwd(resumeResponse);
+        if (!resumedCwd) {
+          resumedCwd = await this.#resolveThreadCwd(recoveredThreadId);
+        }
+        const updated = this.store.upsertBinding({
+          ...binding,
+          threadId: recoveredThreadId,
+          ...(resumedCwd ? { workingDir: resumedCwd } : {}),
+        });
+        Object.assign(binding, updated);
+        await this.#sendMessage(
+          adapter,
+          context,
+          resumedCwd
+            ? `Restored thread context: ${recoveredThreadId}\nWorkspace set to: ${resumedCwd}`
+            : `Restored thread context: ${recoveredThreadId}`
+        );
+      },
+      onRecoveredRetryMissing: async ({ threadId: recoveredThreadId }) => {
+        this.logger.warn(`recovered thread still not startable for ${bKey}: ${recoveredThreadId}`);
+      },
+    });
   }
 
   async #handleInboundSafe(context) {
@@ -929,751 +896,11 @@ export class DaemonApp {
   }
 
   async #handleInbound(context) {
-    const adapter = this.#getAdapter(context.channel);
-    if (!adapter) {
-      return;
-    }
-
-    const binding = this.#ensureBinding(context);
-    const command = parseIncomingCommand(context.text);
-    const bKey = bindingKey(binding.channel, binding.chatId);
-
-    this.#appendChatHistory({
-      direction: "inbound",
-      type: "message",
-      channel: context.channel,
-      chatId: String(context.chatId),
-      userId: context.userId ? String(context.userId) : null,
-      userName: context.userName || "",
-      text: String(context.text || ""),
-      commandType: command.type,
-    });
-
-    if (command.type === "empty") {
-      return;
-    }
-
-    if (command.type === "status") {
-      const pending = this.approvalBroker.listPending().length;
-      const active = this.activeTurnByBinding.get(bKey);
-      await this.#sendMessage(adapter, context, [
-        `Binding: ${bKey}`,
-        `Thread: ${binding.threadId || "none"}`,
-        `Workspace: ${binding.workingDir}`,
-        `Model: ${binding.policyProfile?.model || "runtime default"}`,
-        `Effort: ${binding.policyProfile?.reasoningEffort || "runtime default"}`,
-        `Mode: ${binding.policyProfile?.collaborationMode || "runtime default"}`,
-        `Active turn: ${active || "none"}`,
-        `Pending approvals: ${pending}`,
-      ].join("\n"));
-      return;
-    }
-
-    if (command.type === "help") {
-      await this.#sendMessage(adapter, context, commandManual(command.topic));
-      return;
-    }
-
-    if (!this.#isAuthorized(binding, context)) {
-      await this.#sendMessage(
-        adapter,
-        context,
-        "Unauthorized. Your user ID is not in the binding/channel allowlist."
-      );
-      return;
-    }
-
-    const runInterrupt = async () => {
-      const turnId = this.activeTurnByBinding.get(bKey);
-      if (!binding.threadId || !turnId) {
-        await this.#sendMessage(adapter, context, "No active turn to interrupt.");
-        return true;
-      }
-      await this.runtime.interruptTurn({ threadId: binding.threadId, turnId });
-      await this.#sendMessage(adapter, context, `Interrupt requested for turn ${turnId}.`);
-      return true;
-    };
-
-    const runResume = async (threadId) => {
-      if (!threadId) {
-        await this.#sendMessage(adapter, context, "Usage: /resume <threadId>");
-        return true;
-      }
-      let resumeResponse = null;
-      try {
-        resumeResponse = await this.runtime.resumeThread(threadId);
-      } catch (error) {
-        if (isThreadNotFoundError(error)) {
-          await this.#sendMessage(adapter, context, `Thread not found: ${threadId}. Use /new to start a fresh thread.`);
-          return true;
-        }
-        throw error;
-      }
-
-      this.threadToBinding.set(threadId, bKey);
-      let resumedCwd = extractThreadCwd(resumeResponse);
-      if (!resumedCwd) {
-        resumedCwd = await this.#resolveThreadCwd(threadId);
-      }
-      const updated = this.store.upsertBinding({
-        ...binding,
-        threadId,
-        ...(resumedCwd ? { workingDir: resumedCwd } : {}),
-      });
-      if (resumedCwd) {
-        await this.#sendMessage(adapter, context, `Resumed thread: ${threadId}\nWorkspace set to: ${resumedCwd}`);
-      } else {
-        await this.#sendMessage(adapter, context, `Resumed thread: ${threadId}`);
-      }
-      await this.#sendThreadHistory(adapter, context, threadId, {
-        turns: RESUME_HISTORY_MAX_TURNS,
-      });
-      Object.assign(binding, updated);
-      return true;
-    };
-
-    const runAsk = async (prompt, overrides = {}) => {
-      if (!prompt) {
-        await this.#sendMessage(adapter, context, "Usage: /ask <prompt>");
-        return true;
-      }
-      const started = await this.#startTurnWithRecovery(adapter, context, binding, bKey, prompt, overrides);
-      if (!started) {
-        return true;
-      }
-      const { threadId, turnResponse } = started;
-      const turnId = turnIdFromResponse(turnResponse);
-      if (turnId) {
-        this.turnToBinding.set(turnId, bKey);
-        this.activeTurnByBinding.set(bKey, turnId);
-      }
-      await this.#sendMessage(adapter, context, `Turn started: ${turnId || "unknown"}`);
-      this.store.appendAudit({
-        type: "turn_started",
-        channel: context.channel,
-        chatId: context.chatId,
-        threadId,
-        turnId,
-      });
-      return true;
-    };
-
-    if (command.type === "new") {
-      const threadId = await this.#startFreshThreadForBinding(binding, bKey);
-      await this.#sendMessage(adapter, context, `Started thread: ${threadId || "unknown"}`);
-      return;
-    }
-
-    if (command.type === "resume") {
-      await runResume(command.threadId);
-      return;
-    }
-
-    if (command.type === "interrupt") {
-      await runInterrupt();
-      return;
-    }
-
-    if (command.type === "turn") {
-      const action = command.action || "";
-      const { positional, options } = parseArgsAndOptions(command.args);
-      if (action === "ask") {
-        let turnCwd = binding.workingDir;
-        if (options.cwd) {
-          const resolved = resolveWorkspacePath(options.cwd, binding.workingDir);
-          if (resolved.error) {
-            await this.#sendMessage(adapter, context, resolved.error);
-            return;
-          }
-          turnCwd = resolved.value;
-        }
-        await runAsk(positional.join(" ").trim(), {
-          model: options.model || null,
-          effort: options.effort || null,
-          collaborationMode: options.mode || null,
-          cwd: turnCwd,
-        });
-        return;
-      }
-      if (action === "steer") {
-        const activeTurnId = this.activeTurnByBinding.get(bKey);
-        if (!binding.threadId || !activeTurnId) {
-          await this.#sendMessage(adapter, context, "No active turn to steer.");
-          return;
-        }
-        const prompt = positional.join(" ").trim();
-        if (!prompt) {
-          await this.#sendMessage(adapter, context, "Usage: /turn steer <prompt>");
-          return;
-        }
-        await this.runtime.steerTurn({
-          threadId: binding.threadId,
-          expectedTurnId: activeTurnId,
-          input: [{ type: "text", text: prompt }],
-        });
-        await this.#sendMessage(adapter, context, `Steer accepted for turn ${activeTurnId}.`);
-        return;
-      }
-      if (action === "interrupt") {
-        await runInterrupt();
-        return;
-      }
-      if (action === "review") {
-        if (!binding.threadId) {
-          await this.#sendMessage(adapter, context, "No active thread. Start one with /new first.");
-          return;
-        }
-        const delivery = options.delivery || (toBoolean(options.detached, false) ? "detached" : "inline");
-        const targetKey = String(options.target || positional[0] || "uncommitted").toLowerCase();
-        let target = { type: "uncommittedChanges" };
-        if (["base", "basebranch"].includes(targetKey)) {
-          const branch = options.branch || positional[1];
-          if (!branch) {
-            await this.#sendMessage(adapter, context, "Usage: /turn review base <branch> [--delivery inline|detached]");
-            return;
-          }
-          target = { type: "baseBranch", branch };
-        } else if (targetKey === "commit") {
-          const sha = options.sha || positional[1];
-          if (!sha) {
-            await this.#sendMessage(adapter, context, "Usage: /turn review commit <sha> [title words]");
-            return;
-          }
-          const title = options.title || positional.slice(2).join(" ").trim() || null;
-          target = { type: "commit", sha, title };
-        } else if (targetKey === "custom") {
-          const instructions = (options.instructions || positional.slice(1).join(" ")).trim();
-          if (!instructions) {
-            await this.#sendMessage(adapter, context, "Usage: /turn review custom <instructions...>");
-            return;
-          }
-          target = { type: "custom", instructions };
-        }
-
-        const review = await this.runtime.startReview({
-          threadId: binding.threadId,
-          delivery,
-          target,
-        });
-        const reviewTurnId = turnIdFromResponse(review);
-        const reviewThreadId = review?.reviewThreadId || binding.threadId;
-        this.threadToBinding.set(reviewThreadId, bKey);
-        if (delivery === "detached" && reviewThreadId && reviewThreadId !== binding.threadId) {
-          const updated = this.store.upsertBinding({
-            ...binding,
-            threadId: reviewThreadId,
-          });
-          Object.assign(binding, updated);
-        }
-        if (reviewTurnId) {
-          this.turnToBinding.set(reviewTurnId, bKey);
-          this.activeTurnByBinding.set(bKey, reviewTurnId);
-        }
-        await this.#sendMessage(
-          adapter,
-          context,
-          `Review started (${delivery}) on thread ${reviewThreadId}${reviewTurnId ? `, turn ${reviewTurnId}` : ""}.`
-        );
-        return;
-      }
-      await this.#sendMessage(adapter, context, "Usage: /turn <ask|steer|interrupt|review>");
-      return;
-    }
-
-    if (command.type === "thread") {
-      const action = command.action || "";
-      const { positional, options } = parseArgsAndOptions(command.args);
-
-      if (action === "start") {
-        const cwdResolved = options.cwd ? resolveWorkspacePath(options.cwd, binding.workingDir) : { value: binding.workingDir };
-        if (cwdResolved.error) {
-          await this.#sendMessage(adapter, context, cwdResolved.error);
-          return;
-        }
-        const response = await this.runtime.startThread({
-          cwd: cwdResolved.value,
-          approvalPolicy: binding.policyProfile.approvalMode,
-          model: options.model || binding.policyProfile.model || null,
-        });
-        const threadId = threadIdFromResponse(response);
-        if (threadId) {
-          this.threadToBinding.set(threadId, bKey);
-          const updated = this.store.upsertBinding({
-            ...binding,
-            threadId,
-            workingDir: cwdResolved.value,
-          });
-          Object.assign(binding, updated);
-        }
-        await this.#sendMessage(adapter, context, `Started thread: ${threadId || "unknown"}`);
-        return;
-      }
-
-      if (action === "resume") {
-        await runResume(positional[0]);
-        return;
-      }
-
-      if (action === "list" || action === "more") {
-        const requestedLimitRaw = positional.find((item) => /^\d+$/.test(item));
-        let requestedLimit = toInt(requestedLimitRaw, 10, 1, 100);
-        const useAll = action === "list" && (positional.some((item) => item.toLowerCase() === "all") || toBoolean(options.all, false));
-        let archived = toBoolean(options.archived, false);
-
-        let cursor = null;
-        let cwdFilter = null;
-        if (action === "more") {
-          const state = this.#getThreadListState(bKey);
-          if (!state?.nextCursor) {
-            await this.#sendMessage(adapter, context, "No next page available. Run /thread list first.");
-            return;
-          }
-          cursor = state.nextCursor;
-          cwdFilter = state.cwdFilter;
-          archived = Boolean(state.archived);
-          if (!requestedLimitRaw && Number.isFinite(Number(state.limit))) {
-            requestedLimit = toInt(state.limit, 10, 1, 100);
-          }
-        } else {
-          cwdFilter = useAll ? null : (options.cwd || binding.workingDir);
-          cursor = options.cursor || null;
-        }
-
-        const response = await this.runtime.listThreads({
-          cursor,
-          limit: requestedLimit,
-          archived,
-          cwd: cwdFilter,
-        });
-        const threads = threadListFromResponse(response);
-        const nextCursor = nextCursorFromResponse(response);
-        this.#setThreadListState(bKey, {
-          nextCursor,
-          cwdFilter,
-          archived,
-          limit: requestedLimit,
-        });
-
-        if (!threads.length) {
-          const suffix = cwdFilter ? ` for workspace: ${cwdFilter}` : "";
-          await this.#sendMessage(adapter, context, `No threads found${suffix}.`);
-          return;
-        }
-
-        const entries = threads.map((thread, index) => {
-          const id = extractThreadId(thread) || "unknown";
-          const marker = binding.threadId && id === binding.threadId ? " (current)" : "";
-          const title = threadDisplayTitle(thread);
-          const cwd = extractThreadCwd(thread) || "unknown";
-          return `${index + 1}. ${title}\t\t${cwd}\t\t${id}${marker}`;
-        });
-        await this.#sendMessage(
-          adapter,
-          context,
-          [
-            "Threads:",
-            entries.join("\n"),
-            "",
-            nextCursor ? "Use /thread more for next page." : "No more pages.",
-            "Use /resume <threadId> to switch.",
-          ].join("\n")
-        );
-        return;
-      }
-
-      if (action === "read") {
-        const threadId = positional[0] || binding.threadId;
-        if (!threadId) {
-          await this.#sendMessage(adapter, context, "Usage: /thread read <threadId> [--turns true]");
-          return;
-        }
-        const includeTurns = toBoolean(options.turns, false);
-        const read = await this.runtime.readThread({ threadId, includeTurns });
-        const thread = read?.thread || {};
-        await this.#sendMessage(
-          adapter,
-          context,
-          [
-            `Thread: ${thread.id || threadId}`,
-            `Title: ${thread.name || threadDisplayTitle(thread)}`,
-            `Workspace: ${thread.cwd || "unknown"}`,
-            `Status: ${thread?.status?.type || "unknown"}`,
-            includeTurns ? `Turns: ${(thread.turns || []).length}` : "Turns: hidden (use --turns true)",
-          ].join("\n")
-        );
-        return;
-      }
-
-      if (action === "fork") {
-        const sourceThreadId = positional[0] || binding.threadId;
-        if (!sourceThreadId) {
-          await this.#sendMessage(adapter, context, "Usage: /thread fork <threadId> [--ephemeral true]");
-          return;
-        }
-        const forked = await this.runtime.forkThread({
-          threadId: sourceThreadId,
-          ephemeral: toBoolean(options.ephemeral, false),
-        });
-        const newThreadId = threadIdFromResponse(forked);
-        if (newThreadId) {
-          this.threadToBinding.set(newThreadId, bKey);
-        }
-        await this.#sendMessage(adapter, context, `Forked thread: ${newThreadId || "unknown"}`);
-        return;
-      }
-
-      if (action === "loaded") {
-        const loaded = await this.runtime.listLoadedThreads();
-        const ids = Array.isArray(loaded?.data)
-          ? loaded.data
-          : (Array.isArray(loaded?.threadIds) ? loaded.threadIds : []);
-        await this.#sendMessage(
-          adapter,
-          context,
-          ids.length ? `Loaded threads:\n${ids.join("\n")}` : "No loaded threads."
-        );
-        return;
-      }
-
-      if (action === "unsubscribe") {
-        const threadId = positional[0] || binding.threadId;
-        if (!threadId) {
-          await this.#sendMessage(adapter, context, "Usage: /thread unsubscribe <threadId>");
-          return;
-        }
-        const result = await this.runtime.unsubscribeThread(threadId);
-        await this.#sendMessage(adapter, context, `Unsubscribe status: ${result?.status || "ok"} (${threadId})`);
-        return;
-      }
-
-      if (["archive", "unarchive", "compact", "rollback"].includes(action)) {
-        const threadId = positional[0] || binding.threadId;
-        if (!threadId) {
-          await this.#sendMessage(adapter, context, `Usage: /thread ${action} <threadId> --confirm`);
-          return;
-        }
-        if (riskyThreadActionRequiresConfirm(binding.policyProfile.approvalMode) && !toBoolean(options.confirm, false)) {
-          await this.#sendMessage(
-            adapter,
-            context,
-            `Confirmation required by approval mode. Re-run with --confirm.\nExample: /thread ${action} ${threadId} --confirm`
-          );
-          return;
-        }
-
-        if (action === "archive") {
-          await this.runtime.archiveThread(threadId);
-          if (binding.threadId === threadId) {
-            const updated = this.store.upsertBinding({ ...binding, threadId: null });
-            Object.assign(binding, updated);
-          }
-          this.threadToBinding.delete(threadId);
-          await this.#sendMessage(adapter, context, `Archived thread: ${threadId}`);
-          return;
-        }
-        if (action === "unarchive") {
-          await this.runtime.unarchiveThread(threadId);
-          await this.#sendMessage(adapter, context, `Unarchived thread: ${threadId}`);
-          return;
-        }
-        if (action === "compact") {
-          await this.runtime.compactThread(threadId);
-          await this.#sendMessage(adapter, context, `Compaction started for thread: ${threadId}`);
-          return;
-        }
-        if (action === "rollback") {
-          const numTurns = toInt(options.turns || positional[1], 1, 1, 100);
-          await this.runtime.rollbackThread({ threadId, numTurns });
-          await this.#sendMessage(adapter, context, `Rolled back ${numTurns} turn(s) on thread: ${threadId}`);
-          return;
-        }
-      }
-
-      await this.#sendMessage(
-        adapter,
-        context,
-        "Usage: /thread <start|resume|list|more|read|fork|loaded|unsubscribe|archive|unarchive|compact|rollback>"
-      );
-      return;
-    }
-
-    if (command.type === "threads") {
-      const listCmd = {
-        type: "thread",
-        action: "list",
-        args: [
-          ...(command.all ? ["all"] : []),
-          String(command.limit || 10),
-        ],
-      };
-      await this.#handleInbound({
-        ...context,
-        text: `/thread list ${listCmd.args.join(" ")}`,
-      });
-      return;
-    }
-
-    if (command.type === "archive") {
-      const threadId = String(command.threadId || binding.threadId || "").trim();
-      if (!threadId) {
-        await this.#sendMessage(adapter, context, "No thread selected. Use /archive <threadId> or /resume <threadId> first.");
-        return;
-      }
-      await this.#handleInbound({
-        ...context,
-        text: `/thread archive ${threadId}`,
-      });
-      return;
-    }
-
-    const modelOrSkillsHandled = await handleModelAndSkillsCommand({
-      command,
-      adapter,
-      context,
-      binding,
-      runtime: this.runtime,
-      store: this.store,
-      sendMessage: (targetAdapter, targetContext, message) => this.#sendMessage(targetAdapter, targetContext, message),
-      parseArgsAndOptions,
-      resolveWorkspacePath,
-      toBoolean,
-      toInt,
-      modelListFromResponse,
-      collaborationModesFromResponse,
-      loadSkillsForCwd: (cwd, options) => this.#loadSkillsForCwd(cwd, options),
-      touchSkillsContext: (targetBinding, cwd, skills) => this.#touchSkillsContext(targetBinding, cwd, skills),
-      resolveSkillByName: (targetBinding, cwd, name, options) => this.#resolveSkillByName(targetBinding, cwd, name, options),
-      runAsk,
-      clearSkillCache: (cwd) => this.skillsCacheByCwd.delete(cwd),
-    });
-    if (modelOrSkillsHandled) {
-      return;
-    }
-
-    if (command.type === "approve") {
-      if (!command.requestId || !["allow", "deny"].includes(command.decision)) {
-        await this.#sendMessage(adapter, context, "Usage: /approve <requestId> <allow|deny> [payload]");
-        return;
-      }
-
-      const resolution = this.approvalBroker.resolve(command.requestId, {
-        decision: command.decision,
-        payload: command.payload,
-        actor: context.userId,
-      });
-
-      if (!resolution) {
-        await this.#sendMessage(adapter, context, `Unknown or expired approval request: ${command.requestId}`);
-      }
-      return;
-    }
-
-    if (command.type === "cwd") {
-      const resolved = resolveWorkspacePath(command.path, binding.workingDir);
-      if (resolved.error) {
-        await this.#sendMessage(adapter, context, resolved.error);
-        return;
-      }
-
-      const updated = this.store.upsertBinding({
-        ...binding,
-        workingDir: resolved.value,
-      });
-      await this.#sendMessage(
-        adapter,
-        context,
-        `Workspace set to: ${updated.workingDir}`
-      );
-      return;
-    }
-
-    if (command.type === "ask") {
-      await runAsk(command.prompt);
-      return;
-    }
-
-    await this.#sendMessage(
-      adapter,
-      context,
-      "Unknown command. Use /help to see all commands and examples."
-    );
+    await this.inboundCommands.handle(context);
   }
 
   async #handleRuntimeNotification(notification) {
-    const { method, params } = notification;
-
-    if (!method) {
-      return;
-    }
-
-    if (method === "item/agentMessage/delta") {
-      const threadId = detectThreadId(params);
-      const turnId = detectTurnId(params);
-      const delta = detectDelta(params);
-      if (!delta) {
-        return;
-      }
-
-      const bKey = this.turnToBinding.get(turnId) || this.threadToBinding.get(threadId);
-      if (!bKey) {
-        return;
-      }
-
-      const [channel, chatId] = bKey.split(":");
-      const adapter = this.#getAdapter(channel);
-      if (!adapter) {
-        return;
-      }
-
-      this.#appendTurnOutput(threadId, turnId, bKey, delta);
-      await this.#sendStreamingDelta(adapter, { channel, chatId, turnId }, delta);
-      return;
-    }
-
-    if (method === "turn/started") {
-      const threadId = detectThreadId(params);
-      const turnId = detectTurnId(params);
-      const bKey = this.threadToBinding.get(threadId);
-      if (bKey && turnId) {
-        this.turnToBinding.set(turnId, bKey);
-        this.activeTurnByBinding.set(bKey, turnId);
-      }
-      return;
-    }
-
-    if (method === "turn/completed") {
-      const threadId = detectThreadId(params);
-      const turnId = detectTurnId(params);
-      const bKey = this.turnToBinding.get(turnId) || this.threadToBinding.get(threadId);
-      if (!bKey) {
-        this.#consumeTurnOutput(threadId, turnId);
-        return;
-      }
-
-      const [channel, chatId] = bKey.split(":");
-      const adapter = this.#getAdapter(channel);
-      const status = normalizeTurnStatus(params?.turn?.status);
-      const finalText = this.#consumeTurnOutput(threadId, turnId).trim();
-      if (adapter) {
-        if (adapter.channel === "discord" && typeof adapter.flushStreamingMessage === "function") {
-          if (finalText) {
-            await adapter.flushStreamingMessage({ channel, chatId, turnId }, { finalText });
-          } else {
-            await this.#sendMessage(adapter, { channel, chatId, turnId }, `Turn completed (${status}).`);
-          }
-        } else {
-          await this.#sendMessage(adapter, { channel, chatId, turnId }, `Turn completed (${status}).`);
-        }
-      }
-      this.turnToBinding.delete(turnId);
-      this.activeTurnByBinding.delete(bKey);
-      return;
-    }
-
-    if (method === "thread/started") {
-      const threadId = detectThreadId(params);
-      if (!threadId) {
-        return;
-      }
-      this.store.appendAudit({ type: "thread_started", threadId });
-      return;
-    }
-
-    if (method === "thread/status/changed") {
-      const threadId = detectThreadId(params) || params?.threadId;
-      this.store.appendAudit({
-        type: "thread_status_changed",
-        threadId: threadId || null,
-        status: params?.status?.type || "unknown",
-      });
-      return;
-    }
-
-    if (method === "thread/closed") {
-      const threadId = detectThreadId(params) || params?.threadId;
-      if (threadId) {
-        const bKey = this.threadToBinding.get(threadId);
-        this.threadToBinding.delete(threadId);
-        if (bKey) {
-          for (const [turnId, key] of this.turnToBinding.entries()) {
-            if (key === bKey) {
-              this.turnToBinding.delete(turnId);
-            }
-          }
-          this.activeTurnByBinding.delete(bKey);
-          this.#clearTurnOutputsForBinding(bKey);
-        }
-      }
-      this.store.appendAudit({ type: "thread_closed", threadId: threadId || null });
-      return;
-    }
-
-    if (method === "thread/archived") {
-      const threadId = detectThreadId(params) || params?.threadId;
-      if (threadId) {
-        const bKey = this.threadToBinding.get(threadId);
-        this.threadToBinding.delete(threadId);
-        if (bKey) {
-          this.#clearTurnOutputsForBinding(bKey);
-          const [channel, chatId] = bKey.split(":");
-          const binding = this.store.getBinding(channel, chatId);
-          if (binding?.threadId === threadId) {
-            this.store.upsertBinding({
-              ...binding,
-              threadId: null,
-            });
-          }
-        }
-      }
-      this.store.appendAudit({ type: "thread_archived", threadId: threadId || null });
-      return;
-    }
-
-    if (method === "thread/unarchived") {
-      const threadId = detectThreadId(params) || params?.threadId;
-      this.store.appendAudit({ type: "thread_unarchived", threadId: threadId || null });
-      return;
-    }
-
-    if (method === "skills/changed") {
-      this.skillsCacheByCwd.clear();
-      this.store.appendAudit({ type: "skills_changed" });
-      return;
-    }
-
-    if (method === "error") {
-      const threadId = detectThreadId(params);
-      const turnId = detectTurnId(params);
-      const bKey = this.turnToBinding.get(turnId) || this.threadToBinding.get(threadId);
-      if (!bKey) {
-        this.#consumeTurnOutput(threadId, turnId);
-        return;
-      }
-      const [channel, chatId] = bKey.split(":");
-      const adapter = this.#getAdapter(channel);
-      if (!adapter) {
-        this.#consumeTurnOutput(threadId, turnId);
-        return;
-      }
-      const partial = this.#consumeTurnOutput(threadId, turnId).trim();
-      const errorMessage = `Runtime error: ${params?.error?.message || "unknown"}`;
-      if (adapter.channel === "discord" && typeof adapter.flushStreamingMessage === "function") {
-        const merged = partial ? `${partial}\n\n${errorMessage}` : errorMessage;
-        await adapter.flushStreamingMessage({ channel, chatId, turnId }, { finalText: merged });
-      } else {
-        if (partial) {
-          await this.#sendLongMessage(adapter, { channel, chatId, turnId }, partial, {
-            maxLen: 1700,
-            delayMs: adapter.channel === "discord" ? 650 : 250,
-          });
-        }
-        await this.#sendMessage(adapter, { channel, chatId, turnId }, errorMessage);
-      }
-      if (turnId) {
-        this.turnToBinding.delete(turnId);
-      }
-      this.activeTurnByBinding.delete(bKey);
-    }
+    await this.turnEventRouter.handle(notification);
   }
 
   async #handleServerRequest(serverRequest) {
@@ -1722,13 +949,16 @@ export class DaemonApp {
       chatId,
     });
 
+    const turnId = detectTurnId(serverRequest.params);
+    const approvalSummary = serverRequest.params?.reason || serverRequest.params?.command || "";
+
     await this.#sendApprovalPrompt(
       adapter,
-      { channel, chatId, userId: binding.userId || "", turnId: detectTurnId(serverRequest.params) },
+      { channel, chatId, userId: binding.userId || "", turnId },
       {
         localRequestId: created.record.localRequestId,
         kind: serverRequest.method,
-        summary: serverRequest.params?.reason || serverRequest.params?.command || "",
+        summary: approvalSummary,
       }
     );
   }
