@@ -1,0 +1,6 @@
+{
+  "name": "@im-codex/core-runtime",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.js"
+}

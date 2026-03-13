@@ -1,0 +1,9 @@
+{
+  "name": "@im-codex/ops-cli",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/cli.js",
+  "bin": {
+    "tool": "src/cli.js"
+  }
+}

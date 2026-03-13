@@ -1,0 +1,20 @@
+{
+  "name": "im-codex-tool",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "tool": "node ./packages/ops-cli/src/cli.js",
+    "start": "node ./packages/ops-cli/src/cli.js start",
+    "stop": "node ./packages/ops-cli/src/cli.js stop",
+    "status": "node ./packages/ops-cli/src/cli.js status",
+    "doctor": "node ./packages/ops-cli/src/cli.js doctor",
+    "test": "node --test packages/*/test/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

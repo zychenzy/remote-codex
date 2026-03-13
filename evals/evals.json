@@ -1,0 +1,7 @@
+{
+  "scenarios": [
+    "thread_start_turn_complete",
+    "approval_roundtrip",
+    "daemon_restart_state_recovery"
+  ]
+}
