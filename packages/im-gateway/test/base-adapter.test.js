@@ -14,6 +14,16 @@ class StubAdapter extends BaseAdapter {
   }
 }
 
+class FailingAdapter extends BaseAdapter {
+  constructor(logger) {
+    super({ channel: "failing", logger });
+  }
+
+  async sendMessage() {
+    throw new Error("send failed");
+  }
+}
+
 test("sendApprovalPrompt emits formatted approval instructions", async () => {
   const adapter = new StubAdapter();
   await adapter.sendApprovalPrompt(
@@ -23,4 +33,25 @@ test("sendApprovalPrompt emits formatted approval instructions", async () => {
 
   assert.equal(adapter.messages.length, 1);
   assert.equal(adapter.messages[0].text.includes("/approve abc allow"), true);
+});
+
+test("base adapter coalesces streaming deltas into message output", async () => {
+  const adapter = new StubAdapter();
+  await adapter.sendStreamingDelta({ channel: "stub", chatId: "1", turnId: "t1" }, "hello");
+  await adapter.sendStreamingDelta({ channel: "stub", chatId: "1", turnId: "t1" }, " world");
+  await new Promise((resolve) => setTimeout(resolve, 950));
+  assert.equal(adapter.messages.length, 1);
+  assert.equal(adapter.messages[0].text, "hello world");
+});
+
+test("base adapter catches async flush errors from sendMessage", async () => {
+  const logs = [];
+  const logger = {
+    error: (line) => logs.push(String(line || "")),
+  };
+  const adapter = new FailingAdapter(logger);
+  await adapter.sendStreamingDelta({ channel: "failing", chatId: "1", turnId: "t2" }, "hello");
+  await new Promise((resolve) => setTimeout(resolve, 950));
+  assert.equal(logs.length >= 1, true);
+  assert.equal(logs.some((line) => line.includes("failed to flush streaming delta")), true);
 });

@@ -38,10 +38,15 @@ export class BaseAdapter extends EventEmitter {
     }
 
     buffer.timer = setTimeout(async () => {
-      const content = buffer.value;
-      this.streamingBuffers.delete(key);
-      if (content.trim()) {
-        await this.sendMessage(context, content);
+      try {
+        const content = buffer.value;
+        this.streamingBuffers.delete(key);
+        if (content.trim()) {
+          await this.sendMessage(context, content);
+        }
+      } catch (error) {
+        const message = error?.message || String(error);
+        this.logger?.error?.(`[${this.channel || "adapter"}] failed to flush streaming delta: ${message}`);
       }
     }, 900);
 
