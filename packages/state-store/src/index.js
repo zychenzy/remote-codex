@@ -1,6 +1,10 @@
 import fs from "node:fs";
+import fsp from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
+
+const AUDIT_FLUSH_INTERVAL_MS = 250;
 
 function nowIso() {
   return new Date().toISOString();
@@ -39,6 +43,22 @@ function keyOf(channel, chatId) {
   return `${channel}:${chatId}`;
 }
 
+function normalizeInt(value, fallback, min = 1, max = 10_000) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) {
+    return fallback;
+  }
+  return Math.min(Math.max(Math.floor(n), min), max);
+}
+
+function parseAuditLine(line) {
+  try {
+    return JSON.parse(line);
+  } catch {
+    return null;
+  }
+}
+
 export class StateStore {
   constructor({ baseDir } = {}) {
     const preferred = baseDir || path.join(os.homedir(), ".im-codex-tool");
@@ -53,6 +73,10 @@ export class StateStore {
     this.pendingApprovalsPath = path.join(this.dataDir, "pending-approvals.json");
     this.sessionsPath = path.join(this.dataDir, "sessions.json");
     this.auditPath = path.join(this.dataDir, "audit.jsonl");
+    this.auditBuffer = [];
+    this.auditInFlight = [];
+    this.auditFlushTimer = null;
+    this.auditFlushChain = Promise.resolve();
 
     ensureDir(this.baseDir);
     ensureDir(this.dataDir);
@@ -72,6 +96,14 @@ export class StateStore {
       defaults: {
         workingDir: raw?.defaults?.workingDir || os.homedir(),
         approvalMode: raw?.defaults?.approvalMode || "on-request",
+        output: {
+          resumeHistoryTurns: normalizeInt(raw?.defaults?.output?.resumeHistoryTurns, 5, 1, 100),
+          chatHistoryFlushIntervalMs: normalizeInt(raw?.defaults?.output?.chatHistoryFlushIntervalMs, 250, 10, 10_000),
+          turnOutputMinChunkChars: normalizeInt(raw?.defaults?.output?.turnOutputMinChunkChars, 160, 40, 8_000),
+          turnOutputSoftChunkChars: normalizeInt(raw?.defaults?.output?.turnOutputSoftChunkChars, 280, 40, 8_000),
+          liveSectionMaxLen: normalizeInt(raw?.defaults?.output?.liveSectionMaxLen, 1400, 200, 1900),
+          liveSectionDelayMs: normalizeInt(raw?.defaults?.output?.liveSectionDelayMs, 250, 0, 10_000),
+        },
       },
       channels: {
         discord: {
@@ -237,17 +269,105 @@ export class StateStore {
   }
 
   appendAudit(event) {
-    const line = JSON.stringify({ timestamp: nowIso(), ...event });
-    fs.appendFileSync(this.auditPath, `${line}\n`, { mode: 0o600 });
+    const line = JSON.stringify({
+      auditId: randomUUID(),
+      timestamp: nowIso(),
+      ...event,
+    });
+    this.auditBuffer.push(line);
+    this.#scheduleAuditFlush();
   }
 
   readAudit(limit = 100) {
+    const pendingLines = [
+      ...this.auditInFlight.flatMap((batch) => batch),
+      ...this.auditBuffer,
+    ];
     try {
       const content = fs.readFileSync(this.auditPath, "utf8");
-      const lines = content.trim().split("\n").filter(Boolean);
-      return lines.slice(-limit).map((line) => JSON.parse(line));
+      const persistedLines = content.trim().split("\n").filter(Boolean);
+      const mergedLines = [...persistedLines, ...pendingLines];
+      const parsed = [];
+      const seenAuditIds = new Set();
+      for (const line of mergedLines) {
+        const record = parseAuditLine(line);
+        if (!record) {
+          continue;
+        }
+        const id = record.auditId ? String(record.auditId) : "";
+        if (id && seenAuditIds.has(id)) {
+          continue;
+        }
+        if (id) {
+          seenAuditIds.add(id);
+        }
+        parsed.push(record);
+      }
+      return parsed.slice(-limit);
     } catch {
-      return [];
+      return pendingLines
+        .map((line) => parseAuditLine(line))
+        .filter(Boolean)
+        .slice(-limit);
+    }
+  }
+
+  async flush() {
+    await this.#flushAuditBuffer({ force: true });
+  }
+
+  #scheduleAuditFlush() {
+    if (this.auditFlushTimer) {
+      return;
+    }
+    this.auditFlushTimer = setTimeout(() => {
+      this.auditFlushTimer = null;
+      this.#flushAuditBuffer().catch((error) => {
+        console.warn(`[state-store] failed to flush audit buffer: ${error.message}`);
+      });
+    }, AUDIT_FLUSH_INTERVAL_MS);
+  }
+
+  async #flushAuditBuffer({ force = false } = {}) {
+    if (this.auditFlushTimer && force) {
+      clearTimeout(this.auditFlushTimer);
+      this.auditFlushTimer = null;
+    }
+    if (!this.auditBuffer.length) {
+      if (force) {
+        await this.auditFlushChain.catch(() => {});
+      }
+      return;
+    }
+    const batch = this.auditBuffer.splice(0, this.auditBuffer.length);
+    const payload = `${batch.join("\n")}\n`;
+    this.auditInFlight.push(batch);
+
+    const writeTask = this.auditFlushChain
+      .catch(() => {})
+      .then(() => fsp.appendFile(this.auditPath, payload, { encoding: "utf8", mode: 0o600 }));
+    this.auditFlushChain = writeTask.catch(() => {});
+
+    try {
+      await writeTask;
+    } catch (error) {
+      if (force) {
+        try {
+          fs.appendFileSync(this.auditPath, payload, { encoding: "utf8", mode: 0o600 });
+          return;
+        } catch (syncError) {
+          console.warn(`[state-store] failed to force-flush audit buffer: ${syncError.message}`);
+        }
+      } else {
+        console.warn(`[state-store] failed to flush audit buffer: ${error.message}`);
+      }
+      this.auditBuffer = [...batch, ...this.auditBuffer];
+      this.#scheduleAuditFlush();
+    } finally {
+      const idx = this.auditInFlight.indexOf(batch);
+      if (idx >= 0) {
+        this.auditInFlight.splice(idx, 1);
+      }
     }
   }
 }

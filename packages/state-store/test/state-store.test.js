@@ -67,6 +67,12 @@ test("default config uses home directory as workingDir", () => {
   const store = new StateStore({ baseDir: dir });
   const config = store.readConfig();
   assert.equal(config.defaults.workingDir, os.homedir());
+  assert.equal(config.defaults.output.resumeHistoryTurns, 5);
+  assert.equal(config.defaults.output.chatHistoryFlushIntervalMs, 250);
+  assert.equal(config.defaults.output.turnOutputMinChunkChars, 160);
+  assert.equal(config.defaults.output.turnOutputSoftChunkChars, 280);
+  assert.equal(config.defaults.output.liveSectionMaxLen, 1400);
+  assert.equal(config.defaults.output.liveSectionDelayMs, 250);
 });
 
 test("upsert binding preserves extended policy fields on partial updates", () => {
@@ -108,4 +114,61 @@ test("upsert binding preserves extended policy fields on partial updates", () =>
   assert.equal(binding.policyProfile.reasoningEffort, "high");
   assert.equal(binding.policyProfile.collaborationMode, "default");
   assert.equal(binding.policyProfile.skillsContext.cwd, "/tmp");
+});
+
+test("appendAudit writes through buffered async flush", async () => {
+  const dir = tempDir();
+  const store = new StateStore({ baseDir: dir });
+
+  store.appendAudit({ type: "daemon_started", pid: 123 });
+  store.appendAudit({ type: "daemon_stopped", pid: 123 });
+  await store.flush();
+
+  const audit = store.readAudit(10);
+  assert.equal(audit.length >= 2, true);
+  assert.equal(audit[audit.length - 2].type, "daemon_started");
+  assert.equal(audit[audit.length - 1].type, "daemon_stopped");
+});
+
+test("readAudit includes buffered entries before flush", () => {
+  const dir = tempDir();
+  const store = new StateStore({ baseDir: dir });
+
+  store.appendAudit({ type: "event_one" });
+  store.appendAudit({ type: "event_two" });
+
+  const audit = store.readAudit(10);
+  assert.equal(audit.length >= 2, true);
+  assert.equal(audit[audit.length - 2].type, "event_one");
+  assert.equal(audit[audit.length - 1].type, "event_two");
+});
+
+test("readAudit de-duplicates records with the same auditId", () => {
+  const dir = tempDir();
+  const store = new StateStore({ baseDir: dir });
+
+  store.appendAudit({ type: "dedupe_event" });
+  const line = String(store.auditBuffer[0] || "");
+  fs.appendFileSync(store.auditPath, `${line}\n`, { encoding: "utf8" });
+  store.auditInFlight.push([line]);
+
+  const audit = store.readAudit(10).filter((entry) => entry.type === "dedupe_event");
+  assert.equal(audit.length, 1);
+});
+
+test("appendAudit requeues failed async writes and retries later", async () => {
+  const dir = tempDir();
+  const store = new StateStore({ baseDir: dir });
+  const originalAuditPath = store.auditPath;
+
+  store.auditPath = store.dataDir;
+  store.appendAudit({ type: "retry_event" });
+  await new Promise((resolve) => setTimeout(resolve, 350));
+
+  store.auditPath = originalAuditPath;
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  await store.flush();
+
+  const audit = store.readAudit(20).filter((entry) => entry.type === "retry_event");
+  assert.equal(audit.length, 1);
 });
