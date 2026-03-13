@@ -78,3 +78,52 @@ test("discord adapter marks unknown channels as invalid", async () => {
   assert.equal(fetchCalls >= 1, true);
   assert.equal(adapter.invalidChannels.has("999"), true);
 });
+
+test("discord adapter streams by editing a single message", async () => {
+  const originalFetch = global.fetch;
+  const calls = [];
+
+  global.fetch = async (url, options = {}) => {
+    const method = String(options.method || "GET");
+    let body = null;
+    if (typeof options.body === "string" && options.body) {
+      body = JSON.parse(options.body);
+    }
+    calls.push({ url: String(url), method, body });
+
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ id: "msg-1" }),
+      text: async () => "",
+    };
+  };
+
+  const adapter = new DiscordAdapter({
+    token: "token",
+    allowedChannels: ["123"],
+    minSendIntervalMs: 0,
+    streamEditIntervalMs: 20,
+    logger: { warn() {}, error() {}, info() {}, debug() {} },
+  });
+  const context = { channel: "discord", chatId: "123", turnId: "turn-1" };
+
+  try {
+    await adapter.sendStreamingDelta(context, "hello");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    await adapter.sendStreamingDelta(context, " world");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    await adapter.flushStreamingMessage(context, { finalText: "hello world!" });
+    await adapter.stop();
+  } finally {
+    global.fetch = originalFetch;
+  }
+
+  const postCalls = calls.filter((call) => call.method === "POST" && call.url.includes("/channels/123/messages"));
+  const patchCalls = calls.filter((call) => call.method === "PATCH" && call.url.includes("/channels/123/messages/msg-1"));
+  assert.equal(postCalls.length, 1);
+  assert.equal(patchCalls.length >= 1, true);
+  assert.equal(patchCalls[patchCalls.length - 1].body?.content, "hello world!");
+});

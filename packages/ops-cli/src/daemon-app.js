@@ -340,6 +340,28 @@ function truncateWithNotice(text, maxLen = 1800) {
   return `${input.slice(0, keep)}${suffix}`;
 }
 
+function normalizeTurnStatus(status) {
+  if (typeof status === "string" && status.trim()) {
+    return status;
+  }
+  if (status && typeof status === "object" && typeof status.type === "string" && status.type.trim()) {
+    return status.type;
+  }
+  return "completed";
+}
+
+function turnOutputKey(threadId, turnId) {
+  const tid = String(turnId || "").trim();
+  if (tid) {
+    return `turn:${tid}`;
+  }
+  const thid = String(threadId || "").trim();
+  if (thid) {
+    return `thread:${thid}`;
+  }
+  return "";
+}
+
 const RESUME_HISTORY_MAX_TURNS = 20;
 
 export class DaemonApp {
@@ -365,6 +387,7 @@ export class DaemonApp {
     this.threadToBinding = new Map();
     this.turnToBinding = new Map();
     this.activeTurnByBinding = new Map();
+    this.turnOutputByKey = new Map();
     this.threadListStateByBinding = new Map();
     this.skillsCacheByCwd = new Map();
 
@@ -629,6 +652,53 @@ export class DaemonApp {
       kind: payload?.kind || "",
     });
     await adapter.sendApprovalPrompt(context, payload);
+  }
+
+  #appendTurnOutput(threadId, turnId, bKey, delta) {
+    const key = turnOutputKey(threadId, turnId);
+    if (!key || !delta) {
+      return;
+    }
+    const existing = this.turnOutputByKey.get(key) || { bindingKey: bKey, text: "" };
+    existing.bindingKey = bKey || existing.bindingKey;
+    existing.text += String(delta);
+    this.turnOutputByKey.set(key, existing);
+  }
+
+  #consumeTurnOutput(threadId, turnId) {
+    const candidates = [turnOutputKey(threadId, turnId)];
+    const turnOnly = turnOutputKey("", turnId);
+    const threadOnly = turnOutputKey(threadId, "");
+    if (turnOnly && !candidates.includes(turnOnly)) {
+      candidates.push(turnOnly);
+    }
+    if (threadOnly && !candidates.includes(threadOnly)) {
+      candidates.push(threadOnly);
+    }
+
+    for (const key of candidates) {
+      if (!key) {
+        continue;
+      }
+      const existing = this.turnOutputByKey.get(key);
+      if (!existing) {
+        continue;
+      }
+      this.turnOutputByKey.delete(key);
+      return String(existing.text || "");
+    }
+    return "";
+  }
+
+  #clearTurnOutputsForBinding(bKey) {
+    if (!bKey) {
+      return;
+    }
+    for (const [key, value] of this.turnOutputByKey.entries()) {
+      if (value?.bindingKey === bKey) {
+        this.turnOutputByKey.delete(key);
+      }
+    }
   }
 
   async #startFreshThreadForBinding(binding, bKey) {
@@ -1467,6 +1537,7 @@ export class DaemonApp {
         return;
       }
 
+      this.#appendTurnOutput(threadId, turnId, bKey, delta);
       await this.#sendStreamingDelta(adapter, { channel, chatId, turnId }, delta);
       return;
     }
@@ -1487,14 +1558,24 @@ export class DaemonApp {
       const turnId = detectTurnId(params);
       const bKey = this.turnToBinding.get(turnId) || this.threadToBinding.get(threadId);
       if (!bKey) {
+        this.#consumeTurnOutput(threadId, turnId);
         return;
       }
 
       const [channel, chatId] = bKey.split(":");
       const adapter = this.#getAdapter(channel);
+      const status = normalizeTurnStatus(params?.turn?.status);
+      const finalText = this.#consumeTurnOutput(threadId, turnId).trim();
       if (adapter) {
-        const status = params?.turn?.status || "completed";
-        await this.#sendMessage(adapter, { channel, chatId, turnId }, `Turn completed (${status}).`);
+        if (adapter.channel === "discord" && typeof adapter.flushStreamingMessage === "function") {
+          if (finalText) {
+            await adapter.flushStreamingMessage({ channel, chatId, turnId }, { finalText });
+          } else {
+            await this.#sendMessage(adapter, { channel, chatId, turnId }, `Turn completed (${status}).`);
+          }
+        } else {
+          await this.#sendMessage(adapter, { channel, chatId, turnId }, `Turn completed (${status}).`);
+        }
       }
       this.turnToBinding.delete(turnId);
       this.activeTurnByBinding.delete(bKey);
@@ -1532,6 +1613,7 @@ export class DaemonApp {
             }
           }
           this.activeTurnByBinding.delete(bKey);
+          this.#clearTurnOutputsForBinding(bKey);
         }
       }
       this.store.appendAudit({ type: "thread_closed", threadId: threadId || null });
@@ -1544,6 +1626,7 @@ export class DaemonApp {
         const bKey = this.threadToBinding.get(threadId);
         this.threadToBinding.delete(threadId);
         if (bKey) {
+          this.#clearTurnOutputsForBinding(bKey);
           const [channel, chatId] = bKey.split(":");
           const binding = this.store.getBinding(channel, chatId);
           if (binding?.threadId === threadId) {
@@ -1575,14 +1658,33 @@ export class DaemonApp {
       const turnId = detectTurnId(params);
       const bKey = this.turnToBinding.get(turnId) || this.threadToBinding.get(threadId);
       if (!bKey) {
+        this.#consumeTurnOutput(threadId, turnId);
         return;
       }
       const [channel, chatId] = bKey.split(":");
       const adapter = this.#getAdapter(channel);
       if (!adapter) {
+        this.#consumeTurnOutput(threadId, turnId);
         return;
       }
-      await this.#sendMessage(adapter, { channel, chatId, turnId }, `Runtime error: ${params?.error?.message || "unknown"}`);
+      const partial = this.#consumeTurnOutput(threadId, turnId).trim();
+      const errorMessage = `Runtime error: ${params?.error?.message || "unknown"}`;
+      if (adapter.channel === "discord" && typeof adapter.flushStreamingMessage === "function") {
+        const merged = partial ? `${partial}\n\n${errorMessage}` : errorMessage;
+        await adapter.flushStreamingMessage({ channel, chatId, turnId }, { finalText: merged });
+      } else {
+        if (partial) {
+          await this.#sendLongMessage(adapter, { channel, chatId, turnId }, partial, {
+            maxLen: 1700,
+            delayMs: adapter.channel === "discord" ? 650 : 250,
+          });
+        }
+        await this.#sendMessage(adapter, { channel, chatId, turnId }, errorMessage);
+      }
+      if (turnId) {
+        this.turnToBinding.delete(turnId);
+      }
+      this.activeTurnByBinding.delete(bKey);
     }
   }
 

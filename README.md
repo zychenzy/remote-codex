@@ -8,6 +8,7 @@ This project lets you run Codex on your host machine and control it from chat ap
 
 - Native `codex app-server` integration (JSON-RPC, thread/turn/model/skills methods).
 - IM-first operator flow (Discord + Telegram).
+- Discord turn output streams by editing a single message (lower message burst/rate pressure).
 - Local single-host deployment (no relay/control plane required).
 - Approval-gated risky operations and allowlist-based access control.
 - Persistent bindings, thread mapping, approvals, and audit logs.
@@ -131,6 +132,7 @@ Bindings and policy:
 
 - `reco bind <channel> [chatId] [--chat <id>] [--user <id>] [--cwd <dir>]`
 - `reco unbind <channel> <chatId>`
+- `reco policy set <channel> <chatId> [--approval <mode>] [--auto-approve <bool>] [--allowlist <csv>] [--model <id>] [--effort <level>] [--mode <name>]`
 - `reco policy set <channel> <chatId> [--approval <mode>] [--auto-approve <bool>] [--allowlist <csv>] [--model <id>] [--effort <level>] [--mode <name>]`
 
 Discord diagnostics:

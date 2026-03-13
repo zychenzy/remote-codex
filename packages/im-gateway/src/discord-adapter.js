@@ -2,9 +2,27 @@ import { BaseAdapter } from "./base-adapter.js";
 
 const DISCORD_API = "https://discord.com/api/v10";
 const MAX_RATE_LIMIT_RETRIES = 3;
+const DISCORD_MAX_CONTENT = 1900;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function streamKey(context) {
+  return `${context.channel || "discord"}:${String(context.chatId || "")}:${String(context.turnId || "active")}`;
+}
+
+function formatDiscordContent(text, { live = false } = {}) {
+  const raw = String(text || "");
+  if (!raw) {
+    return live ? "…" : "";
+  }
+  if (raw.length <= DISCORD_MAX_CONTENT) {
+    return raw;
+  }
+  const suffix = live ? "\n...[live view truncated]" : "\n...[truncated]";
+  const keep = Math.max(0, DISCORD_MAX_CONTENT - suffix.length);
+  return `${raw.slice(0, keep)}${suffix}`;
 }
 
 export class DiscordAdapter extends BaseAdapter {
@@ -13,6 +31,7 @@ export class DiscordAdapter extends BaseAdapter {
     allowedChannels = [],
     pollIntervalMs = 1800,
     minSendIntervalMs = 450,
+    streamEditIntervalMs = 1500,
     logger = console,
   } = {}) {
     super({ channel: "discord", logger });
@@ -20,12 +39,14 @@ export class DiscordAdapter extends BaseAdapter {
     this.allowedChannels = allowedChannels;
     this.pollIntervalMs = pollIntervalMs;
     this.minSendIntervalMs = minSendIntervalMs;
+    this.streamEditIntervalMs = streamEditIntervalMs;
     this.running = false;
     this.loopTimer = null;
     this.lastSeenByChannel = new Map();
     this.invalidChannels = new Set();
     this.sendQueue = Promise.resolve();
     this.nextAllowedSendAt = 0;
+    this.streamMessages = new Map();
   }
 
   async start() {
@@ -49,14 +70,86 @@ export class DiscordAdapter extends BaseAdapter {
       clearTimeout(this.loopTimer);
       this.loopTimer = null;
     }
+    for (const state of this.streamMessages.values()) {
+      if (state.timer) {
+        clearTimeout(state.timer);
+      }
+    }
+    this.streamMessages.clear();
   }
 
   async sendMessage(context, text) {
-    const contentRaw = String(text || "");
-    const content = contentRaw.length > 1900
-      ? `${contentRaw.slice(0, 1885)}\n...[truncated]`
-      : contentRaw;
+    const content = formatDiscordContent(text, { live: false });
+    await this.#enqueueSend(async () => {
+      await this.#api(`/channels/${context.chatId}/messages`, {
+        method: "POST",
+        body: {
+          content,
+        },
+      });
+    });
+  }
 
+  async sendStreamingDelta(context, textDelta) {
+    const key = streamKey(context);
+    const state = this.streamMessages.get(key) || {
+      chatId: String(context.chatId || ""),
+      messageId: "",
+      content: "",
+      timer: null,
+      dirty: false,
+      flushing: false,
+      pending: false,
+    };
+
+    state.chatId = String(context.chatId || state.chatId || "");
+    state.content += String(textDelta || "");
+    state.dirty = true;
+
+    if (state.flushing) {
+      state.pending = true;
+      this.streamMessages.set(key, state);
+      return;
+    }
+
+    if (!state.timer) {
+      state.timer = setTimeout(() => {
+        this.#flushStreamMessage(key).catch((error) => {
+          this.logger.error(`[discord] stream flush failed: ${error.message}`);
+        });
+      }, this.streamEditIntervalMs);
+    }
+    this.streamMessages.set(key, state);
+  }
+
+  async flushStreamingMessage(context, { finalText = null } = {}) {
+    const key = streamKey(context);
+    const state = this.streamMessages.get(key) || {
+      chatId: String(context.chatId || ""),
+      messageId: "",
+      content: "",
+      timer: null,
+      dirty: false,
+      flushing: false,
+      pending: false,
+    };
+
+    state.chatId = String(context.chatId || state.chatId || "");
+    if (typeof finalText === "string") {
+      state.content = finalText;
+    }
+    state.dirty = true;
+    if (state.timer) {
+      clearTimeout(state.timer);
+      state.timer = null;
+    }
+    this.streamMessages.set(key, state);
+
+    await this.#flushStreamMessage(key, { force: true });
+    this.streamMessages.delete(key);
+  }
+
+  async #enqueueSend(operation) {
     this.sendQueue = this.sendQueue
       .catch(() => {})
       .then(async () => {
@@ -64,15 +157,62 @@ export class DiscordAdapter extends BaseAdapter {
         if (waitMs > 0) {
           await sleep(waitMs);
         }
-        await this.#api(`/channels/${context.chatId}/messages`, {
-          method: "POST",
-          body: {
-            content,
-          },
-        });
+        await operation();
         this.nextAllowedSendAt = Date.now() + this.minSendIntervalMs;
       });
     await this.sendQueue;
+  }
+
+  async #flushStreamMessage(key, { force = false } = {}) {
+    const state = this.streamMessages.get(key);
+    if (!state) {
+      return;
+    }
+
+    if (state.timer) {
+      clearTimeout(state.timer);
+      state.timer = null;
+    }
+
+    if (state.flushing) {
+      state.pending = true;
+      this.streamMessages.set(key, state);
+      return;
+    }
+
+    state.flushing = true;
+    this.streamMessages.set(key, state);
+    try {
+      do {
+        state.pending = false;
+        if (!force && !state.dirty) {
+          break;
+        }
+
+        const content = formatDiscordContent(state.content, { live: true });
+        state.dirty = false;
+
+        await this.#enqueueSend(async () => {
+          if (!state.messageId) {
+            const created = await this.#api(`/channels/${state.chatId}/messages`, {
+              method: "POST",
+              body: { content },
+            });
+            state.messageId = String(created?.id || "");
+          } else {
+            await this.#api(`/channels/${state.chatId}/messages/${state.messageId}`, {
+              method: "PATCH",
+              body: { content },
+            });
+          }
+        });
+
+        force = false;
+      } while (state.pending || state.dirty);
+    } finally {
+      state.flushing = false;
+      this.streamMessages.set(key, state);
+    }
   }
 
   async #pollLoop() {
