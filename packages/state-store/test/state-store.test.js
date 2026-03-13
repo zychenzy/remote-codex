@@ -172,3 +172,14 @@ test("appendAudit requeues failed async writes and retries later", async () => {
   const audit = store.readAudit(20).filter((entry) => entry.type === "retry_event");
   assert.equal(audit.length, 1);
 });
+
+test("markDeliveryOnce persists dedupe keys across store reload", () => {
+  const dir = tempDir();
+  const store1 = new StateStore({ baseDir: dir });
+  assert.equal(store1.markDeliveryOnce("delivery:key:1"), true);
+  assert.equal(store1.markDeliveryOnce("delivery:key:1"), false);
+
+  const store2 = new StateStore({ baseDir: dir });
+  assert.equal(store2.markDeliveryOnce("delivery:key:1"), false);
+  assert.equal(store2.markDeliveryOnce("delivery:key:2"), true);
+});

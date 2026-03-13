@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { detectDelta, detectThreadId, detectTurnId } from "./utils.js";
 
 function normalizeTurnStatus(status) {
@@ -104,6 +105,10 @@ function formatDiffBlock(header, diffText) {
     String(diffText || "").trim(),
     "```",
   ].join("\n");
+}
+
+function shortHash(text) {
+  return createHash("sha1").update(String(text || ""), "utf8").digest("hex").slice(0, 16);
 }
 
 export class TurnEventRouter {
@@ -351,6 +356,13 @@ export class TurnEventRouter {
       }
     }
 
+    const deliveryKey = itemId
+      ? `file-change:item:${itemId}`
+      : `file-change:${cacheKey || "unknown"}:${shortHash(diffText)}`;
+    if (!this.#markDeliveryOnce(deliveryKey)) {
+      return;
+    }
+
     await this.sendLongMessageRaw(
       adapter,
       { channel, chatId, threadId, turnId },
@@ -391,25 +403,35 @@ export class TurnEventRouter {
         finalFromStream.pendingText || ""
       ).trim();
       if (pendingAssistant) {
-        await this.sendLongMessage(
-          adapter,
-          { channel, chatId, threadId, turnId },
-          pendingAssistant,
-          {
-            maxLen: this.outputPolicy.liveSectionMaxLen,
-            delayMs: this.outputPolicy.liveSectionDelayMs,
-          }
-        );
+        const deliveryKey = `turn-final:${cacheKey || "unknown"}:${shortHash(pendingAssistant)}`;
+        if (this.#markDeliveryOnce(deliveryKey)) {
+          await this.sendLongMessage(
+            adapter,
+            { channel, chatId, threadId, turnId },
+            pendingAssistant,
+            {
+              maxLen: this.outputPolicy.liveSectionMaxLen,
+              delayMs: this.outputPolicy.liveSectionDelayMs,
+            }
+          );
+        }
       } else if (!fullAssistant) {
-        await this.sendMessage(adapter, { channel, chatId, turnId }, `Turn completed (${status}).`);
+        const completionText = `Turn completed (${status}).`;
+        const completionKey = `turn-completed:${cacheKey || "unknown"}:${status}`;
+        if (this.#markDeliveryOnce(completionKey)) {
+          await this.sendMessage(adapter, { channel, chatId, turnId }, completionText);
+        }
       }
     } else if (adapter && suppressed && adapter.channel === "discord") {
       const partial = String(finalFromStream.pendingText || "").trim();
       if (partial) {
-        await this.sendLongMessage(adapter, { channel, chatId, threadId, turnId }, partial, {
-          maxLen: this.outputPolicy.liveSectionMaxLen,
-          delayMs: this.outputPolicy.liveSectionDelayMs,
-        });
+        const partialKey = `turn-suppressed-partial:${cacheKey || "unknown"}:${shortHash(partial)}`;
+        if (this.#markDeliveryOnce(partialKey)) {
+          await this.sendLongMessage(adapter, { channel, chatId, threadId, turnId }, partial, {
+            maxLen: this.outputPolicy.liveSectionMaxLen,
+            delayMs: this.outputPolicy.liveSectionDelayMs,
+          });
+        }
       }
     }
     if (turnId) {
@@ -499,6 +521,7 @@ export class TurnEventRouter {
   async #handleRuntimeError(params) {
     const threadId = detectThreadId(params);
     const turnId = detectTurnId(params);
+    const cacheKey = cacheKeyFromIds(threadId, turnId);
     const suppressed = Boolean(turnId && this.suppressedTurnIds.has(String(turnId)));
     const bKey = turnId ? this.turnToBinding.get(turnId) : this.threadToBinding.get(threadId);
     const finalFromStream = this.turnOutput.takeFinal(threadId, turnId);
@@ -523,18 +546,40 @@ export class TurnEventRouter {
       finalFromStream.pendingText || this.allAgentTextFromTurn(params?.turn || {})
     ).trim();
     if (partial) {
-      await this.sendLongMessage(adapter, { channel, chatId, threadId, turnId }, partial, {
-        maxLen: this.outputPolicy.liveSectionMaxLen,
-        delayMs: this.outputPolicy.liveSectionDelayMs,
-      });
+      const partialKey = `turn-error-partial:${cacheKey || "unknown"}:${shortHash(partial)}`;
+      if (this.#markDeliveryOnce(partialKey)) {
+        await this.sendLongMessage(adapter, { channel, chatId, threadId, turnId }, partial, {
+          maxLen: this.outputPolicy.liveSectionMaxLen,
+          delayMs: this.outputPolicy.liveSectionDelayMs,
+        });
+      }
     }
     if (!suppressed) {
-      await this.sendMessage(adapter, { channel, chatId, turnId }, errorMessage);
+      const errorKey = `turn-error:${cacheKey || "unknown"}:${shortHash(errorMessage)}`;
+      if (this.#markDeliveryOnce(errorKey)) {
+        await this.sendMessage(adapter, { channel, chatId, turnId }, errorMessage);
+      }
     }
     if (turnId) {
       this.suppressedTurnIds.delete(String(turnId));
       this.turnToBinding.delete(turnId);
     }
     this.activeTurnByBinding.delete(bKey);
+  }
+
+  #markDeliveryOnce(key) {
+    const dedupeKey = String(key || "").trim();
+    if (!dedupeKey) {
+      return true;
+    }
+    const mark = this.store?.markDeliveryOnce;
+    if (typeof mark !== "function") {
+      return true;
+    }
+    try {
+      return Boolean(mark.call(this.store, dedupeKey));
+    } catch {
+      return true;
+    }
   }
 }

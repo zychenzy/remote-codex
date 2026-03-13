@@ -361,6 +361,99 @@ test("daemon summarizes whole-file add/remove changes with compact +/- placehold
   assert.equal(adapter.messages.some((item) => item.text.includes("-const removed = true")), false);
 });
 
+test("daemon does not resend replayed file-change item after restart", async () => {
+  const baseDir = tempDir();
+
+  const app1 = new DaemonApp({ baseDir });
+  const runtime1 = new FakeRuntime({ loadedThreadIds: ["thread-1"] });
+  const adapter1 = new StubDiscordAdapter();
+  app1.runtime = runtime1;
+  app1.adapters.push(adapter1);
+  app1.store.upsertBinding({
+    channel: "discord",
+    chatId: "chat-1",
+    userId: "user-1",
+    threadId: "thread-1",
+    workingDir: "/Users/czy/auto",
+    policyProfile: {
+      approvalMode: "on-request",
+      allowlist: ["user-1"],
+      autoApprove: false,
+    },
+  });
+
+  try {
+    await app1.start();
+    runtime1.emit("notification", {
+      method: "turn/started",
+      params: { threadId: "thread-1", turnId: "turn-replay-1" },
+    });
+    await sleep(20);
+    runtime1.emit("notification", {
+      method: "item/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-replay-1",
+        item: {
+          id: "file-replay-1",
+          type: "fileChange",
+          status: "completed",
+          changes: [
+            {
+              path: "src/replay.js",
+              kind: "modified",
+              diff: "@@ -1 +1 @@\n-console.log('first')\n+console.log('second')",
+            },
+          ],
+        },
+      },
+    });
+    await sleep(40);
+    assert.equal(adapter1.messages.some((item) => item.text.includes("src/replay.js")), true);
+  } finally {
+    await app1.stop();
+  }
+
+  const app2 = new DaemonApp({ baseDir });
+  const runtime2 = new FakeRuntime({ loadedThreadIds: ["thread-1"] });
+  const adapter2 = new StubDiscordAdapter();
+  app2.runtime = runtime2;
+  app2.adapters.push(adapter2);
+
+  try {
+    await app2.start();
+    runtime2.emit("notification", {
+      method: "turn/started",
+      params: { threadId: "thread-1", turnId: "turn-replay-1" },
+    });
+    await sleep(20);
+    runtime2.emit("notification", {
+      method: "item/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-replay-1",
+        item: {
+          id: "file-replay-1",
+          type: "fileChange",
+          status: "completed",
+          changes: [
+            {
+              path: "src/replay.js",
+              kind: "modified",
+              diff: "@@ -1 +1 @@\n-console.log('first')\n+console.log('second')",
+            },
+          ],
+        },
+      },
+    });
+    await sleep(40);
+  } finally {
+    await app2.stop();
+  }
+
+  assert.equal(adapter2.messages.some((item) => item.text.includes("src/replay.js")), false);
+});
+
 test("daemon requeues chat history after flush failure and persists after path recovery", async () => {
   const { app, runtime } = await setupDaemonHarness();
   const originalChatHistoryPath = app.chatHistoryPath;

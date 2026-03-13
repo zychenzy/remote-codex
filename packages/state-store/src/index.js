@@ -5,6 +5,8 @@ import os from "node:os";
 import path from "node:path";
 
 const AUDIT_FLUSH_INTERVAL_MS = 250;
+const DELIVERY_DEDUPE_TTL_MS = 24 * 60 * 60 * 1000;
+const DELIVERY_DEDUPE_MAX_ENTRIES = 5_000;
 
 function nowIso() {
   return new Date().toISOString();
@@ -59,6 +61,21 @@ function parseAuditLine(line) {
   }
 }
 
+function normalizeDeliveryMap(raw = {}, { nowMs, ttlMs, maxEntries } = {}) {
+  const now = Number.isFinite(nowMs) ? nowMs : Date.now();
+  const ttl = normalizeInt(ttlMs, DELIVERY_DEDUPE_TTL_MS, 1_000, 30 * 24 * 60 * 60 * 1000);
+  const max = normalizeInt(maxEntries, DELIVERY_DEDUPE_MAX_ENTRIES, 100, 100_000);
+  const minTs = now - ttl;
+
+  const entries = Object.entries(raw || {})
+    .map(([key, value]) => [String(key), Number(value)])
+    .filter(([key, value]) => key && Number.isFinite(value) && value >= minTs)
+    .sort((a, b) => a[1] - b[1]);
+
+  const trimmed = entries.slice(-max);
+  return Object.fromEntries(trimmed);
+}
+
 export class StateStore {
   constructor({ baseDir } = {}) {
     const preferred = baseDir || path.join(os.homedir(), ".im-codex-tool");
@@ -73,10 +90,12 @@ export class StateStore {
     this.pendingApprovalsPath = path.join(this.dataDir, "pending-approvals.json");
     this.sessionsPath = path.join(this.dataDir, "sessions.json");
     this.auditPath = path.join(this.dataDir, "audit.jsonl");
+    this.deliveryDedupePath = path.join(this.dataDir, "delivery-dedupe.json");
     this.auditBuffer = [];
     this.auditInFlight = [];
     this.auditFlushTimer = null;
     this.auditFlushChain = Promise.resolve();
+    this.deliveryDedupeCache = null;
 
     ensureDir(this.baseDir);
     ensureDir(this.dataDir);
@@ -309,6 +328,33 @@ export class StateStore {
         .map((line) => parseAuditLine(line))
         .filter(Boolean)
         .slice(-limit);
+    }
+  }
+
+  markDeliveryOnce(key, { ttlMs = DELIVERY_DEDUPE_TTL_MS, maxEntries = DELIVERY_DEDUPE_MAX_ENTRIES } = {}) {
+    const dedupeKey = String(key || "").trim();
+    if (!dedupeKey) {
+      return true;
+    }
+
+    const nowMs = Date.now();
+    try {
+      if (!this.deliveryDedupeCache) {
+        this.deliveryDedupeCache = readJson(this.deliveryDedupePath, {});
+      }
+      const normalized = normalizeDeliveryMap(this.deliveryDedupeCache, { nowMs, ttlMs, maxEntries });
+      if (Object.prototype.hasOwnProperty.call(normalized, dedupeKey)) {
+        this.deliveryDedupeCache = normalized;
+        return false;
+      }
+      normalized[dedupeKey] = nowMs;
+      const finalMap = normalizeDeliveryMap(normalized, { nowMs, ttlMs, maxEntries });
+      this.deliveryDedupeCache = finalMap;
+      writeJson(this.deliveryDedupePath, finalMap, 0o600);
+      return true;
+    } catch (error) {
+      console.warn(`[state-store] failed to persist delivery dedupe key: ${error.message}`);
+      return true;
     }
   }
 
