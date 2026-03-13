@@ -139,7 +139,7 @@ function extractTextParts(content) {
       return "";
     })
     .filter(Boolean)
-    .join(" ");
+    .join("\n");
 }
 
 function firstUserTextFromTurn(turn) {
@@ -148,7 +148,7 @@ function firstUserTextFromTurn(turn) {
     if (item?.type === "userMessage") {
       const fromContent = extractTextParts(item.content);
       if (fromContent) {
-        return fromContent;
+        return fromContent.trim();
       }
       if (typeof item.text === "string" && item.text.trim()) {
         return item.text.trim();
@@ -167,7 +167,7 @@ function firstAgentTextFromTurn(turn) {
       }
       const fromContent = extractTextParts(item.content);
       if (fromContent) {
-        return fromContent;
+        return fromContent.trim();
       }
     }
   }
@@ -280,6 +280,67 @@ function extractSkillNameFromPrompt(prompt = "") {
   const match = String(prompt || "").match(/\$([a-zA-Z0-9_-]+)/);
   return match ? match[1] : "";
 }
+
+function splitTextIntoChunks(text, maxLen = 1600) {
+  const input = String(text || "").replace(/\r/g, "");
+  if (!input) {
+    return [];
+  }
+  if (input.length <= maxLen) {
+    return [input];
+  }
+
+  const chunks = [];
+  let remaining = input;
+  while (remaining.length > maxLen) {
+    let splitAt = remaining.lastIndexOf("\n", maxLen);
+    if (splitAt < Math.floor(maxLen * 0.5)) {
+      splitAt = maxLen;
+    }
+    chunks.push(remaining.slice(0, splitAt).trimEnd());
+    remaining = remaining.slice(splitAt).trimStart();
+  }
+  if (remaining) {
+    chunks.push(remaining);
+  }
+  return chunks;
+}
+
+function clipText(text, maxLen = 400) {
+  const input = String(text || "");
+  if (!maxLen || input.length <= maxLen) {
+    return input;
+  }
+  return `${input.slice(0, maxLen - 3)}...`;
+}
+
+function prefixFirstLineOnly(marker, text) {
+  const lines = String(text || "").split(/\r?\n/);
+  if (!lines.length) {
+    return "";
+  }
+  const [first, ...rest] = lines;
+  return [
+    `${marker} ${first}`,
+    ...rest.map((line) => `  ${line}`),
+  ].join("\n");
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function truncateWithNotice(text, maxLen = 1800) {
+  const input = String(text || "");
+  if (!input || input.length <= maxLen) {
+    return input;
+  }
+  const suffix = "\n...[truncated]";
+  const keep = Math.max(0, maxLen - suffix.length);
+  return `${input.slice(0, keep)}${suffix}`;
+}
+
+const RESUME_HISTORY_MAX_TURNS = 20;
 
 export class DaemonApp {
   constructor({ baseDir } = {}) {
@@ -528,6 +589,20 @@ export class DaemonApp {
     await adapter.sendMessage(context, text);
   }
 
+  async #sendLongMessage(adapter, context, text, { maxLen = 1600, delayMs = 350 } = {}) {
+    const chunks = splitTextIntoChunks(text, maxLen);
+    if (!chunks.length) {
+      return;
+    }
+    for (let index = 0; index < chunks.length; index += 1) {
+      const chunk = chunks[index];
+      await this.#sendMessage(adapter, context, chunk);
+      if (delayMs > 0 && index < chunks.length - 1) {
+        await sleep(delayMs);
+      }
+    }
+  }
+
   async #sendStreamingDelta(adapter, context, delta) {
     this.#appendChatHistory({
       direction: "outbound",
@@ -596,35 +671,60 @@ export class DaemonApp {
     }
   }
 
-  async #renderRecentThreadHistory(threadId, { turns = 3, textLimit = 260 } = {}) {
+  async #renderThreadHistoryMessages(threadId, { turns = null, textLimit = null } = {}) {
     try {
       const read = await this.runtime.readThread({ threadId, includeTurns: true });
       const allTurns = Array.isArray(read?.thread?.turns) ? read.thread.turns : [];
-      const recentTurns = allTurns.slice(-turns);
-      if (!recentTurns.length) {
-        return "";
+      const selectedTurns = Number.isFinite(Number(turns))
+        ? allTurns.slice(-Math.max(0, Number(turns)))
+        : allTurns;
+      if (!selectedTurns.length) {
+        return [];
       }
 
-      const lines = [];
-      for (const turn of recentTurns) {
-        const userText = singleLine(firstUserTextFromTurn(turn)).slice(0, textLimit);
-        const agentText = singleLine(firstAgentTextFromTurn(turn)).slice(0, textLimit);
+      const messages = [];
+      if (selectedTurns.length < allTurns.length) {
+        messages.push(`Thread history (${selectedTurns.length}/${allTurns.length} turns shown):`);
+      } else {
+        messages.push(`Thread history (${allTurns.length} turns):`);
+      }
+
+      for (const turn of selectedTurns) {
+        const lines = [];
+        const userRaw = String(firstUserTextFromTurn(turn) || "").trim();
+        const agentRaw = String(firstAgentTextFromTurn(turn) || "").trim();
+        const userText = textLimit ? clipText(userRaw, textLimit) : userRaw;
+        const agentText = textLimit ? clipText(agentRaw, textLimit) : agentRaw;
         if (userText) {
-          lines.push(`You: ${userText}`);
+          lines.push(prefixFirstLineOnly("◇", userText));
         }
         if (agentText) {
-          lines.push(`Codex: ${agentText}`);
+          lines.push(prefixFirstLineOnly("•", agentText));
         }
+        if (!userText && !agentText) {
+          lines.push("(no visible text content)");
+        }
+        messages.push(truncateWithNotice(lines.join("\n"), 1800));
       }
 
-      if (!lines.length) {
-        return "";
-      }
-
-      return `Recent messages:\n${lines.join("\n")}`;
+      return messages.filter(Boolean);
     } catch (error) {
-      this.logger.debug(`failed to load recent thread history for ${threadId}: ${error.message}`);
-      return "";
+      this.logger.debug(`failed to load thread history for ${threadId}: ${error.message}`);
+      return [];
+    }
+  }
+
+  async #sendThreadHistory(adapter, context, threadId, options = {}) {
+    const messages = await this.#renderThreadHistoryMessages(threadId, options);
+    if (!messages.length) {
+      return;
+    }
+    const delayMs = adapter.channel === "discord" ? 450 : 0;
+    for (let index = 0; index < messages.length; index += 1) {
+      await this.#sendMessage(adapter, context, messages[index]);
+      if (delayMs > 0 && index < messages.length - 1) {
+        await sleep(delayMs);
+      }
     }
   }
 
@@ -867,10 +967,9 @@ export class DaemonApp {
       } else {
         await this.#sendMessage(adapter, context, `Resumed thread: ${threadId}`);
       }
-      const recent = await this.#renderRecentThreadHistory(threadId, { turns: 3 });
-      if (recent) {
-        await this.#sendMessage(adapter, context, recent);
-      }
+      await this.#sendThreadHistory(adapter, context, threadId, {
+        turns: RESUME_HISTORY_MAX_TURNS,
+      });
       Object.assign(binding, updated);
       return true;
     };

@@ -1,17 +1,31 @@
 import { BaseAdapter } from "./base-adapter.js";
 
 const DISCORD_API = "https://discord.com/api/v10";
+const MAX_RATE_LIMIT_RETRIES = 3;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 export class DiscordAdapter extends BaseAdapter {
-  constructor({ token, allowedChannels = [], pollIntervalMs = 1800, logger = console } = {}) {
+  constructor({
+    token,
+    allowedChannels = [],
+    pollIntervalMs = 1800,
+    minSendIntervalMs = 450,
+    logger = console,
+  } = {}) {
     super({ channel: "discord", logger });
     this.token = token;
     this.allowedChannels = allowedChannels;
     this.pollIntervalMs = pollIntervalMs;
+    this.minSendIntervalMs = minSendIntervalMs;
     this.running = false;
     this.loopTimer = null;
     this.lastSeenByChannel = new Map();
     this.invalidChannels = new Set();
+    this.sendQueue = Promise.resolve();
+    this.nextAllowedSendAt = 0;
   }
 
   async start() {
@@ -38,12 +52,27 @@ export class DiscordAdapter extends BaseAdapter {
   }
 
   async sendMessage(context, text) {
-    await this.#api(`/channels/${context.chatId}/messages`, {
-      method: "POST",
-      body: {
-        content: text.slice(0, 1900),
-      },
-    });
+    const contentRaw = String(text || "");
+    const content = contentRaw.length > 1900
+      ? `${contentRaw.slice(0, 1885)}\n...[truncated]`
+      : contentRaw;
+
+    this.sendQueue = this.sendQueue
+      .catch(() => {})
+      .then(async () => {
+        const waitMs = this.nextAllowedSendAt - Date.now();
+        if (waitMs > 0) {
+          await sleep(waitMs);
+        }
+        await this.#api(`/channels/${context.chatId}/messages`, {
+          method: "POST",
+          body: {
+            content,
+          },
+        });
+        this.nextAllowedSendAt = Date.now() + this.minSendIntervalMs;
+      });
+    await this.sendQueue;
   }
 
   async #pollLoop() {
@@ -107,25 +136,48 @@ export class DiscordAdapter extends BaseAdapter {
   }
 
   async #api(path, { method = "GET", body = null } = {}) {
-    const response = await fetch(`${DISCORD_API}${path}`, {
-      method,
-      headers: {
-        authorization: `Bot ${this.token}`,
-        ...(body ? { "content-type": "application/json" } : {}),
-      },
-      ...(body ? { body: JSON.stringify(body) } : {}),
-    });
+    for (let attempt = 0; attempt <= MAX_RATE_LIMIT_RETRIES; attempt += 1) {
+      const response = await fetch(`${DISCORD_API}${path}`, {
+        method,
+        headers: {
+          authorization: `Bot ${this.token}`,
+          ...(body ? { "content-type": "application/json" } : {}),
+        },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      });
 
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`discord ${path} failed: ${response.status} ${text}`);
+      if (response.status === 429) {
+        const text = await response.text();
+        let retryAfterMs = 400;
+        try {
+          const payload = JSON.parse(text);
+          const seconds = Number(payload?.retry_after);
+          if (Number.isFinite(seconds) && seconds > 0) {
+            retryAfterMs = Math.ceil(seconds * 1000) + 50;
+          }
+        } catch {
+          // keep default
+        }
+        if (attempt < MAX_RATE_LIMIT_RETRIES) {
+          this.logger.warn(`[discord] rate limited on ${path}; retrying in ${retryAfterMs}ms`);
+          await sleep(retryAfterMs);
+          continue;
+        }
+        throw new Error(`discord ${path} failed: 429 ${text}`);
+      }
+
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`discord ${path} failed: ${response.status} ${text}`);
+      }
+
+      if (response.status === 204) {
+        return null;
+      }
+
+      return response.json();
     }
-
-    if (response.status === 204) {
-      return null;
-    }
-
-    return response.json();
+    throw new Error(`discord ${path} failed after retries`);
   }
 }
 

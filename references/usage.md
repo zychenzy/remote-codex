@@ -56,7 +56,7 @@ Thread management:
 /thread archive <threadId> --confirm
 ```
 
-When you `/resume <threadId>`, daemon also sends a short preview of recent messages from that thread.
+When you `/resume <threadId>`, daemon sends a formatted transcript window (last 20 turns by default) back to IM in chunked messages.
 
 Model and skills:
 
