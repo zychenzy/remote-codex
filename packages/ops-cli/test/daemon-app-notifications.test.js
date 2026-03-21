@@ -19,6 +19,7 @@ class FakeRuntime {
     this.loadedThreadIds = loadedThreadIds;
     this.threadReads = new Map(Object.entries(threadReads));
     this.handlers = new Map();
+    this.serverResponses = [];
   }
 
   on(event, handler) {
@@ -73,7 +74,9 @@ class FakeRuntime {
     return { thread: { id: threadId, cwd: "/Users/czy/auto" } };
   }
 
-  async respondServerRequest() {}
+  async respondServerRequest(requestId, result) {
+    this.serverResponses.push({ requestId, result });
+  }
 }
 
 class StubDiscordAdapter {
@@ -604,4 +607,354 @@ test("daemon /resume sends thread history blocks through integrated command flow
   assert.equal(adapter.messages.some((item) => item.text.includes("Thread history (1 turns):")), true);
   assert.equal(adapter.messages.some((item) => item.text.includes("◇ hello from user")), true);
   assert.equal(adapter.messages.some((item) => item.text.includes("• hello from agent")), true);
+});
+
+test("daemon supports /cwd absolute, ~, and /workspace alias with resolved errors", async () => {
+  const { app, adapter } = await setupDaemonHarness();
+  const missing = `~/definitely-missing-${Date.now()}`;
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/cwd /",
+    });
+    await sleep(50);
+
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/cwd ~",
+    });
+    await sleep(50);
+
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/workspace /tmp",
+    });
+    await sleep(50);
+
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: `/cwd ${missing}`,
+    });
+    await sleep(60);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(adapter.messages.some((item) => item.text.includes("Workspace set to: /")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes(`Workspace set to: ${os.homedir()}`)), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Workspace set to: /tmp")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes(`Directory does not exist: ${missing}`)), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("(resolved: ")), true);
+});
+
+test("daemon /status includes auth inheritance note", async () => {
+  const { app, adapter } = await setupDaemonHarness();
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/status",
+    });
+    await sleep(50);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(adapter.messages.some((item) => item.text.includes("Auth mode: inherited from current Codex login state")), true);
+});
+
+test("daemon thread auto-approve handles command/file only and keeps tool user-input manual", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/approve auto on",
+    });
+    await sleep(60);
+
+    runtime.emit("serverRequest", {
+      id: "srv-auto-command-1",
+      method: "item/commandExecution/requestApproval",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-auto-1",
+        reason: "run command",
+      },
+    });
+    await sleep(60);
+
+    runtime.emit("serverRequest", {
+      id: "srv-auto-tool-1",
+      method: "item/tool/requestUserInput",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-auto-1",
+        reason: "need user input",
+      },
+    });
+    await sleep(60);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(adapter.messages.some((item) => item.text.includes("Thread auto-approve (command/file) enabled for thread-1")), true);
+  assert.equal(runtime.serverResponses.some((item) => item.requestId === "srv-auto-command-1" && item.result?.decision === "accept"), true);
+  assert.equal(runtime.serverResponses.some((item) => item.requestId === "srv-auto-tool-1"), false);
+  assert.equal(adapter.approvalPrompts.length >= 1, true);
+});
+
+test("daemon thread auto-approve is scoped per thread and persists across restart", async () => {
+  const baseDir = tempDir();
+
+  const app1 = new DaemonApp({ baseDir });
+  const runtime1 = new FakeRuntime({ loadedThreadIds: ["thread-1"] });
+  const adapter1 = new StubDiscordAdapter();
+  app1.runtime = runtime1;
+  app1.adapters.push(adapter1);
+  app1.store.upsertBinding({
+    channel: "discord",
+    chatId: "chat-1",
+    userId: "user-1",
+    threadId: "thread-1",
+    workingDir: "/Users/czy/auto",
+    policyProfile: {
+      approvalMode: "on-request",
+      allowlist: ["user-1"],
+      autoApprove: false,
+    },
+  });
+
+  try {
+    await app1.start();
+    adapter1.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/approve auto on thread-1",
+    });
+    await sleep(80);
+    app1.threadToBinding.set("thread-2", "discord:chat-1");
+    runtime1.emit("serverRequest", {
+      id: "srv-auto-thread2",
+      method: "item/commandExecution/requestApproval",
+      params: { threadId: "thread-2", reason: "run thread2 command" },
+    });
+    await sleep(60);
+  } finally {
+    await app1.stop();
+  }
+
+  const app2 = new DaemonApp({ baseDir });
+  const runtime2 = new FakeRuntime({ loadedThreadIds: ["thread-1"] });
+  const adapter2 = new StubDiscordAdapter();
+  app2.runtime = runtime2;
+  app2.adapters.push(adapter2);
+  try {
+    await app2.start();
+    runtime2.emit("serverRequest", {
+      id: "srv-auto-thread1-after-restart",
+      method: "item/fileChange/requestApproval",
+      params: { threadId: "thread-1", reason: "file change" },
+    });
+    await sleep(60);
+  } finally {
+    await app2.stop();
+  }
+
+  assert.equal(runtime1.serverResponses.some((item) => item.requestId === "srv-auto-thread2"), false);
+  assert.equal(adapter1.approvalPrompts.length >= 1, true);
+  assert.equal(runtime2.serverResponses.some((item) => (
+    item.requestId === "srv-auto-thread1-after-restart"
+    && item.result?.decision === "accept"
+  )), true);
+});
+
+test("daemon clears thread auto-approve toggle when thread is archived or closed", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/approve auto on thread-1",
+    });
+    await sleep(60);
+    runtime.emit("notification", {
+      method: "thread/archived",
+      params: { threadId: "thread-1" },
+    });
+    await sleep(40);
+
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/approve auto on thread-2",
+    });
+    await sleep(60);
+    app.threadToBinding.set("thread-2", "discord:chat-1");
+    runtime.emit("notification", {
+      method: "thread/closed",
+      params: { threadId: "thread-2" },
+    });
+    await sleep(40);
+  } finally {
+    await app.stop();
+  }
+
+  const binding = app.store.getBinding("discord", "chat-1");
+  const map = binding?.policyProfile?.threadAutoApproveByThreadId || {};
+  assert.equal(Boolean(map["thread-1"]), false);
+  assert.equal(Boolean(map["thread-2"]), false);
+});
+
+test("daemon supports /plan on|off|show alias", async () => {
+  const { app, adapter } = await setupDaemonHarness();
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/plan on",
+    });
+    await sleep(60);
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/plan show",
+    });
+    await sleep(40);
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/plan off",
+    });
+    await sleep(60);
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/plan show",
+    });
+    await sleep(40);
+  } finally {
+    await app.stop();
+  }
+
+  const binding = app.store.getBinding("discord", "chat-1");
+  assert.equal(binding?.policyProfile?.collaborationMode ?? null, null);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Plan mode enabled")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Plan mode is ON")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Plan mode disabled")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Plan mode is OFF")), true);
+});
+
+test("daemon /answer resolves latest tool user-input request in binding", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+  try {
+    runtime.emit("serverRequest", {
+      id: "srv-tool-input-1",
+      method: "item/tool/requestUserInput",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-tool-1",
+        reason: "need plan answers",
+        questions: [
+          {
+            id: "mode",
+            question: "Pick mode",
+            options: [{ label: "fast" }, { label: "safe" }],
+          },
+        ],
+      },
+    });
+    await sleep(60);
+
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/answer mode=fast",
+    });
+    await sleep(70);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(adapter.approvalPrompts.length, 1);
+  assert.equal(Array.isArray(adapter.approvalPrompts[0]?.payload?.questions), true);
+  assert.equal(runtime.serverResponses.length >= 1, true);
+  const response = runtime.serverResponses.find((item) => item.requestId === "srv-tool-input-1");
+  assert.equal(Boolean(response), true);
+  assert.deepEqual(response?.result, { answers: { mode: { answers: ["fast"] } } });
+});
+
+test("daemon /answer supports explicit request id and deny", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+  try {
+    runtime.emit("serverRequest", {
+      id: "srv-tool-input-a",
+      method: "item/tool/requestUserInput",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-tool-a",
+        reason: "first prompt",
+        questions: [{ id: "mode", question: "Pick mode", options: [{ label: "fast" }, { label: "safe" }] }],
+      },
+    });
+    await sleep(40);
+    runtime.emit("serverRequest", {
+      id: "srv-tool-input-b",
+      method: "item/tool/requestUserInput",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-tool-b",
+        reason: "second prompt",
+        questions: [{ id: "mode", question: "Pick mode", options: [{ label: "fast" }, { label: "safe" }] }],
+      },
+    });
+    await sleep(60);
+
+    const firstLocal = adapter.approvalPrompts[0]?.payload?.localRequestId;
+    const secondLocal = adapter.approvalPrompts[1]?.payload?.localRequestId;
+    assert.equal(Boolean(firstLocal), true);
+    assert.equal(Boolean(secondLocal), true);
+
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: `/answer deny ${firstLocal}`,
+    });
+    await sleep(60);
+
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: `/answer ${secondLocal} mode=safe`,
+    });
+    await sleep(70);
+  } finally {
+    await app.stop();
+  }
+
+  const denyResponse = runtime.serverResponses.find((item) => item.requestId === "srv-tool-input-a");
+  const allowResponse = runtime.serverResponses.find((item) => item.requestId === "srv-tool-input-b");
+  assert.deepEqual(denyResponse?.result, { answers: {} });
+  assert.deepEqual(allowResponse?.result, { answers: { mode: { answers: ["safe"] } } });
 });

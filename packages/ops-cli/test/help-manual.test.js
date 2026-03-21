@@ -8,6 +8,10 @@ test("commandManual returns general manual", () => {
   assert.equal(text.includes("IM command manual"), true);
   assert.equal(text.includes("/thread ..."), true);
   assert.equal(text.includes("/skills ..."), true);
+  assert.equal(text.includes("/approve auto <on|off|show>"), true);
+  assert.equal(text.includes("/plan <on|off|show>"), true);
+  assert.equal(text.includes("/answer [requestId]"), true);
+  assert.equal(text.includes("Daemon auth context follows current Codex login"), true);
 });
 
 test("commandManual normalizes topic with slash prefix", () => {

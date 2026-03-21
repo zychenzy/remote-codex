@@ -76,6 +76,15 @@ function normalizeDeliveryMap(raw = {}, { nowMs, ttlMs, maxEntries } = {}) {
   return Object.fromEntries(trimmed);
 }
 
+function normalizeThreadAutoApproveByThreadId(raw = {}, { maxEntries = 500 } = {}) {
+  const source = raw && typeof raw === "object" ? raw : {};
+  const entries = Object.entries(source)
+    .map(([threadId, enabled]) => [String(threadId || "").trim(), Boolean(enabled)])
+    .filter(([threadId, enabled]) => threadId && enabled)
+    .slice(-maxEntries);
+  return Object.fromEntries(entries);
+}
+
 export class StateStore {
   constructor({ baseDir } = {}) {
     const preferred = baseDir || path.join(os.homedir(), ".im-codex-tool");
@@ -159,6 +168,11 @@ export class StateStore {
         delete policy.desktopSyncEnabled;
         changed = true;
       }
+      const normalizedThreadAutoApprove = normalizeThreadAutoApproveByThreadId(policy.threadAutoApproveByThreadId);
+      if (JSON.stringify(policy.threadAutoApproveByThreadId || {}) !== JSON.stringify(normalizedThreadAutoApprove)) {
+        policy.threadAutoApproveByThreadId = normalizedThreadAutoApprove;
+        changed = true;
+      }
       normalized[key] = {
         ...binding,
         policyProfile: policy,
@@ -190,15 +204,36 @@ export class StateStore {
     const bindings = this.getBindings();
     const key = keyOf(binding.channel, binding.chatId);
     const existing = bindings[key] || {};
+    const incomingPolicy = binding.policyProfile || {};
+    const hasPolicyField = (field) => Object.prototype.hasOwnProperty.call(incomingPolicy, field);
 
     const policyProfile = {
-      approvalMode: binding.policyProfile?.approvalMode || existing.policyProfile?.approvalMode || "on-request",
-      allowlist: binding.policyProfile?.allowlist || existing.policyProfile?.allowlist || [],
-      autoApprove: Boolean(binding.policyProfile?.autoApprove ?? existing.policyProfile?.autoApprove ?? false),
-      model: binding.policyProfile?.model ?? existing.policyProfile?.model ?? null,
-      reasoningEffort: binding.policyProfile?.reasoningEffort ?? existing.policyProfile?.reasoningEffort ?? null,
-      collaborationMode: binding.policyProfile?.collaborationMode ?? existing.policyProfile?.collaborationMode ?? null,
-      skillsContext: binding.policyProfile?.skillsContext ?? existing.policyProfile?.skillsContext ?? null,
+      approvalMode: hasPolicyField("approvalMode")
+        ? (incomingPolicy.approvalMode || "on-request")
+        : (existing.policyProfile?.approvalMode || "on-request"),
+      allowlist: hasPolicyField("allowlist")
+        ? (incomingPolicy.allowlist || [])
+        : (existing.policyProfile?.allowlist || []),
+      autoApprove: hasPolicyField("autoApprove")
+        ? Boolean(incomingPolicy.autoApprove)
+        : Boolean(existing.policyProfile?.autoApprove ?? false),
+      model: hasPolicyField("model")
+        ? (incomingPolicy.model ?? null)
+        : (existing.policyProfile?.model ?? null),
+      reasoningEffort: hasPolicyField("reasoningEffort")
+        ? (incomingPolicy.reasoningEffort ?? null)
+        : (existing.policyProfile?.reasoningEffort ?? null),
+      collaborationMode: hasPolicyField("collaborationMode")
+        ? (incomingPolicy.collaborationMode ?? null)
+        : (existing.policyProfile?.collaborationMode ?? null),
+      skillsContext: hasPolicyField("skillsContext")
+        ? (incomingPolicy.skillsContext ?? null)
+        : (existing.policyProfile?.skillsContext ?? null),
+      threadAutoApproveByThreadId: normalizeThreadAutoApproveByThreadId(
+        hasPolicyField("threadAutoApproveByThreadId")
+          ? (incomingPolicy.threadAutoApproveByThreadId ?? {})
+          : (existing.policyProfile?.threadAutoApproveByThreadId ?? {})
+      ),
     };
 
     const next = {

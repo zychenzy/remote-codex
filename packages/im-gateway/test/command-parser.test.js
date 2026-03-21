@@ -22,6 +22,49 @@ test("parser handles approve command", () => {
   assert.equal(result.decision, "allow");
 });
 
+test("parser handles approve auto command", () => {
+  const result = parseIncomingCommand("/approve auto on");
+  assert.equal(result.type, "approveAuto");
+  assert.equal(result.action, "on");
+  assert.equal(result.threadId, "");
+});
+
+test("parser handles approve auto command with explicit thread id", () => {
+  const result = parseIncomingCommand("/approve auto off thread-1");
+  assert.equal(result.type, "approveAuto");
+  assert.equal(result.action, "off");
+  assert.equal(result.threadId, "thread-1");
+});
+
+test("parser handles plan command", () => {
+  const result = parseIncomingCommand("/plan on");
+  assert.equal(result.type, "plan");
+  assert.equal(result.action, "on");
+});
+
+test("parser handles answer command with explicit request id", () => {
+  const result = parseIncomingCommand("/answer req-1 q1=on;q2=off");
+  assert.equal(result.type, "answer");
+  assert.equal(result.decision, "allow");
+  assert.equal(result.requestId, "req-1");
+  assert.equal(result.payload, "q1=on;q2=off");
+});
+
+test("parser handles answer command without request id", () => {
+  const result = parseIncomingCommand("/answer q1=on;q2=off");
+  assert.equal(result.type, "answer");
+  assert.equal(result.decision, "allow");
+  assert.equal(result.requestId, "");
+  assert.equal(result.payload, "q1=on;q2=off");
+});
+
+test("parser handles answer deny shorthand", () => {
+  const result = parseIncomingCommand("/answer deny req-1");
+  assert.equal(result.type, "answer");
+  assert.equal(result.decision, "deny");
+  assert.equal(result.requestId, "req-1");
+});
+
 test("parser handles cwd command", () => {
   const result = parseIncomingCommand("/cwd ~/projects/demo");
   assert.equal(result.type, "cwd");

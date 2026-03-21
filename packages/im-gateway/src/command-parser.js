@@ -78,6 +78,53 @@ export function parseIncomingCommand(text = "") {
     return { type: "model", value: parts.slice(1).join(" ").trim() };
   }
 
+  if (cmd === "/plan") {
+    return { type: "plan", action: (parts[1] || "show").toLowerCase() };
+  }
+
+  if (cmd === "/answer") {
+    const first = parts[1] || "";
+    const firstLower = first.toLowerCase();
+    const firstLooksLikePayload = first.includes("=") || first.includes(";") || first.startsWith("{");
+
+    if (!first) {
+      return { type: "answer", decision: "allow", requestId: "", payload: "" };
+    }
+
+    if (["allow", "deny"].includes(firstLower)) {
+      const second = parts[2] || "";
+      const secondLooksLikePayload = second.includes("=") || second.includes(";") || second.startsWith("{");
+      const hasRequestId = Boolean(second) && !secondLooksLikePayload;
+      const payload = parts.slice(hasRequestId ? 3 : 2).join(" ").trim();
+      return {
+        type: "answer",
+        decision: firstLower,
+        requestId: hasRequestId ? second : "",
+        payload,
+      };
+    }
+
+    if (firstLower === "cancel") {
+      return { type: "answer", decision: "deny", requestId: "", payload: "" };
+    }
+
+    if (parts.length === 2 && firstLooksLikePayload) {
+      return {
+        type: "answer",
+        decision: "allow",
+        requestId: "",
+        payload: first,
+      };
+    }
+
+    return {
+      type: "answer",
+      decision: "allow",
+      requestId: first,
+      payload: parts.slice(2).join(" ").trim(),
+    };
+  }
+
   if (cmd === "/skills") {
     return {
       type: "skills",
@@ -88,6 +135,11 @@ export function parseIncomingCommand(text = "") {
   }
 
   if (cmd === "/approve") {
+    if ((parts[1] || "").toLowerCase() === "auto") {
+      const action = (parts[2] || "").toLowerCase();
+      const threadId = parts[3] || "";
+      return { type: "approveAuto", action, threadId };
+    }
     const requestId = parts[1] || "";
     const decision = (parts[2] || "").toLowerCase();
     const payload = parts.slice(3).join(" ").trim();

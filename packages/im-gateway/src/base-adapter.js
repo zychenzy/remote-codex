@@ -1,5 +1,35 @@
 import { EventEmitter } from "node:events";
 
+function normalizeQuestions(rawQuestions) {
+  if (!Array.isArray(rawQuestions)) {
+    return [];
+  }
+  const out = [];
+  for (const entry of rawQuestions) {
+    if (!entry || typeof entry !== "object") {
+      continue;
+    }
+    const id = String(entry.id || "").trim();
+    const question = String(entry.question || entry.prompt || entry.text || "").trim();
+    const options = Array.isArray(entry.options) ? entry.options : [];
+    out.push({ id, question, options });
+  }
+  return out;
+}
+
+function optionLabel(option) {
+  if (option == null) {
+    return "";
+  }
+  if (typeof option === "string") {
+    return option.trim();
+  }
+  if (typeof option === "object") {
+    return String(option.label || option.value || option.id || "").trim();
+  }
+  return "";
+}
+
 export class BaseAdapter extends EventEmitter {
   constructor({ channel, logger = console } = {}) {
     super();
@@ -54,6 +84,37 @@ export class BaseAdapter extends EventEmitter {
   }
 
   async sendApprovalPrompt(context, approvalRequest) {
+    if (approvalRequest.kind === "item/tool/requestUserInput") {
+      const questions = normalizeQuestions(approvalRequest.questions);
+      const lines = [
+        `User input required (${approvalRequest.kind})`,
+        `requestId: ${approvalRequest.localRequestId}`,
+        approvalRequest.summary ? `details: ${approvalRequest.summary}` : "",
+      ].filter(Boolean);
+
+      if (questions.length) {
+        lines.push("questions:");
+        for (const question of questions) {
+          const title = question.question || "(question)";
+          const key = question.id ? `[${question.id}] ` : "";
+          lines.push(`${key}${title}`);
+          const labels = question.options
+            .map((option) => optionLabel(option))
+            .filter(Boolean);
+          if (labels.length) {
+            lines.push(`options: ${labels.join(" | ")}`);
+          }
+        }
+      }
+
+      lines.push(
+        `reply: /answer ${approvalRequest.localRequestId} <questionId>=<answer>[;<questionId>=<answer>]`,
+        `or:    /answer deny ${approvalRequest.localRequestId}`
+      );
+      await this.sendMessage(context, lines.join("\n"));
+      return;
+    }
+
     const summary = [
       `Approval required (${approvalRequest.kind})`,
       `requestId: ${approvalRequest.localRequestId}`,

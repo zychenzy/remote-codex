@@ -35,6 +35,31 @@ test("sendApprovalPrompt emits formatted approval instructions", async () => {
   assert.equal(adapter.messages[0].text.includes("/approve abc allow"), true);
 });
 
+test("sendApprovalPrompt emits tool question instructions with /answer", async () => {
+  const adapter = new StubAdapter();
+  await adapter.sendApprovalPrompt(
+    { channel: "stub", chatId: "1" },
+    {
+      localRequestId: "req-tool",
+      kind: "item/tool/requestUserInput",
+      summary: "Plan needs choices",
+      questions: [
+        {
+          id: "mode",
+          question: "Which mode?",
+          options: [{ label: "fast" }, { label: "safe" }],
+        },
+      ],
+    }
+  );
+
+  assert.equal(adapter.messages.length, 1);
+  assert.equal(adapter.messages[0].text.includes("User input required"), true);
+  assert.equal(adapter.messages[0].text.includes("[mode] Which mode?"), true);
+  assert.equal(adapter.messages[0].text.includes("options: fast | safe"), true);
+  assert.equal(adapter.messages[0].text.includes("/answer req-tool"), true);
+});
+
 test("base adapter coalesces streaming deltas into message output", async () => {
   const adapter = new StubAdapter();
   await adapter.sendStreamingDelta({ channel: "stub", chatId: "1", turnId: "t1" }, "hello");

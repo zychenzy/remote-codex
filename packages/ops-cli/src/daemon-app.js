@@ -40,6 +40,52 @@ function supportedApprovalMethod(method) {
   );
 }
 
+function threadScopedAutoApproveSupportedMethod(method) {
+  return (
+    method === "item/commandExecution/requestApproval" ||
+    method === "item/fileChange/requestApproval"
+  );
+}
+
+function requestUserInputQuestions(params = {}) {
+  const candidates = [
+    params?.questions,
+    params?.input?.questions,
+    params?.request?.questions,
+    params?.payload?.questions,
+  ];
+  for (const value of candidates) {
+    if (!Array.isArray(value)) {
+      continue;
+    }
+    const out = [];
+    for (const entry of value) {
+      if (!entry || typeof entry !== "object") {
+        continue;
+      }
+      const id = String(entry.id || "").trim();
+      const question = String(entry.question || entry.prompt || entry.text || "").trim();
+      const optionsRaw = Array.isArray(entry.options) ? entry.options : [];
+      const options = optionsRaw
+        .map((option) => {
+          if (typeof option === "string") {
+            return option.trim();
+          }
+          if (option && typeof option === "object") {
+            return String(option.label || option.value || option.id || "").trim();
+          }
+          return "";
+        })
+        .filter(Boolean);
+      out.push({ id, question, options });
+    }
+    if (out.length) {
+      return out;
+    }
+  }
+  return [];
+}
+
 function makeLaunchSpec(config) {
   if (config?.runtime?.appServer?.command) {
     return {
@@ -56,12 +102,16 @@ function makeLaunchSpec(config) {
 function resolveWorkspacePath(inputPath, currentWorkingDir) {
   const trimmed = String(inputPath || "").trim();
   if (!trimmed) {
-    return { value: currentWorkingDir };
+    return { value: currentWorkingDir, input: "", resolved: currentWorkingDir };
   }
 
   let candidate = trimmed;
-  if (candidate.startsWith("~")) {
-    candidate = path.join(os.homedir(), candidate.slice(1));
+  if (candidate === "~") {
+    candidate = os.homedir();
+  } else if (candidate.startsWith("~/") || candidate.startsWith("~\\")) {
+    candidate = path.resolve(os.homedir(), candidate.slice(2));
+  } else if (candidate.startsWith("~")) {
+    candidate = path.join(os.homedir(), candidate.slice(1).replace(/^[/\\]+/, ""));
   } else if (!path.isAbsolute(candidate)) {
     candidate = path.resolve(currentWorkingDir, candidate);
   }
@@ -69,13 +119,21 @@ function resolveWorkspacePath(inputPath, currentWorkingDir) {
   try {
     const stat = fs.statSync(candidate);
     if (!stat.isDirectory()) {
-      return { error: `Not a directory: ${candidate}` };
+      return {
+        error: `Not a directory: ${trimmed} (resolved: ${candidate})`,
+        input: trimmed,
+        resolved: candidate,
+      };
     }
   } catch {
-    return { error: `Directory does not exist: ${candidate}` };
+    return {
+      error: `Directory does not exist: ${trimmed} (resolved: ${candidate})`,
+      input: trimmed,
+      resolved: candidate,
+    };
   }
 
-  return { value: candidate };
+  return { value: candidate, input: trimmed, resolved: candidate };
 }
 
 function isThreadNotFoundError(error) {
@@ -707,6 +765,7 @@ export class DaemonApp {
         approvalMode: this.config.defaults?.approvalMode || "on-request",
         allowlist: this.#channelAllowlist(context.channel),
         autoApprove: false,
+        threadAutoApproveByThreadId: {},
       },
     });
 
@@ -738,6 +797,105 @@ export class DaemonApp {
 
   #getAdapter(channel) {
     return this.adapters.find((adapter) => adapter.channel === channel) || null;
+  }
+
+  #threadAutoApproveMap(binding) {
+    const raw = binding?.policyProfile?.threadAutoApproveByThreadId;
+    if (!raw || typeof raw !== "object") {
+      return {};
+    }
+    const out = {};
+    for (const [threadId, enabled] of Object.entries(raw)) {
+      const id = String(threadId || "").trim();
+      if (!id) {
+        continue;
+      }
+      out[id] = Boolean(enabled);
+    }
+    return out;
+  }
+
+  #threadAutoApproveEnabled(binding, threadId) {
+    const id = String(threadId || "").trim();
+    if (!id) {
+      return false;
+    }
+    return Boolean(this.#threadAutoApproveMap(binding)[id]);
+  }
+
+  #setThreadAutoApprove(binding, threadId, enabled) {
+    const id = String(threadId || "").trim();
+    if (!id) {
+      return binding;
+    }
+    const nextMap = this.#threadAutoApproveMap(binding);
+    if (enabled) {
+      nextMap[id] = true;
+    } else {
+      delete nextMap[id];
+    }
+    return this.store.upsertBinding({
+      ...binding,
+      policyProfile: {
+        ...binding.policyProfile,
+        threadAutoApproveByThreadId: nextMap,
+      },
+    });
+  }
+
+  #clearThreadAutoApproveForThread(binding, threadId) {
+    if (!binding) {
+      return null;
+    }
+    const id = String(threadId || "").trim();
+    if (!id) {
+      return binding;
+    }
+    const nextMap = this.#threadAutoApproveMap(binding);
+    if (!nextMap[id]) {
+      return binding;
+    }
+    delete nextMap[id];
+    return this.store.upsertBinding({
+      ...binding,
+      policyProfile: {
+        ...binding.policyProfile,
+        threadAutoApproveByThreadId: nextMap,
+      },
+    });
+  }
+
+  #findPendingToolInputRequest(binding, { requestId = "", preferredThreadId = "" } = {}) {
+    const targetRequestId = String(requestId || "").trim();
+    if (targetRequestId) {
+      const pending = this.approvalBroker.getPending(targetRequestId);
+      if (!pending || pending.method !== "item/tool/requestUserInput") {
+        return null;
+      }
+      const matchesBinding = (
+        String(pending.binding?.channel || "") === String(binding.channel || "")
+        && String(pending.binding?.chatId || "") === String(binding.chatId || "")
+      );
+      return matchesBinding ? pending : null;
+    }
+
+    const requestedThreadId = String(preferredThreadId || "").trim();
+    const candidates = this.approvalBroker
+      .listPending()
+      .filter((record) => (
+        record.method === "item/tool/requestUserInput"
+        && String(record.binding?.channel || "") === String(binding.channel || "")
+        && String(record.binding?.chatId || "") === String(binding.chatId || "")
+      ));
+    if (!candidates.length) {
+      return null;
+    }
+    if (!requestedThreadId) {
+      return candidates[candidates.length - 1];
+    }
+
+    const exact = candidates.filter((record) => String(detectThreadId(record.params) || "").trim() === requestedThreadId);
+    return exact[exact.length - 1] || candidates[candidates.length - 1];
   }
 
   #resetEphemeralTurnState() {
@@ -1372,6 +1530,9 @@ export class DaemonApp {
         }
         this.activeTurnByBinding.delete(bKey);
         this.#turnOutputClearByBinding(bKey);
+        const [channel, chatId] = bKey.split(":");
+        const binding = this.store.getBinding(channel, chatId);
+        this.#clearThreadAutoApproveForThread(binding, threadId);
       }
     }
     this.store.appendAudit({ type: "thread_closed", threadId: threadId || null });
@@ -1386,9 +1547,11 @@ export class DaemonApp {
         this.#turnOutputClearByBinding(bKey);
         const [channel, chatId] = bKey.split(":");
         const binding = this.store.getBinding(channel, chatId);
-        if (binding?.threadId === threadId) {
+        const updated = this.#clearThreadAutoApproveForThread(binding, threadId);
+        const effective = updated || binding;
+        if (effective?.threadId === threadId) {
           this.store.upsertBinding({
-            ...binding,
+            ...effective,
             threadId: null,
           });
         }
@@ -1638,6 +1801,9 @@ export class DaemonApp {
     if (command.type === "status") {
       const pending = this.approvalBroker.listPending().length;
       const active = this.activeTurnByBinding.get(bKey);
+      const threadScopedAutoApprove = binding.threadId
+        ? (this.#threadAutoApproveEnabled(binding, binding.threadId) ? "on" : "off")
+        : "n/a";
       await this.#sendMessage(adapter, context, [
         `Binding: ${bKey}`,
         `Thread: ${binding.threadId || "none"}`,
@@ -1645,6 +1811,8 @@ export class DaemonApp {
         `Model: ${binding.policyProfile?.model || "runtime default"}`,
         `Effort: ${binding.policyProfile?.reasoningEffort || "runtime default"}`,
         `Mode: ${binding.policyProfile?.collaborationMode || "runtime default"}`,
+        `Auth mode: inherited from current Codex login state`,
+        `Thread auto-approve (command/file): ${threadScopedAutoApprove}`,
         `Active turn: ${active || "none"}`,
         `Pending approvals: ${pending}`,
       ].join("\n"));
@@ -2049,6 +2217,10 @@ export class DaemonApp {
 
         if (action === "archive") {
           await this.runtime.archiveThread(threadId);
+          const updatedPolicy = this.#clearThreadAutoApproveForThread(binding, threadId);
+          if (updatedPolicy) {
+            Object.assign(binding, updatedPolicy);
+          }
           if (binding.threadId === threadId) {
             const updated = this.store.upsertBinding({ ...binding, threadId: null });
             Object.assign(binding, updated);
@@ -2136,9 +2308,137 @@ export class DaemonApp {
       return;
     }
 
+    if (command.type === "plan") {
+      const action = String(command.action || "show").toLowerCase();
+      if (["show", "status"].includes(action)) {
+        const enabled = String(binding.policyProfile?.collaborationMode || "").toLowerCase() === "plan";
+        await this.#sendMessage(adapter, context, `Plan mode is ${enabled ? "ON" : "OFF"} for this binding.`);
+        return;
+      }
+      if (["on", "enable", "enabled"].includes(action)) {
+        const updated = this.store.upsertBinding({
+          ...binding,
+          policyProfile: {
+            ...binding.policyProfile,
+            collaborationMode: "plan",
+          },
+        });
+        Object.assign(binding, updated);
+        await this.#sendMessage(adapter, context, "Plan mode enabled. New turns will run with mode: plan.");
+        return;
+      }
+      if (["off", "disable", "disabled"].includes(action)) {
+        const updated = this.store.upsertBinding({
+          ...binding,
+          policyProfile: {
+            ...binding.policyProfile,
+            collaborationMode: null,
+          },
+        });
+        Object.assign(binding, updated);
+        await this.#sendMessage(adapter, context, "Plan mode disabled. New turns will use runtime default mode.");
+        return;
+      }
+      await this.#sendMessage(adapter, context, "Usage: /plan <on|off|show>");
+      return;
+    }
+
+    if (command.type === "answer") {
+      const pending = this.#findPendingToolInputRequest(binding, {
+        requestId: command.requestId,
+        preferredThreadId: binding.threadId || "",
+      });
+      if (!pending) {
+        await this.#sendMessage(
+          adapter,
+          context,
+          "No pending tool input request found for this chat. Wait for a prompt, or use /approve <requestId> <allow|deny>."
+        );
+        return;
+      }
+
+      const decision = String(command.decision || "allow").toLowerCase() === "deny" ? "deny" : "allow";
+      if (decision === "deny") {
+        const denied = this.approvalBroker.resolve(pending.localRequestId, {
+          decision: "deny",
+          payload: "",
+          actor: context.userId,
+        });
+        if (!denied) {
+          await this.#sendMessage(adapter, context, `Unknown or expired approval request: ${pending.localRequestId}`);
+        }
+        return;
+      }
+
+      const payload = String(command.payload || "").trim();
+      if (!payload) {
+        const questions = requestUserInputQuestions(pending.params);
+        const sample = questions[0]?.id ? `${questions[0].id}=<answer>` : "questionId=<answer>";
+        await this.#sendMessage(
+          adapter,
+          context,
+          [
+            "Usage: /answer [requestId] <questionId>=<answer>[;<questionId>=<answer>]",
+            `Example: /answer ${pending.localRequestId} ${sample}`,
+            `Or deny: /answer deny ${pending.localRequestId}`,
+          ].join("\n")
+        );
+        return;
+      }
+
+      const resolved = this.approvalBroker.resolve(pending.localRequestId, {
+        decision: "allow",
+        payload,
+        actor: context.userId,
+      });
+      if (!resolved) {
+        await this.#sendMessage(adapter, context, `Unknown or expired approval request: ${pending.localRequestId}`);
+      }
+      return;
+    }
+
+    if (command.type === "approveAuto") {
+      const action = String(command.action || "").toLowerCase();
+      if (!["on", "off", "show"].includes(action)) {
+        await this.#sendMessage(adapter, context, "Usage: /approve auto <on|off|show> [threadId]");
+        return;
+      }
+      const targetThreadId = String(command.threadId || binding.threadId || "").trim();
+      if (action === "show") {
+        if (!targetThreadId) {
+          await this.#sendMessage(
+            adapter,
+            context,
+            "Thread auto-approve (command/file): no active thread. Usage: /approve auto show <threadId>"
+          );
+          return;
+        }
+        const enabled = this.#threadAutoApproveEnabled(binding, targetThreadId);
+        await this.#sendMessage(
+          adapter,
+          context,
+          `Thread auto-approve (command/file) is ${enabled ? "ON" : "OFF"} for ${targetThreadId}.`
+        );
+        return;
+      }
+      if (!targetThreadId) {
+        await this.#sendMessage(adapter, context, "No target thread selected. Usage: /approve auto <on|off> <threadId>");
+        return;
+      }
+      const enabled = action === "on";
+      const updated = this.#setThreadAutoApprove(binding, targetThreadId, enabled);
+      Object.assign(binding, updated);
+      await this.#sendMessage(
+        adapter,
+        context,
+        `Thread auto-approve (command/file) ${enabled ? "enabled" : "disabled"} for ${targetThreadId}.`
+      );
+      return;
+    }
+
     if (command.type === "approve") {
       if (!command.requestId || !["allow", "deny"].includes(command.decision)) {
-        await this.#sendMessage(adapter, context, "Usage: /approve <requestId> <allow|deny> [payload]");
+        await this.#sendMessage(adapter, context, "Usage: /approve <requestId> <allow|deny> [payload] or /approve auto <on|off|show> [threadId]");
         return;
       }
 
@@ -2290,19 +2590,27 @@ export class DaemonApp {
       return;
     }
 
+    const threadScopedAutoApprove = (
+      threadScopedAutoApproveSupportedMethod(serverRequest.method)
+      && this.#threadAutoApproveEnabled(binding, threadId)
+    );
     const created = this.approvalBroker.create({
       serverRequest,
       binding,
-      autoApprove: Boolean(binding.policyProfile?.autoApprove),
+      autoApprove: Boolean(binding.policyProfile?.autoApprove) || threadScopedAutoApprove,
     });
 
     if (created.autoResolved) {
       return;
     }
 
+    const isToolInputRequest = serverRequest.method === "item/tool/requestUserInput";
+    const questions = isToolInputRequest ? requestUserInputQuestions(serverRequest.params) : [];
+    const approvalSummary = serverRequest.params?.reason || serverRequest.params?.command || (isToolInputRequest ? "tool input required" : "");
+
     this.store.createPendingApproval({
       ...created.record,
-      summary: serverRequest.params?.reason || serverRequest.params?.command || "approval required",
+      summary: approvalSummary || "approval required",
     });
 
     this.store.appendAudit({
@@ -2314,7 +2622,6 @@ export class DaemonApp {
     });
 
     const turnId = detectTurnId(serverRequest.params);
-    const approvalSummary = serverRequest.params?.reason || serverRequest.params?.command || "";
 
     await this.#sendApprovalPrompt(
       adapter,
@@ -2323,6 +2630,7 @@ export class DaemonApp {
         localRequestId: created.record.localRequestId,
         kind: serverRequest.method,
         summary: approvalSummary,
+        questions,
       }
     );
   }

@@ -30,6 +30,9 @@ test("binding persistence across store reload", () => {
         cwd: "/tmp",
         lastListedAt: "2026-01-01T00:00:00.000Z",
       },
+      threadAutoApproveByThreadId: {
+        "thread-1": true,
+      },
     },
   });
 
@@ -41,6 +44,7 @@ test("binding persistence across store reload", () => {
   assert.equal(binding.policyProfile.reasoningEffort, "medium");
   assert.equal(binding.policyProfile.collaborationMode, "default");
   assert.equal(binding.policyProfile.skillsContext.cwd, "/tmp");
+  assert.equal(binding.policyProfile.threadAutoApproveByThreadId["thread-1"], true);
 });
 
 test("pending approval create and resolve", () => {
@@ -95,6 +99,9 @@ test("upsert binding preserves extended policy fields on partial updates", () =>
         cwd: "/tmp",
         count: 1,
       },
+      threadAutoApproveByThreadId: {
+        "thread-keep": true,
+      },
     },
   });
 
@@ -114,6 +121,40 @@ test("upsert binding preserves extended policy fields on partial updates", () =>
   assert.equal(binding.policyProfile.reasoningEffort, "high");
   assert.equal(binding.policyProfile.collaborationMode, "default");
   assert.equal(binding.policyProfile.skillsContext.cwd, "/tmp");
+  assert.equal(binding.policyProfile.threadAutoApproveByThreadId["thread-keep"], true);
+});
+
+test("upsert binding supports explicit clearing of nullable policy fields", () => {
+  const dir = tempDir();
+  const store = new StateStore({ baseDir: dir });
+
+  store.upsertBinding({
+    channel: "discord",
+    chatId: "c2",
+    policyProfile: {
+      model: "gpt-5.4",
+      reasoningEffort: "high",
+      collaborationMode: "plan",
+      skillsContext: { cwd: "/tmp" },
+    },
+  });
+
+  store.upsertBinding({
+    channel: "discord",
+    chatId: "c2",
+    policyProfile: {
+      model: null,
+      reasoningEffort: null,
+      collaborationMode: null,
+      skillsContext: null,
+    },
+  });
+
+  const binding = store.getBinding("discord", "c2");
+  assert.equal(binding.policyProfile.model, null);
+  assert.equal(binding.policyProfile.reasoningEffort, null);
+  assert.equal(binding.policyProfile.collaborationMode, null);
+  assert.equal(binding.policyProfile.skillsContext, null);
 });
 
 test("appendAudit writes through buffered async flush", async () => {

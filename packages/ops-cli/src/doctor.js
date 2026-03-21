@@ -1,14 +1,25 @@
 import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 
-export function runDoctor({ store }) {
+export function runDoctor({ store, spawn = spawnSync } = {}) {
   const findings = [];
 
-  const codexVersion = spawnSync("codex", ["--version"], { encoding: "utf8" });
+  const codexVersion = spawn("codex", ["--version"], { encoding: "utf8" });
   if (codexVersion.status !== 0) {
     findings.push({ level: "error", message: "codex CLI not available in PATH" });
   } else {
     findings.push({ level: "info", message: `codex detected: ${codexVersion.stdout.trim()}` });
+  }
+
+  const codexLogin = spawn("codex", ["login", "status"], { encoding: "utf8" });
+  if (codexLogin.status !== 0) {
+    findings.push({ level: "warn", message: "codex login status unavailable" });
+  } else {
+    const statusText = String(codexLogin.stdout || "").trim() || "unknown";
+    findings.push({ level: "info", message: `codex auth: ${statusText}` });
+    if (!/logged in/i.test(statusText)) {
+      findings.push({ level: "warn", message: "codex auth appears to be logged out" });
+    }
   }
 
   try {

@@ -22,8 +22,14 @@ export function commandManual(topic = "") {
       "/threads [limit|all] or /sessions [limit|all] - list threads (current workspace by default).",
       "/archive [threadId] - archive current or specified thread.",
       "/approve <requestId> <allow|deny> [payload] - resolve approval.",
+      "/approve auto <on|off|show> [threadId] - thread-scoped auto-approve for command/file requests.",
+      "/answer [requestId] <questionId>=<answer>[;<questionId>=<answer>] - reply to tool user-input prompts.",
+      "/plan <on|off|show> - quick collaboration mode toggle (plan/default).",
       "/status - show binding/thread/runtime status.",
       "/help [command] - show this help or details for one command.",
+      "",
+      "Auth/workspace note:",
+      "Daemon auth context follows current Codex login; run `reco restart` after changing account/workspace.",
       "",
       "Examples:",
       "/ask summarize this repo",
@@ -34,6 +40,9 @@ export function commandManual(topic = "") {
       "/turn ask summarize this repo --model gpt-5.4 --effort high",
       "/skills list",
       "/archive",
+      "/approve auto on",
+      "/plan on",
+      "/answer req-123 mode=fast",
       "/help approve",
     ].join("\n");
   }
@@ -151,10 +160,30 @@ export function commandManual(topic = "") {
   if (t === "approve") {
     return [
       "/approve <requestId> <allow|deny> [payload]",
+      "/approve auto <on|off|show> [threadId]",
       "Resolves pending command/file/tool approval requests.",
       "Use requestId from the approval prompt message.",
-      "Examples: /approve req-abc allow, /approve req-abc deny",
+      "Thread auto mode applies only to command/file approvals (tool user-input stays manual).",
+      "Examples: /approve req-abc allow, /approve req-abc deny, /approve auto on",
       "For user-input requests, optional payload can be sent after allow/deny.",
+    ].join("\n");
+  }
+
+  if (t === "answer") {
+    return [
+      "/answer [requestId] <questionId>=<answer>[;<questionId>=<answer>]",
+      "Resolves pending tool user-input prompts from runtime (plan-style follow-up questions).",
+      "If requestId is omitted, the latest pending tool prompt for this chat is used.",
+      "Examples: /answer req-abc q1=on;q2=safe, /answer q1=on, /answer deny req-abc",
+    ].join("\n");
+  }
+
+  if (t === "plan") {
+    return [
+      "/plan <on|off|show>",
+      "Convenience alias for collaboration mode on this binding.",
+      "on => mode plan, off => runtime default.",
+      "Examples: /plan on, /plan show, /plan off",
     ].join("\n");
   }
 
@@ -162,6 +191,7 @@ export function commandManual(topic = "") {
     return [
       "/status",
       "Shows binding key, current thread id, workspace path, active turn id, and pending approvals.",
+      "Also shows daemon auth mode (inherited from current Codex login state).",
     ].join("\n");
   }
 
