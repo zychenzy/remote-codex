@@ -15,8 +15,9 @@ function sleep(ms) {
 }
 
 class FakeRuntime {
-  constructor({ loadedThreadIds = [] } = {}) {
+  constructor({ loadedThreadIds = [], threadReads = {} } = {}) {
     this.loadedThreadIds = loadedThreadIds;
+    this.threadReads = new Map(Object.entries(threadReads));
     this.handlers = new Map();
   }
 
@@ -45,7 +46,30 @@ class FakeRuntime {
     return { data: this.loadedThreadIds };
   }
 
-  async readThread({ threadId }) {
+  async readThread({ threadId, includeTurns = false }) {
+    const existing = this.threadReads.get(threadId);
+    if (existing) {
+      return existing;
+    }
+    return {
+      thread: {
+        id: threadId,
+        cwd: "/Users/czy/auto",
+        ...(includeTurns ? { turns: [] } : {}),
+      },
+    };
+  }
+
+  async resumeThread(threadId) {
+    const existing = this.threadReads.get(threadId);
+    if (existing?.thread) {
+      return {
+        thread: {
+          id: threadId,
+          cwd: existing.thread.cwd || "/Users/czy/auto",
+        },
+      };
+    }
     return { thread: { id: threadId, cwd: "/Users/czy/auto" } };
   }
 
@@ -58,6 +82,17 @@ class StubDiscordAdapter {
     this.messages = [];
     this.streamingDeltas = [];
     this.approvalPrompts = [];
+    this.inboundHandler = null;
+  }
+
+  registerInboundHandler(handler) {
+    this.inboundHandler = handler;
+  }
+
+  emitInbound(context) {
+    if (this.inboundHandler) {
+      this.inboundHandler(context);
+    }
   }
 
   async start() {}
@@ -156,6 +191,35 @@ test("daemon emits completed sections during turn and only sends pending tail on
   } finally {
     await app.stop();
   }
+});
+
+test("daemon soft-publishes long text without blank-line boundary", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+  app.outputPolicy.turnOutputMinChunkChars = 2000;
+  app.outputPolicy.turnOutputSoftChunkChars = 120;
+
+  try {
+    runtime.emit("notification", {
+      method: "turn/started",
+      params: { threadId: "thread-1", turnId: "turn-soft-1" },
+    });
+    await sleep(20);
+
+    runtime.emit("notification", {
+      method: "item/agentMessage/delta",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-soft-1",
+        delta: `${"word ".repeat(35)}\n${"more ".repeat(35)}\n`,
+      },
+    });
+    await sleep(30);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(adapter.messages.some((item) => item.text.includes("word")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("more")), true);
 });
 
 test("daemon suppresses interrupted turn errors from user-facing output", async () => {
@@ -482,4 +546,62 @@ test("daemon requeues chat history after flush failure and persists after path r
 
   const text = fs.readFileSync(app.chatHistoryPath, "utf8");
   assert.equal(text.includes("Turn completed (completed)."), true);
+});
+
+test("daemon /resume sends thread history blocks through integrated command flow", async () => {
+  const baseDir = tempDir();
+  const app = new DaemonApp({ baseDir });
+  const runtime = new FakeRuntime({
+    loadedThreadIds: ["thread-history"],
+    threadReads: {
+      "thread-history": {
+        thread: {
+          id: "thread-history",
+          cwd: "/Users/czy/auto",
+          turns: [
+            {
+              items: [
+                { type: "userMessage", content: [{ type: "text", text: "hello from user" }] },
+                { type: "agentMessage", content: [{ type: "text", text: "hello from agent" }] },
+              ],
+            },
+          ],
+        },
+      },
+    },
+  });
+  const adapter = new StubDiscordAdapter();
+
+  app.runtime = runtime;
+  app.adapters.push(adapter);
+  app.store.upsertBinding({
+    channel: "discord",
+    chatId: "chat-1",
+    userId: "user-1",
+    threadId: "thread-1",
+    workingDir: "/Users/czy/auto",
+    policyProfile: {
+      approvalMode: "on-request",
+      allowlist: ["user-1"],
+      autoApprove: false,
+    },
+  });
+
+  try {
+    await app.start();
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/resume thread-history",
+    });
+    await sleep(450);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(adapter.messages.some((item) => item.text.includes("Resumed thread: thread-history")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Thread history (1 turns):")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("◇ hello from user")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("• hello from agent")), true);
 });

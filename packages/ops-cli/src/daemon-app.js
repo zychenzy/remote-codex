@@ -1,7 +1,9 @@
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { createHash } from "node:crypto";
 
 import { AppServerRuntime } from "../../core-runtime/src/index.js";
 import {
@@ -10,17 +12,13 @@ import {
 } from "../../im-gateway/src/index.js";
 import { StateStore } from "../../state-store/src/index.js";
 import { ApprovalBroker } from "./approval-broker.js";
-import { ChatHistoryStore } from "./chat-history-store.js";
-import { InboundCommandService } from "./inbound-command-service.js";
+import { commandManual } from "./help-manual.js";
 import { createLogger } from "./logger.js";
 import { handleModelAndSkillsCommand } from "./model-skills-handler.js";
 import { reconcileRuntimeState } from "./runtime-state-reconciler.js";
-import { ThreadHistoryPresenter } from "./thread-history-presenter.js";
-import { allAgentTextFromTurn } from "./turn-text-utils.js";
-import { TurnEventRouter } from "./turn-event-router.js";
-import { TurnOutputService } from "./turn-output-service.js";
+import { allAgentTextFromTurn, allUserTextFromTurn } from "./turn-text-utils.js";
 import { startTurnWithRecovery } from "./turn-recovery.js";
-import { detectThreadId, detectTurnId } from "./utils.js";
+import { detectDelta, detectThreadId, detectTurnId } from "./utils.js";
 
 function bindingKey(channel, chatId) {
   return `${channel}:${chatId}`;
@@ -297,6 +295,209 @@ function splitTextIntoChunks(text, maxLen = 1600) {
   return chunks;
 }
 
+function clipText(text, maxLen = 400) {
+  const input = String(text || "");
+  if (!maxLen || input.length <= maxLen) {
+    return input;
+  }
+  return `${input.slice(0, maxLen - 3)}...`;
+}
+
+function prefixFirstLineOnly(marker, text) {
+  const lines = String(text || "").split(/\r?\n/);
+  if (!lines.length) {
+    return "";
+  }
+  const [first, ...rest] = lines;
+  return [
+    `${marker} ${first}`,
+    ...rest.map((line) => `  ${line}`),
+  ].join("\n");
+}
+
+function turnOutputKey(threadId, turnId) {
+  const tid = String(turnId || "").trim();
+  if (tid) {
+    return `turn:${tid}`;
+  }
+  const thid = String(threadId || "").trim();
+  if (thid) {
+    return `thread:${thid}`;
+  }
+  return "";
+}
+
+function boundaryScan(text, { minChunkChars = 280, after = 0 } = {}) {
+  const input = String(text || "").replace(/\r/g, "");
+  if (!input) {
+    return {
+      hardBoundary: 0,
+      softBoundary: 0,
+      inFence: false,
+    };
+  }
+
+  let inFence = false;
+  let lineStart = 0;
+  let lastHardBoundary = 0;
+  let lastSafeNewline = 0;
+
+  for (let i = 0; i < input.length; i += 1) {
+    if (input[i] !== "\n") {
+      continue;
+    }
+    const line = input.slice(lineStart, i);
+    const trimmed = line.trim();
+    const isFenceLine = trimmed.startsWith("```");
+
+    if (isFenceLine) {
+      inFence = !inFence;
+      if (!inFence) {
+        lastHardBoundary = i + 1;
+      }
+    } else if (!inFence) {
+      lastSafeNewline = i + 1;
+      if (!trimmed) {
+        lastHardBoundary = i + 1;
+      }
+    }
+
+    lineStart = i + 1;
+  }
+
+  if (!inFence && input.length - lastHardBoundary >= minChunkChars && lastSafeNewline > lastHardBoundary) {
+    lastHardBoundary = lastSafeNewline;
+  }
+
+  let softBoundary = 0;
+  if (!inFence) {
+    const pendingChars = input.length - after;
+    if (pendingChars >= minChunkChars) {
+      if (lastSafeNewline > after) {
+        softBoundary = lastSafeNewline;
+      } else {
+        const target = Math.min(input.length, after + minChunkChars + 160);
+        let whitespace = input.lastIndexOf(" ", target);
+        if (whitespace <= after) {
+          whitespace = input.lastIndexOf("\t", target);
+        }
+        softBoundary = whitespace > after ? whitespace : Math.min(input.length, after + minChunkChars);
+      }
+    }
+  }
+
+  return {
+    hardBoundary: Math.min(Math.max(lastHardBoundary, 0), input.length),
+    softBoundary: Math.min(Math.max(softBoundary, 0), input.length),
+    inFence,
+  };
+}
+
+function normalizeTurnStatus(status) {
+  if (typeof status === "string" && status.trim()) {
+    return status;
+  }
+  if (status && typeof status === "object" && typeof status.type === "string" && status.type.trim()) {
+    return status.type;
+  }
+  return "completed";
+}
+
+function normalizeChangeKind(kind) {
+  return String(kind || "").trim().toLowerCase();
+}
+
+function isWholeFileChange(kind) {
+  const normalized = normalizeChangeKind(kind);
+  return ["added", "deleted", "removed"].includes(normalized);
+}
+
+function wholeFilePlaceholderDiff(kind, filePath) {
+  const normalized = normalizeChangeKind(kind);
+  const safePath = String(filePath || "").trim();
+  if (normalized === "added") {
+    const rhs = safePath ? `b/${safePath}` : "/dev/null";
+    return [
+      `+++ ${rhs}`,
+      "+ [full file content omitted]",
+    ].join("\n");
+  }
+  const lhs = safePath ? `a/${safePath}` : "/dev/null";
+  return [
+    `--- ${lhs}`,
+    "- [full file content omitted]",
+  ].join("\n");
+}
+
+function formatDiffBlock(header, diffText) {
+  return [
+    header,
+    "```diff",
+    String(diffText || "").trim(),
+    "```",
+  ].join("\n");
+}
+
+function fileChangeDiffText(item) {
+  const changes = Array.isArray(item?.changes) ? item.changes : [];
+  const blocks = [];
+  for (const change of changes) {
+    const kind = normalizeChangeKind(change?.kind);
+    const filePath = String(change?.path || "").trim();
+    const header = filePath
+      ? `Path: ${filePath}${kind ? ` (${kind})` : ""}`
+      : `Path: (unknown)${kind ? ` (${kind})` : ""}`;
+    if (isWholeFileChange(kind)) {
+      blocks.push(formatDiffBlock(header, wholeFilePlaceholderDiff(kind, filePath)));
+      continue;
+    }
+
+    const diff = String(change?.diff || "").trim();
+    if (!diff) {
+      continue;
+    }
+    blocks.push(formatDiffBlock(header, diff));
+  }
+  return blocks.join("\n\n");
+}
+
+function trimToLimit(text, maxLen = 120_000) {
+  const input = String(text || "");
+  if (!input) {
+    return "";
+  }
+  if (input.length <= maxLen) {
+    return input;
+  }
+  return input.slice(input.length - maxLen);
+}
+
+function cacheKeyFromIds(threadId, turnId) {
+  const turn = String(turnId || "").trim();
+  if (turn) {
+    return `turn:${turn}`;
+  }
+  const thread = String(threadId || "").trim();
+  if (thread) {
+    return `thread:${thread}`;
+  }
+  return "";
+}
+
+function hasWholeFileChanges(item) {
+  const changes = Array.isArray(item?.changes) ? item.changes : [];
+  return changes.some((change) => isWholeFileChange(change?.kind));
+}
+
+function isUnifiedDiffText(text) {
+  const input = String(text || "");
+  return /(^|\n)(diff --git |@@ |--- |\+\+\+ )/.test(input);
+}
+
+function shortHash(text) {
+  return createHash("sha1").update(String(text || ""), "utf8").digest("hex").slice(0, 16);
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -322,11 +523,9 @@ export class DaemonApp {
     };
 
     this.chatHistoryPath = path.join(this.store.logsDir, "chat-history.jsonl");
-    this.chatHistory = new ChatHistoryStore({
-      getFilePath: () => this.chatHistoryPath,
-      flushIntervalMs: this.outputPolicy.chatHistoryFlushIntervalMs,
-      logger: this.logger,
-    });
+    this.chatHistoryBuffer = [];
+    this.chatHistoryFlushTimer = null;
+    this.chatHistoryFlushChain = Promise.resolve();
 
     this.runtime = new AppServerRuntime({
       launchSpec: makeLaunchSpec(this.config),
@@ -341,87 +540,13 @@ export class DaemonApp {
     this.turnToBinding = new Map();
     this.activeTurnByBinding = new Map();
     this.suppressedTurnIds = new Set();
-    this.turnOutput = new TurnOutputService({
-      minChunkChars: this.outputPolicy.turnOutputMinChunkChars,
-      softChunkChars: this.outputPolicy.turnOutputSoftChunkChars,
-    });
+    this.turnTextByKey = new Map();
+    this.deliveredFileChangeItemIds = new Set();
+    this.fileChangeOutputByItemId = new Map();
+    this.latestTurnDiffByKey = new Map();
+    this.deliveredTurnDiffByKey = new Set();
     this.threadListStateByBinding = new Map();
     this.skillsCacheByCwd = new Map();
-
-    this.turnEventRouter = new TurnEventRouter({
-      threadToBinding: this.threadToBinding,
-      turnToBinding: this.turnToBinding,
-      activeTurnByBinding: this.activeTurnByBinding,
-      suppressedTurnIds: this.suppressedTurnIds,
-      turnOutput: this.turnOutput,
-      store: this.store,
-      outputPolicy: this.outputPolicy,
-      getAdapter: (channel) => this.#getAdapter(channel),
-      sendMessage: (adapter, context, text) => this.#sendMessage(adapter, context, text),
-      sendLongMessage: (adapter, context, text, options) => this.#sendLongMessage(adapter, context, text, options),
-      sendMessageRaw: (adapter, context, text) => this.#sendMessageRaw(adapter, context, text),
-      sendLongMessageRaw: (adapter, context, text, options) => this.#sendLongMessageRaw(adapter, context, text, options),
-      sendStreamingDelta: (adapter, context, delta) => this.#sendStreamingDelta(adapter, context, delta),
-      allAgentTextFromTurn,
-      onSkillsChanged: () => this.skillsCacheByCwd.clear(),
-    });
-
-    this.threadHistoryPresenter = new ThreadHistoryPresenter({
-      getRuntime: () => this.runtime,
-      logger: this.logger,
-      sendMessage: (adapter, context, text) => this.#sendMessage(adapter, context, text),
-      sendLongMessage: (adapter, context, text, options) => this.#sendLongMessage(adapter, context, text, options),
-    });
-
-    this.inboundCommands = new InboundCommandService({
-      parseIncomingCommand,
-      handleModelAndSkillsCommand,
-      getRuntime: () => this.runtime,
-      getStore: () => this.store,
-      getApprovalBroker: () => this.approvalBroker,
-      getOutputPolicy: () => this.outputPolicy,
-      threadToBinding: this.threadToBinding,
-      turnToBinding: this.turnToBinding,
-      activeTurnByBinding: this.activeTurnByBinding,
-      suppressedTurnIds: this.suppressedTurnIds,
-      getAdapter: (channel) => this.#getAdapter(channel),
-      ensureBinding: (context) => this.#ensureBinding(context),
-      appendChatHistory: (entry) => this.chatHistory.append(entry),
-      sendMessage: (adapter, context, text) => this.#sendMessage(adapter, context, text),
-      sendMessageRaw: (adapter, context, text) => this.#sendMessageRaw(adapter, context, text),
-      sendLongMessageRaw: (adapter, context, text, options) => this.#sendLongMessageRaw(adapter, context, text, options),
-      isAuthorized: (binding, context) => this.#isAuthorized(binding, context),
-      startTurnWithRecovery: (adapter, context, binding, bKey, prompt, overrides) => (
-        this.#startTurnWithRecovery(adapter, context, binding, bKey, prompt, overrides)
-      ),
-      startFreshThreadForBinding: (binding, bKey) => this.#startFreshThreadForBinding(binding, bKey),
-      sendThreadHistory: (adapter, context, threadId, options) => (
-        this.threadHistoryPresenter.send(adapter, context, threadId, options)
-      ),
-      setThreadListState: (bKey, state) => this.#setThreadListState(bKey, state),
-      getThreadListState: (bKey) => this.#getThreadListState(bKey),
-      resolveThreadCwd: (threadId) => this.#resolveThreadCwd(threadId),
-      loadSkillsForCwd: (cwd, options) => this.#loadSkillsForCwd(cwd, options),
-      touchSkillsContext: (binding, cwd, skills) => this.#touchSkillsContext(binding, cwd, skills),
-      resolveSkillByName: (binding, cwd, name, options) => this.#resolveSkillByName(binding, cwd, name, options),
-      clearSkillCache: (cwd) => this.skillsCacheByCwd.delete(cwd),
-      bindingKeyFn: bindingKey,
-      parseArgsAndOptions,
-      resolveWorkspacePath,
-      toBoolean,
-      toInt,
-      isThreadNotFoundError,
-      riskyThreadActionRequiresConfirm,
-      threadIdFromResponse,
-      turnIdFromResponse,
-      threadListFromResponse,
-      nextCursorFromResponse,
-      extractThreadId,
-      threadDisplayTitle,
-      extractThreadCwd,
-      modelListFromResponse,
-      collaborationModesFromResponse,
-    });
 
     this.running = false;
   }
@@ -451,7 +576,7 @@ export class DaemonApp {
       await adapter.stop();
     }
 
-    await this.chatHistory.flush({ force: true });
+    await this.#flushChatHistory({ force: true });
     await this.store.flush();
     await this.runtime.stop();
     this.store.appendAudit({ type: "daemon_stopped", pid: process.pid });
@@ -549,13 +674,15 @@ export class DaemonApp {
         allowedChannels: channels.discord.allowedChannels || [],
         logger: this.logger,
       });
-      discord.registerInboundHandler((context) => {
-        this.#handleInboundSafe(context).catch((error) => this.logger.error("discord inbound failed", error));
-      });
       this.adapters.push(discord);
     }
 
     for (const adapter of this.adapters) {
+      if (typeof adapter.registerInboundHandler === "function") {
+        adapter.registerInboundHandler((context) => {
+          this.#handleInboundSafe(context).catch((error) => this.logger.error(`${adapter.channel} inbound failed`, error));
+        });
+      }
       await adapter.start();
     }
   }
@@ -616,12 +743,71 @@ export class DaemonApp {
   #resetEphemeralTurnState() {
     this.turnToBinding.clear();
     this.activeTurnByBinding.clear();
-    this.turnOutput.reset();
+    this.turnTextByKey.clear();
     this.suppressedTurnIds.clear();
   }
 
+  #appendChatHistory(entry) {
+    const line = JSON.stringify({
+      timestamp: new Date().toISOString(),
+      ...entry,
+    });
+    this.chatHistoryBuffer.push(line);
+    this.#scheduleChatHistoryFlush();
+  }
+
+  #scheduleChatHistoryFlush() {
+    if (this.chatHistoryFlushTimer) {
+      return;
+    }
+    this.chatHistoryFlushTimer = setTimeout(() => {
+      this.chatHistoryFlushTimer = null;
+      this.#flushChatHistory().catch((error) => {
+        this.logger?.warn?.(`failed to flush chat history: ${error.message}`);
+      });
+    }, this.outputPolicy.chatHistoryFlushIntervalMs);
+  }
+
+  async #flushChatHistory({ force = false } = {}) {
+    if (this.chatHistoryFlushTimer && force) {
+      clearTimeout(this.chatHistoryFlushTimer);
+      this.chatHistoryFlushTimer = null;
+    }
+    if (!this.chatHistoryBuffer.length) {
+      if (force) {
+        await this.chatHistoryFlushChain.catch(() => {});
+      }
+      return;
+    }
+
+    const batch = this.chatHistoryBuffer.splice(0, this.chatHistoryBuffer.length);
+    const payload = `${batch.join("\n")}\n`;
+    const filePath = String(this.chatHistoryPath || "");
+    const writeTask = this.chatHistoryFlushChain
+      .catch(() => {})
+      .then(() => fsp.appendFile(filePath, payload, { encoding: "utf8" }));
+    this.chatHistoryFlushChain = writeTask.catch(() => {});
+
+    try {
+      await writeTask;
+    } catch (error) {
+      if (force) {
+        try {
+          fs.appendFileSync(filePath, payload, { encoding: "utf8" });
+          return;
+        } catch (syncError) {
+          this.logger?.warn?.(`failed to force-flush chat history: ${syncError.message}`);
+        }
+      } else {
+        this.logger?.warn?.(`failed to append chat history: ${error.message}`);
+      }
+      this.chatHistoryBuffer = [...batch, ...this.chatHistoryBuffer];
+      this.#scheduleChatHistoryFlush();
+    }
+  }
+
   async #sendMessage(adapter, context, text) {
-    this.chatHistory.append({
+    this.#appendChatHistory({
       direction: "outbound",
       type: "message",
       channel: context.channel,
@@ -666,7 +852,7 @@ export class DaemonApp {
   }
 
   async #sendStreamingDelta(adapter, context, delta) {
-    this.chatHistory.append({
+    this.#appendChatHistory({
       direction: "outbound",
       type: "stream_delta",
       channel: context.channel,
@@ -679,7 +865,7 @@ export class DaemonApp {
   }
 
   async #sendApprovalPrompt(adapter, context, payload) {
-    this.chatHistory.append({
+    this.#appendChatHistory({
       direction: "outbound",
       type: "approval_prompt",
       channel: context.channel,
@@ -739,6 +925,70 @@ export class DaemonApp {
 
   #getThreadListState(bKey) {
     return this.threadListStateByBinding.get(bKey) || null;
+  }
+
+  async #renderThreadHistoryMessages(threadId, { turns = null, textLimit = null } = {}) {
+    try {
+      const read = await this.runtime.readThread({ threadId, includeTurns: true });
+      const allTurns = Array.isArray(read?.thread?.turns) ? read.thread.turns : [];
+      const selectedTurns = Number.isFinite(Number(turns))
+        ? allTurns.slice(-Math.max(0, Number(turns)))
+        : allTurns;
+      if (!selectedTurns.length) {
+        return [];
+      }
+
+      const messages = [];
+      if (selectedTurns.length < allTurns.length) {
+        messages.push(`Thread history (${selectedTurns.length}/${allTurns.length} turns shown):`);
+      } else {
+        messages.push(`Thread history (${allTurns.length} turns):`);
+      }
+
+      for (const turn of selectedTurns) {
+        const lines = [];
+        const userRaw = String(allUserTextFromTurn(turn) || "").trim();
+        const agentRaw = String(allAgentTextFromTurn(turn) || "").trim();
+        const userText = textLimit ? clipText(userRaw, textLimit) : userRaw;
+        const agentText = textLimit ? clipText(agentRaw, textLimit) : agentRaw;
+        if (userText) {
+          lines.push(prefixFirstLineOnly("◇", userText));
+        }
+        if (agentText) {
+          lines.push(prefixFirstLineOnly("•", agentText));
+        }
+        if (!userText && !agentText) {
+          lines.push("(no visible text content)");
+        }
+        messages.push(lines.join("\n"));
+      }
+
+      return messages.filter(Boolean);
+    } catch (error) {
+      this.logger.debug(`failed to load thread history for ${threadId}: ${error.message}`);
+      return [];
+    }
+  }
+
+  async #sendThreadHistory(adapter, context, threadId, options = {}) {
+    const messages = await this.#renderThreadHistoryMessages(threadId, options);
+    if (!messages.length) {
+      return;
+    }
+    for (let index = 0; index < messages.length; index += 1) {
+      const historyBlock = String(messages[index] || "");
+      if (historyBlock.length <= 1850) {
+        await this.#sendMessage(adapter, context, historyBlock);
+      } else {
+        await this.#sendLongMessage(adapter, context, historyBlock, {
+          maxLen: 1850,
+          delayMs: adapter.channel === "discord" ? 300 : 0,
+        });
+      }
+      if (adapter.channel === "discord" && index < messages.length - 1) {
+        await sleep(220);
+      }
+    }
   }
 
   async #loadSkillsForCwd(cwd, { forceReload = false } = {}) {
@@ -883,6 +1133,471 @@ export class DaemonApp {
     });
   }
 
+  #turnTextKeys(threadId, turnId) {
+    const candidates = [turnOutputKey(threadId, turnId)];
+    const turnOnly = turnOutputKey("", turnId);
+    const threadOnly = turnOutputKey(threadId, "");
+    if (turnOnly && !candidates.includes(turnOnly)) {
+      candidates.push(turnOnly);
+    }
+    if (threadOnly && !candidates.includes(threadOnly)) {
+      candidates.push(threadOnly);
+    }
+    return candidates.filter(Boolean);
+  }
+
+  #getOrCreateTurnTextState(threadId, turnId, bindingKeyValue) {
+    const keys = this.#turnTextKeys(threadId, turnId);
+    if (!keys.length) {
+      return null;
+    }
+
+    for (const key of keys) {
+      const existing = this.turnTextByKey.get(key);
+      if (!existing) {
+        continue;
+      }
+      existing.bindingKey = bindingKeyValue || existing.bindingKey;
+      existing.threadId = String(threadId || existing.threadId || "");
+      existing.turnId = String(turnId || existing.turnId || "");
+      if (key !== keys[0]) {
+        this.turnTextByKey.delete(key);
+        this.turnTextByKey.set(keys[0], existing);
+      }
+      return existing;
+    }
+
+    const created = {
+      bindingKey: bindingKeyValue,
+      threadId: String(threadId || ""),
+      turnId: String(turnId || ""),
+      assistantText: "",
+      publishedUntil: 0,
+      deliveredUntil: 0,
+    };
+    this.turnTextByKey.set(keys[0], created);
+    return created;
+  }
+
+  #takeTurnTextState(threadId, turnId) {
+    const keys = this.#turnTextKeys(threadId, turnId);
+    for (const key of keys) {
+      const existing = this.turnTextByKey.get(key);
+      if (!existing) {
+        continue;
+      }
+      this.turnTextByKey.delete(key);
+      return existing;
+    }
+    return null;
+  }
+
+  #turnOutputAppendDelta(threadId, turnId, bindingKeyValue, delta) {
+    const state = this.#getOrCreateTurnTextState(threadId, turnId, bindingKeyValue);
+    if (!state || !delta) {
+      return { sectionText: "" };
+    }
+
+    state.assistantText += String(delta || "");
+    const scanned = boundaryScan(state.assistantText, {
+      minChunkChars: this.outputPolicy.turnOutputMinChunkChars,
+      after: state.deliveredUntil,
+    });
+    let nextBoundary = Math.max(scanned.hardBoundary, state.publishedUntil);
+
+    if (nextBoundary <= state.deliveredUntil) {
+      const softScan = boundaryScan(state.assistantText, {
+        minChunkChars: this.outputPolicy.turnOutputSoftChunkChars,
+        after: state.deliveredUntil,
+      });
+      if (!softScan.inFence && softScan.softBoundary > state.deliveredUntil) {
+        nextBoundary = softScan.softBoundary;
+      }
+    }
+
+    if (nextBoundary <= state.deliveredUntil) {
+      return { sectionText: "" };
+    }
+
+    const sectionText = state.assistantText
+      .slice(state.deliveredUntil, nextBoundary)
+      .trimEnd();
+
+    state.publishedUntil = nextBoundary;
+    if (sectionText) {
+      state.deliveredUntil = nextBoundary;
+    }
+
+    return { sectionText };
+  }
+
+  #turnOutputTakeFinal(threadId, turnId) {
+    const state = this.#takeTurnTextState(threadId, turnId);
+    const fullText = String(state?.assistantText || "");
+    const pendingText = String(fullText.slice(state?.deliveredUntil || 0) || "").trimEnd();
+    return { fullText, pendingText };
+  }
+
+  #turnOutputClearByBinding(bindingKeyValue) {
+    if (!bindingKeyValue) {
+      return;
+    }
+    for (const [key, value] of this.turnTextByKey.entries()) {
+      if (value?.bindingKey === bindingKeyValue) {
+        this.turnTextByKey.delete(key);
+      }
+    }
+  }
+
+  #markDeliveryOnce(key) {
+    const dedupeKey = String(key || "").trim();
+    if (!dedupeKey) {
+      return true;
+    }
+    const mark = this.store?.markDeliveryOnce;
+    if (typeof mark !== "function") {
+      return true;
+    }
+    try {
+      return Boolean(mark.call(this.store, dedupeKey));
+    } catch {
+      return true;
+    }
+  }
+
+  async #handleAgentDelta(params) {
+    const threadId = detectThreadId(params);
+    const turnId = detectTurnId(params);
+    const delta = detectDelta(params);
+    if (!delta) {
+      return;
+    }
+
+    let bKey = null;
+    if (turnId) {
+      if (this.suppressedTurnIds.has(String(turnId))) {
+        return;
+      }
+      bKey = this.turnToBinding.get(turnId);
+    } else {
+      bKey = this.threadToBinding.get(threadId);
+    }
+    if (!bKey) {
+      return;
+    }
+
+    const [channel, chatId] = bKey.split(":");
+    const adapter = this.#getAdapter(channel);
+    if (!adapter) {
+      return;
+    }
+
+    const sectionUpdate = this.#turnOutputAppendDelta(threadId, turnId, bKey, delta);
+    if (adapter.channel === "discord") {
+      if (sectionUpdate.sectionText) {
+        await this.#sendLongMessage(
+          adapter,
+          { channel, chatId, threadId, turnId },
+          sectionUpdate.sectionText,
+          {
+            maxLen: this.outputPolicy.liveSectionMaxLen,
+            delayMs: this.outputPolicy.liveSectionDelayMs,
+          }
+        );
+      }
+    } else {
+      await this.#sendStreamingDelta(adapter, { channel, chatId, threadId, turnId }, delta);
+    }
+  }
+
+  #handleTurnStarted(params) {
+    const threadId = detectThreadId(params);
+    const turnId = detectTurnId(params);
+    const bKey = this.threadToBinding.get(threadId);
+    if (bKey && turnId) {
+      this.turnToBinding.set(turnId, bKey);
+      this.activeTurnByBinding.set(bKey, turnId);
+    }
+  }
+
+  #handleFileChangeOutputDelta(params) {
+    const itemId = String(params?.itemId || params?.item?.id || "").trim();
+    if (!itemId) {
+      return;
+    }
+    const delta = detectDelta(params) || params?.outputDelta || "";
+    if (!delta) {
+      return;
+    }
+    const existing = String(this.fileChangeOutputByItemId.get(itemId) || "");
+    this.fileChangeOutputByItemId.set(itemId, trimToLimit(`${existing}${String(delta)}`));
+    if (this.fileChangeOutputByItemId.size > 2000) {
+      const oldest = this.fileChangeOutputByItemId.keys().next().value;
+      if (oldest) {
+        this.fileChangeOutputByItemId.delete(oldest);
+      }
+    }
+  }
+
+  #handleTurnDiffUpdated(params) {
+    const threadId = detectThreadId(params);
+    const turnId = detectTurnId(params);
+    const key = cacheKeyFromIds(threadId, turnId);
+    if (!key) {
+      return;
+    }
+    const diff = String(params?.diff || detectDelta(params) || "").trim();
+    if (!diff) {
+      return;
+    }
+    this.latestTurnDiffByKey.set(key, trimToLimit(diff));
+    if (this.latestTurnDiffByKey.size > 2000) {
+      const oldest = this.latestTurnDiffByKey.keys().next().value;
+      if (oldest) {
+        this.latestTurnDiffByKey.delete(oldest);
+      }
+    }
+  }
+
+  #handleThreadClosed(params) {
+    const threadId = detectThreadId(params) || params?.threadId;
+    if (threadId) {
+      const bKey = this.threadToBinding.get(threadId);
+      this.threadToBinding.delete(threadId);
+      if (bKey) {
+        for (const [turnId, key] of this.turnToBinding.entries()) {
+          if (key === bKey) {
+            this.turnToBinding.delete(turnId);
+          }
+        }
+        this.activeTurnByBinding.delete(bKey);
+        this.#turnOutputClearByBinding(bKey);
+      }
+    }
+    this.store.appendAudit({ type: "thread_closed", threadId: threadId || null });
+  }
+
+  #handleThreadArchived(params) {
+    const threadId = detectThreadId(params) || params?.threadId;
+    if (threadId) {
+      const bKey = this.threadToBinding.get(threadId);
+      this.threadToBinding.delete(threadId);
+      if (bKey) {
+        this.#turnOutputClearByBinding(bKey);
+        const [channel, chatId] = bKey.split(":");
+        const binding = this.store.getBinding(channel, chatId);
+        if (binding?.threadId === threadId) {
+          this.store.upsertBinding({
+            ...binding,
+            threadId: null,
+          });
+        }
+      }
+    }
+    this.store.appendAudit({ type: "thread_archived", threadId: threadId || null });
+  }
+
+  async #handleItemCompleted(params) {
+    const item = params?.item || {};
+    if (item?.type !== "fileChange") {
+      return;
+    }
+
+    const itemId = String(item?.id || params?.itemId || "").trim();
+    if (itemId && this.deliveredFileChangeItemIds.has(itemId)) {
+      return;
+    }
+
+    const threadId = detectThreadId(params);
+    const turnId = detectTurnId(params);
+    if (turnId && this.suppressedTurnIds.has(String(turnId))) {
+      return;
+    }
+
+    const bKey = turnId ? this.turnToBinding.get(turnId) : this.threadToBinding.get(threadId);
+    if (!bKey) {
+      return;
+    }
+    const [channel, chatId] = bKey.split(":");
+    const adapter = this.#getAdapter(channel);
+    if (!adapter) {
+      return;
+    }
+
+    const cacheKey = cacheKeyFromIds(threadId, turnId);
+    const turnDiffText = cacheKey ? String(this.latestTurnDiffByKey.get(cacheKey) || "").trim() : "";
+    const toolOutputText = itemId ? String(this.fileChangeOutputByItemId.get(itemId) || "").trim() : "";
+    if (itemId) {
+      this.fileChangeOutputByItemId.delete(itemId);
+    }
+
+    const perItemDiff = fileChangeDiffText(item);
+    const preferPerItem = hasWholeFileChanges(item);
+    let diffText = "";
+    if (preferPerItem && perItemDiff) {
+      diffText = perItemDiff;
+    } else if (turnDiffText && !this.deliveredTurnDiffByKey.has(cacheKey) && isUnifiedDiffText(turnDiffText)) {
+      diffText = formatDiffBlock("Turn diff (aggregated)", turnDiffText);
+      this.deliveredTurnDiffByKey.add(cacheKey);
+      if (this.deliveredTurnDiffByKey.size > 2000) {
+        const oldest = this.deliveredTurnDiffByKey.values().next().value;
+        if (oldest) {
+          this.deliveredTurnDiffByKey.delete(oldest);
+        }
+      }
+    } else if (perItemDiff) {
+      diffText = perItemDiff;
+    } else if (toolOutputText && isUnifiedDiffText(toolOutputText)) {
+      diffText = formatDiffBlock("Patch diff", toolOutputText);
+    }
+    if (!diffText) {
+      return;
+    }
+
+    if (itemId) {
+      this.deliveredFileChangeItemIds.add(itemId);
+      if (this.deliveredFileChangeItemIds.size > 2000) {
+        const oldest = this.deliveredFileChangeItemIds.values().next().value;
+        if (oldest) {
+          this.deliveredFileChangeItemIds.delete(oldest);
+        }
+      }
+    }
+
+    const deliveryKey = itemId
+      ? `file-change:item:${itemId}`
+      : `file-change:${cacheKey || "unknown"}:${shortHash(diffText)}`;
+    if (!this.#markDeliveryOnce(deliveryKey)) {
+      return;
+    }
+
+    await this.#sendLongMessageRaw(
+      adapter,
+      { channel, chatId, threadId, turnId },
+      diffText,
+      {
+        maxLen: this.outputPolicy.liveSectionMaxLen,
+        delayMs: this.outputPolicy.liveSectionDelayMs,
+      }
+    );
+  }
+
+  async #handleTurnCompleted(params) {
+    const threadId = detectThreadId(params);
+    const turnId = detectTurnId(params);
+    const cacheKey = cacheKeyFromIds(threadId, turnId);
+    if (cacheKey) {
+      this.latestTurnDiffByKey.delete(cacheKey);
+      this.deliveredTurnDiffByKey.delete(cacheKey);
+    }
+    const suppressed = Boolean(turnId && this.suppressedTurnIds.has(String(turnId)));
+    const bKey = turnId ? this.turnToBinding.get(turnId) : this.threadToBinding.get(threadId);
+    const finalFromStream = this.#turnOutputTakeFinal(threadId, turnId);
+    if (!bKey) {
+      if (turnId) {
+        this.suppressedTurnIds.delete(String(turnId));
+      }
+      return;
+    }
+
+    const [channel, chatId] = bKey.split(":");
+    const adapter = this.#getAdapter(channel);
+    const status = normalizeTurnStatus(params?.turn?.status);
+    if (adapter && !suppressed) {
+      const fullAssistant = String(
+        finalFromStream.fullText || allAgentTextFromTurn(params?.turn || {})
+      ).trim();
+      const pendingAssistant = String(
+        finalFromStream.pendingText || ""
+      ).trim();
+      if (pendingAssistant) {
+        const deliveryKey = `turn-final:${cacheKey || "unknown"}:${shortHash(pendingAssistant)}`;
+        if (this.#markDeliveryOnce(deliveryKey)) {
+          await this.#sendLongMessage(
+            adapter,
+            { channel, chatId, threadId, turnId },
+            pendingAssistant,
+            {
+              maxLen: this.outputPolicy.liveSectionMaxLen,
+              delayMs: this.outputPolicy.liveSectionDelayMs,
+            }
+          );
+        }
+      } else if (!fullAssistant) {
+        const completionText = `Turn completed (${status}).`;
+        const completionKey = `turn-completed:${cacheKey || "unknown"}:${status}`;
+        if (this.#markDeliveryOnce(completionKey)) {
+          await this.#sendMessage(adapter, { channel, chatId, turnId }, completionText);
+        }
+      }
+    } else if (adapter && suppressed && adapter.channel === "discord") {
+      const partial = String(finalFromStream.pendingText || "").trim();
+      if (partial) {
+        const partialKey = `turn-suppressed-partial:${cacheKey || "unknown"}:${shortHash(partial)}`;
+        if (this.#markDeliveryOnce(partialKey)) {
+          await this.#sendLongMessage(adapter, { channel, chatId, threadId, turnId }, partial, {
+            maxLen: this.outputPolicy.liveSectionMaxLen,
+            delayMs: this.outputPolicy.liveSectionDelayMs,
+          });
+        }
+      }
+    }
+    if (turnId) {
+      this.suppressedTurnIds.delete(String(turnId));
+    }
+    this.turnToBinding.delete(turnId);
+    this.activeTurnByBinding.delete(bKey);
+  }
+
+  async #handleRuntimeError(params) {
+    const threadId = detectThreadId(params);
+    const turnId = detectTurnId(params);
+    const cacheKey = cacheKeyFromIds(threadId, turnId);
+    const suppressed = Boolean(turnId && this.suppressedTurnIds.has(String(turnId)));
+    const bKey = turnId ? this.turnToBinding.get(turnId) : this.threadToBinding.get(threadId);
+    const finalFromStream = this.#turnOutputTakeFinal(threadId, turnId);
+    if (!bKey) {
+      if (turnId) {
+        this.suppressedTurnIds.delete(String(turnId));
+      }
+      return;
+    }
+
+    const [channel, chatId] = bKey.split(":");
+    const adapter = this.#getAdapter(channel);
+    if (!adapter) {
+      if (turnId) {
+        this.suppressedTurnIds.delete(String(turnId));
+      }
+      return;
+    }
+
+    const errorMessage = `Runtime error: ${params?.error?.message || "unknown"}`;
+    const partial = String(
+      finalFromStream.pendingText || allAgentTextFromTurn(params?.turn || {})
+    ).trim();
+    if (partial) {
+      const partialKey = `turn-error-partial:${cacheKey || "unknown"}:${shortHash(partial)}`;
+      if (this.#markDeliveryOnce(partialKey)) {
+        await this.#sendLongMessage(adapter, { channel, chatId, threadId, turnId }, partial, {
+          maxLen: this.outputPolicy.liveSectionMaxLen,
+          delayMs: this.outputPolicy.liveSectionDelayMs,
+        });
+      }
+    }
+    if (!suppressed) {
+      const errorKey = `turn-error:${cacheKey || "unknown"}:${shortHash(errorMessage)}`;
+      if (this.#markDeliveryOnce(errorKey)) {
+        await this.#sendMessage(adapter, { channel, chatId, turnId }, errorMessage);
+      }
+    }
+    if (turnId) {
+      this.suppressedTurnIds.delete(String(turnId));
+      this.turnToBinding.delete(turnId);
+    }
+    this.activeTurnByBinding.delete(bKey);
+  }
+
   async #handleInboundSafe(context) {
     try {
       await this.#handleInbound(context);
@@ -896,11 +1611,660 @@ export class DaemonApp {
   }
 
   async #handleInbound(context) {
-    await this.inboundCommands.handle(context);
+    const adapter = this.#getAdapter(context.channel);
+    if (!adapter) {
+      return;
+    }
+
+    const binding = this.#ensureBinding(context);
+    const command = parseIncomingCommand(context.text);
+    const bKey = bindingKey(binding.channel, binding.chatId);
+
+    this.#appendChatHistory({
+      direction: "inbound",
+      type: "message",
+      channel: context.channel,
+      chatId: String(context.chatId),
+      userId: context.userId ? String(context.userId) : null,
+      userName: context.userName || "",
+      text: String(context.text || ""),
+      commandType: command.type,
+    });
+
+    if (command.type === "empty") {
+      return;
+    }
+
+    if (command.type === "status") {
+      const pending = this.approvalBroker.listPending().length;
+      const active = this.activeTurnByBinding.get(bKey);
+      await this.#sendMessage(adapter, context, [
+        `Binding: ${bKey}`,
+        `Thread: ${binding.threadId || "none"}`,
+        `Workspace: ${binding.workingDir}`,
+        `Model: ${binding.policyProfile?.model || "runtime default"}`,
+        `Effort: ${binding.policyProfile?.reasoningEffort || "runtime default"}`,
+        `Mode: ${binding.policyProfile?.collaborationMode || "runtime default"}`,
+        `Active turn: ${active || "none"}`,
+        `Pending approvals: ${pending}`,
+      ].join("\n"));
+      return;
+    }
+
+    if (command.type === "help") {
+      await this.#sendMessage(adapter, context, commandManual(command.topic));
+      return;
+    }
+
+    if (!this.#isAuthorized(binding, context)) {
+      await this.#sendMessage(
+        adapter,
+        context,
+        "Unauthorized. Your user ID is not in the binding/channel allowlist."
+      );
+      return;
+    }
+
+    const runInterrupt = async () => {
+      const turnId = this.activeTurnByBinding.get(bKey);
+      if (!binding.threadId || !turnId) {
+        await this.#sendMessage(adapter, context, "No active turn to interrupt.");
+        return true;
+      }
+      await this.runtime.interruptTurn({ threadId: binding.threadId, turnId });
+      this.suppressedTurnIds.add(String(turnId));
+      this.activeTurnByBinding.delete(bKey);
+      await this.#sendMessage(adapter, context, `Interrupt requested for turn ${turnId}.`);
+      return true;
+    };
+
+    const runResume = async (threadId) => {
+      if (!threadId) {
+        await this.#sendMessage(adapter, context, "Usage: /resume <threadId>");
+        return true;
+      }
+      let resumeResponse = null;
+      try {
+        resumeResponse = await this.runtime.resumeThread(threadId);
+      } catch (error) {
+        if (isThreadNotFoundError(error)) {
+          await this.#sendMessage(adapter, context, `Thread not found: ${threadId}. Use /new to start a fresh thread.`);
+          return true;
+        }
+        throw error;
+      }
+
+      this.threadToBinding.set(threadId, bKey);
+      let resumedCwd = extractThreadCwd(resumeResponse);
+      if (!resumedCwd) {
+        resumedCwd = await this.#resolveThreadCwd(threadId);
+      }
+      const updated = this.store.upsertBinding({
+        ...binding,
+        threadId,
+        ...(resumedCwd ? { workingDir: resumedCwd } : {}),
+      });
+      if (resumedCwd) {
+        await this.#sendMessage(adapter, context, `Resumed thread: ${threadId}\nWorkspace set to: ${resumedCwd}`);
+      } else {
+        await this.#sendMessage(adapter, context, `Resumed thread: ${threadId}`);
+      }
+      await this.#sendThreadHistory(adapter, context, threadId, {
+        turns: this.outputPolicy.resumeHistoryTurns,
+      });
+      Object.assign(binding, updated);
+      return true;
+    };
+
+    const runAsk = async (prompt, overrides = {}) => {
+      if (!prompt) {
+        await this.#sendMessage(adapter, context, "Usage: /ask <prompt>");
+        return true;
+      }
+      const started = await this.#startTurnWithRecovery(adapter, context, binding, bKey, prompt, overrides);
+      if (!started) {
+        return true;
+      }
+      const { threadId, turnResponse } = started;
+      const turnId = turnIdFromResponse(turnResponse);
+      if (turnId) {
+        this.turnToBinding.set(turnId, bKey);
+        this.activeTurnByBinding.set(bKey, turnId);
+      }
+      if (adapter.channel !== "discord") {
+        await this.#sendMessage(adapter, context, `Turn started: ${turnId || "unknown"}`);
+      }
+      this.store.appendAudit({
+        type: "turn_started",
+        channel: context.channel,
+        chatId: context.chatId,
+        threadId,
+        turnId,
+      });
+      return true;
+    };
+
+    if (command.type === "new") {
+      const threadId = await this.#startFreshThreadForBinding(binding, bKey);
+      await this.#sendMessage(adapter, context, `Started thread: ${threadId || "unknown"}`);
+      return;
+    }
+
+    if (command.type === "resume") {
+      await runResume(command.threadId);
+      return;
+    }
+
+    if (command.type === "interrupt") {
+      await runInterrupt();
+      return;
+    }
+
+    if (command.type === "turn") {
+      const action = command.action || "";
+      const { positional, options } = parseArgsAndOptions(command.args);
+      if (action === "ask") {
+        let turnCwd = binding.workingDir;
+        if (options.cwd) {
+          const resolved = resolveWorkspacePath(options.cwd, binding.workingDir);
+          if (resolved.error) {
+            await this.#sendMessage(adapter, context, resolved.error);
+            return;
+          }
+          turnCwd = resolved.value;
+        }
+        await runAsk(positional.join(" ").trim(), {
+          model: options.model || null,
+          effort: options.effort || null,
+          collaborationMode: options.mode || null,
+          cwd: turnCwd,
+        });
+        return;
+      }
+      if (action === "steer") {
+        const activeTurnId = this.activeTurnByBinding.get(bKey);
+        if (!binding.threadId || !activeTurnId) {
+          await this.#sendMessage(adapter, context, "No active turn to steer.");
+          return;
+        }
+        const prompt = positional.join(" ").trim();
+        if (!prompt) {
+          await this.#sendMessage(adapter, context, "Usage: /turn steer <prompt>");
+          return;
+        }
+        await this.runtime.steerTurn({
+          threadId: binding.threadId,
+          expectedTurnId: activeTurnId,
+          input: [{ type: "text", text: prompt }],
+        });
+        await this.#sendMessage(adapter, context, `Steer accepted for turn ${activeTurnId}.`);
+        return;
+      }
+      if (action === "interrupt") {
+        await runInterrupt();
+        return;
+      }
+      if (action === "review") {
+        if (!binding.threadId) {
+          await this.#sendMessage(adapter, context, "No active thread. Start one with /new first.");
+          return;
+        }
+        const delivery = options.delivery || (toBoolean(options.detached, false) ? "detached" : "inline");
+        const targetKey = String(options.target || positional[0] || "uncommitted").toLowerCase();
+        let target = { type: "uncommittedChanges" };
+        if (["base", "basebranch"].includes(targetKey)) {
+          const branch = options.branch || positional[1];
+          if (!branch) {
+            await this.#sendMessage(adapter, context, "Usage: /turn review base <branch> [--delivery inline|detached]");
+            return;
+          }
+          target = { type: "baseBranch", branch };
+        } else if (targetKey === "commit") {
+          const sha = options.sha || positional[1];
+          if (!sha) {
+            await this.#sendMessage(adapter, context, "Usage: /turn review commit <sha> [title words]");
+            return;
+          }
+          const title = options.title || positional.slice(2).join(" ").trim() || null;
+          target = { type: "commit", sha, title };
+        } else if (targetKey === "custom") {
+          const instructions = (options.instructions || positional.slice(1).join(" ")).trim();
+          if (!instructions) {
+            await this.#sendMessage(adapter, context, "Usage: /turn review custom <instructions...>");
+            return;
+          }
+          target = { type: "custom", instructions };
+        }
+
+        const review = await this.runtime.startReview({
+          threadId: binding.threadId,
+          delivery,
+          target,
+        });
+        const reviewTurnId = turnIdFromResponse(review);
+        const reviewThreadId = review?.reviewThreadId || binding.threadId;
+        this.threadToBinding.set(reviewThreadId, bKey);
+        if (delivery === "detached" && reviewThreadId && reviewThreadId !== binding.threadId) {
+          const updated = this.store.upsertBinding({
+            ...binding,
+            threadId: reviewThreadId,
+          });
+          Object.assign(binding, updated);
+        }
+        if (reviewTurnId) {
+          this.turnToBinding.set(reviewTurnId, bKey);
+          this.activeTurnByBinding.set(bKey, reviewTurnId);
+        }
+        await this.#sendMessage(
+          adapter,
+          context,
+          `Review started (${delivery}) on thread ${reviewThreadId}${reviewTurnId ? `, turn ${reviewTurnId}` : ""}.`
+        );
+        return;
+      }
+      await this.#sendMessage(adapter, context, "Usage: /turn <ask|steer|interrupt|review>");
+      return;
+    }
+
+    if (command.type === "thread") {
+      const action = command.action || "";
+      const { positional, options } = parseArgsAndOptions(command.args);
+
+      if (action === "start") {
+        const cwdResolved = options.cwd ? resolveWorkspacePath(options.cwd, binding.workingDir) : { value: binding.workingDir };
+        if (cwdResolved.error) {
+          await this.#sendMessage(adapter, context, cwdResolved.error);
+          return;
+        }
+        const response = await this.runtime.startThread({
+          cwd: cwdResolved.value,
+          approvalPolicy: binding.policyProfile.approvalMode,
+          model: options.model || binding.policyProfile.model || null,
+        });
+        const threadId = threadIdFromResponse(response);
+        if (threadId) {
+          this.threadToBinding.set(threadId, bKey);
+          const updated = this.store.upsertBinding({
+            ...binding,
+            threadId,
+            workingDir: cwdResolved.value,
+          });
+          Object.assign(binding, updated);
+        }
+        await this.#sendMessage(adapter, context, `Started thread: ${threadId || "unknown"}`);
+        return;
+      }
+
+      if (action === "resume") {
+        await runResume(positional[0]);
+        return;
+      }
+
+      if (action === "list" || action === "more") {
+        const requestedLimitRaw = positional.find((item) => /^\d+$/.test(item));
+        let requestedLimit = toInt(requestedLimitRaw, 10, 1, 100);
+        const useAll = action === "list" && (positional.some((item) => item.toLowerCase() === "all") || toBoolean(options.all, false));
+        let archived = toBoolean(options.archived, false);
+
+        let cursor = null;
+        let cwdFilter = null;
+        if (action === "more") {
+          const state = this.#getThreadListState(bKey);
+          if (!state?.nextCursor) {
+            await this.#sendMessage(adapter, context, "No next page available. Run /thread list first.");
+            return;
+          }
+          cursor = state.nextCursor;
+          cwdFilter = state.cwdFilter;
+          archived = Boolean(state.archived);
+          if (!requestedLimitRaw && Number.isFinite(Number(state.limit))) {
+            requestedLimit = toInt(state.limit, 10, 1, 100);
+          }
+        } else {
+          cwdFilter = useAll ? null : (options.cwd || binding.workingDir);
+          cursor = options.cursor || null;
+        }
+
+        const response = await this.runtime.listThreads({
+          cursor,
+          limit: requestedLimit,
+          archived,
+          cwd: cwdFilter,
+        });
+        const threads = threadListFromResponse(response);
+        const nextCursor = nextCursorFromResponse(response);
+        this.#setThreadListState(bKey, {
+          nextCursor,
+          cwdFilter,
+          archived,
+          limit: requestedLimit,
+        });
+
+        if (!threads.length) {
+          const suffix = cwdFilter ? ` for workspace: ${cwdFilter}` : "";
+          await this.#sendMessage(adapter, context, `No threads found${suffix}.`);
+          return;
+        }
+
+        const entries = threads.map((thread, index) => {
+          const id = extractThreadId(thread) || "unknown";
+          const marker = binding.threadId && id === binding.threadId ? " (current)" : "";
+          const title = threadDisplayTitle(thread);
+          const cwd = extractThreadCwd(thread) || "unknown";
+          return `${index + 1}. ${title}\t\t${cwd}\t\t${id}${marker}`;
+        });
+        await this.#sendMessage(
+          adapter,
+          context,
+          [
+            "Threads:",
+            entries.join("\n"),
+            "",
+            nextCursor ? "Use /thread more for next page." : "No more pages.",
+            "Use /resume <threadId> to switch.",
+          ].join("\n")
+        );
+        return;
+      }
+
+      if (action === "read") {
+        const threadId = positional[0] || binding.threadId;
+        if (!threadId) {
+          await this.#sendMessage(adapter, context, "Usage: /thread read <threadId> [--turns true]");
+          return;
+        }
+        const includeTurns = toBoolean(options.turns, false);
+        const read = await this.runtime.readThread({ threadId, includeTurns });
+        const thread = read?.thread || {};
+        await this.#sendMessage(
+          adapter,
+          context,
+          [
+            `Thread: ${thread.id || threadId}`,
+            `Title: ${thread.name || threadDisplayTitle(thread)}`,
+            `Workspace: ${thread.cwd || "unknown"}`,
+            `Status: ${thread?.status?.type || "unknown"}`,
+            includeTurns ? `Turns: ${(thread.turns || []).length}` : "Turns: hidden (use --turns true)",
+          ].join("\n")
+        );
+        return;
+      }
+
+      if (action === "fork") {
+        const sourceThreadId = positional[0] || binding.threadId;
+        if (!sourceThreadId) {
+          await this.#sendMessage(adapter, context, "Usage: /thread fork <threadId> [--ephemeral true]");
+          return;
+        }
+        const forked = await this.runtime.forkThread({
+          threadId: sourceThreadId,
+          ephemeral: toBoolean(options.ephemeral, false),
+        });
+        const newThreadId = threadIdFromResponse(forked);
+        if (newThreadId) {
+          this.threadToBinding.set(newThreadId, bKey);
+        }
+        await this.#sendMessage(adapter, context, `Forked thread: ${newThreadId || "unknown"}`);
+        return;
+      }
+
+      if (action === "loaded") {
+        const loaded = await this.runtime.listLoadedThreads();
+        const ids = Array.isArray(loaded?.data)
+          ? loaded.data
+          : (Array.isArray(loaded?.threadIds) ? loaded.threadIds : []);
+        await this.#sendMessage(
+          adapter,
+          context,
+          ids.length ? `Loaded threads:\n${ids.join("\n")}` : "No loaded threads."
+        );
+        return;
+      }
+
+      if (action === "unsubscribe") {
+        const threadId = positional[0] || binding.threadId;
+        if (!threadId) {
+          await this.#sendMessage(adapter, context, "Usage: /thread unsubscribe <threadId>");
+          return;
+        }
+        const result = await this.runtime.unsubscribeThread(threadId);
+        await this.#sendMessage(adapter, context, `Unsubscribe status: ${result?.status || "ok"} (${threadId})`);
+        return;
+      }
+
+      if (["archive", "unarchive", "compact", "rollback"].includes(action)) {
+        const threadId = positional[0] || binding.threadId;
+        if (!threadId) {
+          await this.#sendMessage(adapter, context, `Usage: /thread ${action} <threadId> --confirm`);
+          return;
+        }
+        if (riskyThreadActionRequiresConfirm(binding.policyProfile.approvalMode) && !toBoolean(options.confirm, false)) {
+          await this.#sendMessage(
+            adapter,
+            context,
+            `Confirmation required by approval mode. Re-run with --confirm.\nExample: /thread ${action} ${threadId} --confirm`
+          );
+          return;
+        }
+
+        if (action === "archive") {
+          await this.runtime.archiveThread(threadId);
+          if (binding.threadId === threadId) {
+            const updated = this.store.upsertBinding({ ...binding, threadId: null });
+            Object.assign(binding, updated);
+          }
+          this.threadToBinding.delete(threadId);
+          await this.#sendMessage(adapter, context, `Archived thread: ${threadId}`);
+          return;
+        }
+        if (action === "unarchive") {
+          await this.runtime.unarchiveThread(threadId);
+          await this.#sendMessage(adapter, context, `Unarchived thread: ${threadId}`);
+          return;
+        }
+        if (action === "compact") {
+          await this.runtime.compactThread(threadId);
+          await this.#sendMessage(adapter, context, `Compaction started for thread: ${threadId}`);
+          return;
+        }
+        if (action === "rollback") {
+          const numTurns = toInt(options.turns || positional[1], 1, 1, 100);
+          await this.runtime.rollbackThread({ threadId, numTurns });
+          await this.#sendMessage(adapter, context, `Rolled back ${numTurns} turn(s) on thread: ${threadId}`);
+          return;
+        }
+      }
+
+      await this.#sendMessage(
+        adapter,
+        context,
+        "Usage: /thread <start|resume|list|more|read|fork|loaded|unsubscribe|archive|unarchive|compact|rollback>"
+      );
+      return;
+    }
+
+    if (command.type === "threads") {
+      const listCmd = {
+        type: "thread",
+        action: "list",
+        args: [
+          ...(command.all ? ["all"] : []),
+          String(command.limit || 10),
+        ],
+      };
+      await this.#handleInbound({
+        ...context,
+        text: `/thread list ${listCmd.args.join(" ")}`,
+      });
+      return;
+    }
+
+    if (command.type === "archive") {
+      const threadId = String(command.threadId || binding.threadId || "").trim();
+      if (!threadId) {
+        await this.#sendMessage(adapter, context, "No thread selected. Use /archive <threadId> or /resume <threadId> first.");
+        return;
+      }
+      await this.#handleInbound({
+        ...context,
+        text: `/thread archive ${threadId}`,
+      });
+      return;
+    }
+
+    const modelOrSkillsHandled = await handleModelAndSkillsCommand({
+      command,
+      adapter,
+      context,
+      binding,
+      runtime: this.runtime,
+      store: this.store,
+      sendMessage: (targetAdapter, targetContext, message) => this.#sendMessage(targetAdapter, targetContext, message),
+      parseArgsAndOptions,
+      resolveWorkspacePath,
+      toBoolean,
+      toInt,
+      modelListFromResponse,
+      collaborationModesFromResponse,
+      loadSkillsForCwd: (cwd, options) => this.#loadSkillsForCwd(cwd, options),
+      touchSkillsContext: (targetBinding, cwd, skills) => this.#touchSkillsContext(targetBinding, cwd, skills),
+      resolveSkillByName: (targetBinding, cwd, name, options) => this.#resolveSkillByName(targetBinding, cwd, name, options),
+      runAsk,
+      clearSkillCache: (cwd) => this.skillsCacheByCwd.delete(cwd),
+    });
+    if (modelOrSkillsHandled) {
+      return;
+    }
+
+    if (command.type === "approve") {
+      if (!command.requestId || !["allow", "deny"].includes(command.decision)) {
+        await this.#sendMessage(adapter, context, "Usage: /approve <requestId> <allow|deny> [payload]");
+        return;
+      }
+
+      const resolution = this.approvalBroker.resolve(command.requestId, {
+        decision: command.decision,
+        payload: command.payload,
+        actor: context.userId,
+      });
+
+      if (!resolution) {
+        await this.#sendMessage(adapter, context, `Unknown or expired approval request: ${command.requestId}`);
+      }
+      return;
+    }
+
+    if (command.type === "cwd") {
+      const resolved = resolveWorkspacePath(command.path, binding.workingDir);
+      if (resolved.error) {
+        await this.#sendMessage(adapter, context, resolved.error);
+        return;
+      }
+
+      const updated = this.store.upsertBinding({
+        ...binding,
+        workingDir: resolved.value,
+      });
+      await this.#sendMessage(
+        adapter,
+        context,
+        `Workspace set to: ${updated.workingDir}`
+      );
+      return;
+    }
+
+    if (command.type === "ask") {
+      await runAsk(command.prompt);
+      return;
+    }
+
+    await this.#sendMessage(
+      adapter,
+      context,
+      "Unknown command. Use /help to see all commands and examples."
+    );
   }
 
   async #handleRuntimeNotification(notification) {
-    await this.turnEventRouter.handle(notification);
+    const { method, params } = notification || {};
+    if (!method) {
+      return;
+    }
+
+    if (method === "item/agentMessage/delta") {
+      await this.#handleAgentDelta(params);
+      return;
+    }
+
+    if (method === "turn/started") {
+      this.#handleTurnStarted(params);
+      return;
+    }
+
+    if (method === "item/completed") {
+      await this.#handleItemCompleted(params);
+      return;
+    }
+
+    if (method === "item/fileChange/outputDelta") {
+      this.#handleFileChangeOutputDelta(params);
+      return;
+    }
+
+    if (method === "turn/diff/updated") {
+      this.#handleTurnDiffUpdated(params);
+      return;
+    }
+
+    if (method === "turn/completed") {
+      await this.#handleTurnCompleted(params);
+      return;
+    }
+
+    if (method === "thread/started") {
+      const threadId = detectThreadId(params);
+      if (!threadId) {
+        return;
+      }
+      this.store.appendAudit({ type: "thread_started", threadId });
+      return;
+    }
+
+    if (method === "thread/status/changed") {
+      const threadId = detectThreadId(params) || params?.threadId;
+      this.store.appendAudit({
+        type: "thread_status_changed",
+        threadId: threadId || null,
+        status: params?.status?.type || "unknown",
+      });
+      return;
+    }
+
+    if (method === "thread/closed") {
+      this.#handleThreadClosed(params);
+      return;
+    }
+
+    if (method === "thread/archived") {
+      this.#handleThreadArchived(params);
+      return;
+    }
+
+    if (method === "thread/unarchived") {
+      const threadId = detectThreadId(params) || params?.threadId;
+      this.store.appendAudit({ type: "thread_unarchived", threadId: threadId || null });
+      return;
+    }
+
+    if (method === "skills/changed") {
+      this.skillsCacheByCwd.clear();
+      this.store.appendAudit({ type: "skills_changed" });
+      return;
+    }
+
+    if (method === "error") {
+      await this.#handleRuntimeError(params);
+    }
   }
 
   async #handleServerRequest(serverRequest) {
