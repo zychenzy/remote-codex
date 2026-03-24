@@ -86,6 +86,7 @@ export function parseIncomingCommand(text = "") {
     const first = parts[1] || "";
     const firstLower = first.toLowerCase();
     const firstLooksLikePayload = first.includes("=") || first.includes(";") || first.startsWith("{");
+    const firstLooksLikeUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(first);
 
     if (!first) {
       return { type: "answer", decision: "allow", requestId: "", payload: "" };
@@ -114,6 +115,15 @@ export function parseIncomingCommand(text = "") {
         decision: "allow",
         requestId: "",
         payload: first,
+      };
+    }
+
+    if (!firstLooksLikeUuid) {
+      return {
+        type: "answer",
+        decision: "allow",
+        requestId: "",
+        payload: parts.slice(1).join(" ").trim(),
       };
     }
 

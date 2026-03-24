@@ -43,6 +43,7 @@ export function commandManual(topic = "") {
       "/approve auto on",
       "/plan on",
       "/answer req-123 mode=fast",
+      "/answer rec",
       "/help approve",
     ].join("\n");
   }
@@ -174,6 +175,7 @@ export function commandManual(topic = "") {
       "/answer [requestId] <questionId>=<answer>[;<questionId>=<answer>]",
       "Resolves pending tool user-input prompts from runtime (plan-style follow-up questions).",
       "If requestId is omitted, the latest pending tool prompt for this chat is used.",
+      "Quick shortcuts: /answer rec (pick recommended options), /answer 1 1 1 (option numbers by Q order).",
       "Examples: /answer req-abc q1=on;q2=safe, /answer q1=on, /answer deny req-abc",
     ].join("\n");
   }

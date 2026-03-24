@@ -86,6 +86,72 @@ function requestUserInputQuestions(params = {}) {
   return [];
 }
 
+function questionKey(question, index) {
+  return String(question?.id || "").trim() || `q${index + 1}`;
+}
+
+function sanitizeAnswerValue(value) {
+  return String(value || "").replace(/[;\n\r]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function normalizeToolAnswerPayload(rawPayload, questions = []) {
+  const payload = String(rawPayload || "").trim();
+  if (!payload) {
+    return { payload: "", error: "" };
+  }
+
+  const normalized = payload.toLowerCase();
+  if (["rec", "recommended", "default"].includes(normalized)) {
+    const pairs = [];
+    for (let i = 0; i < questions.length; i += 1) {
+      const first = sanitizeAnswerValue(questions[i]?.options?.[0] || "");
+      if (!first) {
+        continue;
+      }
+      pairs.push(`${questionKey(questions[i], i)}=${first}`);
+    }
+    if (!pairs.length) {
+      return { payload: "", error: "No selectable options found for this prompt." };
+    }
+    return { payload: pairs.join(";"), error: "" };
+  }
+
+  if (!payload.includes("=") && questions.length) {
+    const tokens = payload.split(/[\s,]+/).filter(Boolean);
+    const numeric = tokens.length > 0 && tokens.every((token) => /^\d+$/.test(token));
+    if (numeric) {
+      if (tokens.length > questions.length) {
+        return {
+          payload: "",
+          error: `Too many selections: got ${tokens.length}, but only ${questions.length} question(s) are available.`,
+        };
+      }
+      const pairs = [];
+      for (let i = 0; i < tokens.length; i += 1) {
+        const question = questions[i];
+        if (!question) {
+          break;
+        }
+        const optionIndex = Number(tokens[i]) - 1;
+        const selected = sanitizeAnswerValue(question.options?.[optionIndex] || "");
+        if (!selected) {
+          return {
+            payload: "",
+            error: `Invalid option index for Q${i + 1}: ${tokens[i]}.`,
+          };
+        }
+        pairs.push(`${questionKey(question, i)}=${selected}`);
+      }
+      if (!pairs.length) {
+        return { payload: "", error: "No valid selections provided." };
+      }
+      return { payload: pairs.join(";"), error: "" };
+    }
+  }
+
+  return { payload, error: "" };
+}
+
 function makeLaunchSpec(config) {
   if (config?.runtime?.appServer?.command) {
     return {
@@ -2370,15 +2436,16 @@ export class DaemonApp {
         return;
       }
 
-      const payload = String(command.payload || "").trim();
-      if (!payload) {
-        const questions = requestUserInputQuestions(pending.params);
+      const questions = requestUserInputQuestions(pending.params);
+      const payloadInput = String(command.payload || "").trim();
+      if (!payloadInput) {
         const sample = questions[0]?.id ? `${questions[0].id}=<answer>` : "questionId=<answer>";
         await this.#sendMessage(
           adapter,
           context,
           [
             "Usage: /answer [requestId] <questionId>=<answer>[;<questionId>=<answer>]",
+            "Quick options: /answer [requestId] rec  OR  /answer [requestId] 1 1 1",
             `Example: /answer ${pending.localRequestId} ${sample}`,
             `Or deny: /answer deny ${pending.localRequestId}`,
           ].join("\n")
@@ -2386,9 +2453,22 @@ export class DaemonApp {
         return;
       }
 
+      const normalizedPayload = normalizeToolAnswerPayload(payloadInput, questions);
+      if (normalizedPayload.error) {
+        await this.#sendMessage(
+          adapter,
+          context,
+          [
+            `Answer parse error: ${normalizedPayload.error}`,
+            "Try: /answer rec  OR  /answer 1 1 1  OR  /answer <requestId> <questionId>=<answer>",
+          ].join("\n")
+        );
+        return;
+      }
+
       const resolved = this.approvalBroker.resolve(pending.localRequestId, {
         decision: "allow",
-        payload,
+        payload: normalizedPayload.payload,
         actor: context.userId,
       });
       if (!resolved) {

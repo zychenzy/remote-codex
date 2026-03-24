@@ -43,10 +43,10 @@ test("parser handles plan command", () => {
 });
 
 test("parser handles answer command with explicit request id", () => {
-  const result = parseIncomingCommand("/answer req-1 q1=on;q2=off");
+  const result = parseIncomingCommand("/answer 917222ab-9d14-41fa-9afd-d692702d8824 q1=on;q2=off");
   assert.equal(result.type, "answer");
   assert.equal(result.decision, "allow");
-  assert.equal(result.requestId, "req-1");
+  assert.equal(result.requestId, "917222ab-9d14-41fa-9afd-d692702d8824");
   assert.equal(result.payload, "q1=on;q2=off");
 });
 
@@ -59,10 +59,26 @@ test("parser handles answer command without request id", () => {
 });
 
 test("parser handles answer deny shorthand", () => {
-  const result = parseIncomingCommand("/answer deny req-1");
+  const result = parseIncomingCommand("/answer deny 917222ab-9d14-41fa-9afd-d692702d8824");
   assert.equal(result.type, "answer");
   assert.equal(result.decision, "deny");
-  assert.equal(result.requestId, "req-1");
+  assert.equal(result.requestId, "917222ab-9d14-41fa-9afd-d692702d8824");
+});
+
+test("parser handles answer recommended shorthand without request id", () => {
+  const result = parseIncomingCommand("/answer rec");
+  assert.equal(result.type, "answer");
+  assert.equal(result.decision, "allow");
+  assert.equal(result.requestId, "");
+  assert.equal(result.payload, "rec");
+});
+
+test("parser handles answer numeric shorthand without request id", () => {
+  const result = parseIncomingCommand("/answer 1 2 1");
+  assert.equal(result.type, "answer");
+  assert.equal(result.decision, "allow");
+  assert.equal(result.requestId, "");
+  assert.equal(result.payload, "1 2 1");
 });
 
 test("parser handles cwd command", () => {

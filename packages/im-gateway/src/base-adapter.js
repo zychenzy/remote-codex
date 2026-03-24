@@ -94,20 +94,23 @@ export class BaseAdapter extends EventEmitter {
 
       if (questions.length) {
         lines.push("questions:");
-        for (const question of questions) {
+        for (let index = 0; index < questions.length; index += 1) {
+          const question = questions[index];
           const title = question.question || "(question)";
-          const key = question.id ? `[${question.id}] ` : "";
-          lines.push(`${key}${title}`);
+          const key = question.id ? ` [${question.id}]` : "";
+          lines.push(`Q${index + 1}${key} ${title}`);
           const labels = question.options
             .map((option) => optionLabel(option))
             .filter(Boolean);
           if (labels.length) {
-            lines.push(`options: ${labels.join(" | ")}`);
+            lines.push(`options: ${labels.map((label, optIndex) => `${optIndex + 1}.${label}`).join(" | ")}`);
           }
         }
       }
 
       lines.push(
+        `quick: /answer ${approvalRequest.localRequestId} rec`,
+        `quick: /answer ${approvalRequest.localRequestId} 1 1 1  (Q1..Qn option numbers)`,
         `reply: /answer ${approvalRequest.localRequestId} <questionId>=<answer>[;<questionId>=<answer>]`,
         `or:    /answer deny ${approvalRequest.localRequestId}`
       );

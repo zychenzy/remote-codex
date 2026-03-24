@@ -958,3 +958,67 @@ test("daemon /answer supports explicit request id and deny", async () => {
   assert.deepEqual(denyResponse?.result, { answers: {} });
   assert.deepEqual(allowResponse?.result, { answers: { mode: { answers: ["safe"] } } });
 });
+
+test("daemon /answer supports recommended and numeric shorthand", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+  try {
+    runtime.emit("serverRequest", {
+      id: "srv-tool-rec",
+      method: "item/tool/requestUserInput",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-tool-rec",
+        questions: [
+          { id: "delivery_path", question: "Delivery path?", options: [{ label: "dm" }, { label: "chat" }] },
+          { id: "chapter_unit", question: "Chapter unit?", options: [{ label: "chapter" }, { label: "section" }] },
+        ],
+      },
+    });
+    await sleep(60);
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/answer rec",
+    });
+    await sleep(80);
+
+    runtime.emit("serverRequest", {
+      id: "srv-tool-num",
+      method: "item/tool/requestUserInput",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-tool-num",
+        questions: [
+          { id: "delivery_path", question: "Delivery path?", options: [{ label: "dm" }, { label: "chat" }] },
+          { id: "chapter_unit", question: "Chapter unit?", options: [{ label: "chapter" }, { label: "section" }] },
+        ],
+      },
+    });
+    await sleep(60);
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/answer 2 1",
+    });
+    await sleep(80);
+  } finally {
+    await app.stop();
+  }
+
+  const recResponse = runtime.serverResponses.find((item) => item.requestId === "srv-tool-rec");
+  const numResponse = runtime.serverResponses.find((item) => item.requestId === "srv-tool-num");
+  assert.deepEqual(recResponse?.result, {
+    answers: {
+      delivery_path: { answers: ["dm"] },
+      chapter_unit: { answers: ["chapter"] },
+    },
+  });
+  assert.deepEqual(numResponse?.result, {
+    answers: {
+      delivery_path: { answers: ["chat"] },
+      chapter_unit: { answers: ["chapter"] },
+    },
+  });
+});

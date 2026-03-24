@@ -55,8 +55,9 @@ test("sendApprovalPrompt emits tool question instructions with /answer", async (
 
   assert.equal(adapter.messages.length, 1);
   assert.equal(adapter.messages[0].text.includes("User input required"), true);
-  assert.equal(adapter.messages[0].text.includes("[mode] Which mode?"), true);
-  assert.equal(adapter.messages[0].text.includes("options: fast | safe"), true);
+  assert.equal(adapter.messages[0].text.includes("Q1 [mode] Which mode?"), true);
+  assert.equal(adapter.messages[0].text.includes("options: 1.fast | 2.safe"), true);
+  assert.equal(adapter.messages[0].text.includes("quick: /answer req-tool rec"), true);
   assert.equal(adapter.messages[0].text.includes("/answer req-tool"), true);
 });
 
