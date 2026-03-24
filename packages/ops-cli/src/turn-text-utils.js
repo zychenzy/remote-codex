@@ -38,7 +38,7 @@ export function allAgentTextFromTurn(turn) {
   const items = Array.isArray(turn?.items) ? turn.items : [];
   const texts = [];
   for (const item of items) {
-    if (item?.type === "agentMessage") {
+    if (item?.type === "agentMessage" || item?.type === "plan") {
       if (typeof item.text === "string" && item.text.trim()) {
         texts.push(item.text.trim());
         continue;

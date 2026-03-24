@@ -10,6 +10,7 @@ test("turn text utils collect text from content and fallback text fields", () =>
       { type: "userMessage", text: "user fallback" },
       { type: "agentMessage", content: [{ type: "text", text: "agent content" }] },
       { type: "agentMessage", text: "agent fallback" },
+      { type: "plan", text: "plan content" },
     ],
   };
 
@@ -20,4 +21,5 @@ test("turn text utils collect text from content and fallback text fields", () =>
   assert.equal(user.includes("user fallback"), true);
   assert.equal(agent.includes("agent content"), true);
   assert.equal(agent.includes("agent fallback"), true);
+  assert.equal(agent.includes("plan content"), true);
 });

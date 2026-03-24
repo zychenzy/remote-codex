@@ -585,6 +585,28 @@ function fileChangeDiffText(item) {
   return blocks.join("\n\n");
 }
 
+function planItemText(item) {
+  if (!item || typeof item !== "object") {
+    return "";
+  }
+  if (typeof item.text === "string" && item.text.trim()) {
+    return item.text.trim();
+  }
+  const content = Array.isArray(item.content) ? item.content : [];
+  const parts = content
+    .map((part) => {
+      if (typeof part === "string") {
+        return part;
+      }
+      if (part?.type === "text") {
+        return part.text || "";
+      }
+      return "";
+    })
+    .filter(Boolean);
+  return parts.join("\n").trim();
+}
+
 function trimToLimit(text, maxLen = 120_000) {
   const input = String(text || "");
   if (!input) {
@@ -1628,6 +1650,44 @@ export class DaemonApp {
 
   async #handleItemCompleted(params) {
     const item = params?.item || {};
+    if (item?.type === "plan") {
+      const threadId = detectThreadId(params);
+      const turnId = detectTurnId(params);
+      if (turnId && this.suppressedTurnIds.has(String(turnId))) {
+        return;
+      }
+      const bKey = turnId ? this.turnToBinding.get(turnId) : this.threadToBinding.get(threadId);
+      if (!bKey) {
+        return;
+      }
+      const [channel, chatId] = bKey.split(":");
+      const adapter = this.#getAdapter(channel);
+      if (!adapter) {
+        return;
+      }
+      const text = planItemText(item);
+      if (!text) {
+        return;
+      }
+      const itemId = String(item?.id || params?.itemId || "").trim();
+      const deliveryKey = itemId
+        ? `plan:item:${itemId}`
+        : `plan:${cacheKeyFromIds(threadId, turnId) || "unknown"}:${shortHash(text)}`;
+      if (!this.#markDeliveryOnce(deliveryKey)) {
+        return;
+      }
+      await this.#sendLongMessage(
+        adapter,
+        { channel, chatId, threadId, turnId },
+        text,
+        {
+          maxLen: this.outputPolicy.liveSectionMaxLen,
+          delayMs: this.outputPolicy.liveSectionDelayMs,
+        }
+      );
+      return;
+    }
+
     if (item?.type !== "fileChange") {
       return;
     }
@@ -1733,9 +1793,9 @@ export class DaemonApp {
     const adapter = this.#getAdapter(channel);
     const status = normalizeTurnStatus(params?.turn?.status);
     if (adapter && !suppressed) {
-      const streamedAssistant = String(finalFromStream.fullText || "").trim();
-      const fallbackAssistant = String(allAgentTextFromTurn(params?.turn || {})).trim();
-      const fullAssistant = streamedAssistant || fallbackAssistant;
+      const fullAssistant = String(
+        finalFromStream.fullText || allAgentTextFromTurn(params?.turn || {})
+      ).trim();
       const pendingAssistant = String(
         finalFromStream.pendingText || ""
       ).trim();
@@ -1746,19 +1806,6 @@ export class DaemonApp {
             adapter,
             { channel, chatId, threadId, turnId },
             pendingAssistant,
-            {
-              maxLen: this.outputPolicy.liveSectionMaxLen,
-              delayMs: this.outputPolicy.liveSectionDelayMs,
-            }
-          );
-        }
-      } else if (!streamedAssistant && fallbackAssistant) {
-        const fallbackKey = `turn-final-fallback:${cacheKey || "unknown"}:${shortHash(fallbackAssistant)}`;
-        if (this.#markDeliveryOnce(fallbackKey)) {
-          await this.#sendLongMessage(
-            adapter,
-            { channel, chatId, threadId, turnId },
-            fallbackAssistant,
             {
               maxLen: this.outputPolicy.liveSectionMaxLen,
               delayMs: this.outputPolicy.liveSectionDelayMs,

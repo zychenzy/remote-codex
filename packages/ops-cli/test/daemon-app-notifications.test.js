@@ -551,27 +551,23 @@ test("daemon requeues chat history after flush failure and persists after path r
   assert.equal(text.includes("Turn completed (completed)."), true);
 });
 
-test("daemon sends assistant text from turn/completed when no delta was streamed", async () => {
+test("daemon delivers completed plan item text", async () => {
   const { app, runtime, adapter } = await setupDaemonHarness();
   try {
     runtime.emit("notification", {
       method: "turn/started",
-      params: { threadId: "thread-1", turnId: "turn-fallback-1" },
+      params: { threadId: "thread-1", turnId: "turn-plan-1" },
     });
     await sleep(20);
     runtime.emit("notification", {
-      method: "turn/completed",
+      method: "item/completed",
       params: {
         threadId: "thread-1",
-        turnId: "turn-fallback-1",
-        turn: {
-          status: { type: "completed" },
-          items: [
-            {
-              type: "agentMessage",
-              content: [{ type: "text", text: "Final plan output should be delivered." }],
-            },
-          ],
+        turnId: "turn-plan-1",
+        item: {
+          id: "plan-item-1",
+          type: "plan",
+          text: "# Final plan\n- step 1\n- step 2",
         },
       },
     });
@@ -580,8 +576,8 @@ test("daemon sends assistant text from turn/completed when no delta was streamed
     await app.stop();
   }
 
-  assert.equal(adapter.messages.some((item) => item.text.includes("Final plan output should be delivered.")), true);
-  assert.equal(adapter.messages.some((item) => item.text.includes("Turn completed (completed).")), false);
+  assert.equal(adapter.messages.some((item) => item.text.includes("# Final plan")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("- step 1")), true);
 });
 
 test("daemon /resume sends thread history blocks through integrated command flow", async () => {
@@ -640,6 +636,61 @@ test("daemon /resume sends thread history blocks through integrated command flow
   assert.equal(adapter.messages.some((item) => item.text.includes("Thread history (1 turns):")), true);
   assert.equal(adapter.messages.some((item) => item.text.includes("◇ hello from user")), true);
   assert.equal(adapter.messages.some((item) => item.text.includes("• hello from agent")), true);
+});
+
+test("daemon /resume includes plan item text in thread history", async () => {
+  const baseDir = tempDir();
+  const app = new DaemonApp({ baseDir });
+  const runtime = new FakeRuntime({
+    loadedThreadIds: ["thread-plan-history"],
+    threadReads: {
+      "thread-plan-history": {
+        thread: {
+          id: "thread-plan-history",
+          cwd: "/Users/czy/auto",
+          turns: [
+            {
+              items: [
+                { type: "plan", text: "# Plan from thread history\n- one\n- two" },
+              ],
+            },
+          ],
+        },
+      },
+    },
+  });
+  const adapter = new StubDiscordAdapter();
+
+  app.runtime = runtime;
+  app.adapters.push(adapter);
+  app.store.upsertBinding({
+    channel: "discord",
+    chatId: "chat-1",
+    userId: "user-1",
+    threadId: "thread-1",
+    workingDir: "/Users/czy/auto",
+    policyProfile: {
+      approvalMode: "on-request",
+      allowlist: ["user-1"],
+      autoApprove: false,
+    },
+  });
+
+  try {
+    await app.start();
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/resume thread-plan-history",
+    });
+    await sleep(450);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(adapter.messages.some((item) => item.text.includes("Resumed thread: thread-plan-history")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("# Plan from thread history")), true);
 });
 
 test("daemon supports /cwd absolute, ~, and /workspace alias with resolved errors", async () => {
