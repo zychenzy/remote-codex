@@ -8,8 +8,33 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function formatDiscordContent(text) {
+function stabilizeDiscordMarkdown(text) {
   const raw = String(text || "");
+  if (!raw) {
+    return "";
+  }
+
+  const lines = raw.split("\n");
+  const out = [];
+  let inFence = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("```")) {
+      inFence = !inFence;
+      out.push(line);
+      continue;
+    }
+    if (inFence) {
+      out.push(line);
+      continue;
+    }
+    out.push(line.replace(/^(\s*)(\d+)\.(\s+)/, "$1$2\\.$3"));
+  }
+  return out.join("\n");
+}
+
+function formatDiscordContent(text) {
+  const raw = stabilizeDiscordMarkdown(text);
   if (!raw) {
     return "";
   }

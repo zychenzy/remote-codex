@@ -198,3 +198,51 @@ test("discord adapter skips empty outbound content", async () => {
   const postCalls = calls.filter((call) => call.method === "POST" && call.url.includes("/channels/123/messages"));
   assert.equal(postCalls.length, 0);
 });
+
+test("discord adapter escapes ordered-list markers outside code fences", async () => {
+  const originalFetch = global.fetch;
+  const calls = [];
+
+  global.fetch = async (url, options = {}) => {
+    const method = String(options.method || "GET");
+    let body = null;
+    if (typeof options.body === "string" && options.body) {
+      body = JSON.parse(options.body);
+    }
+    calls.push({ url: String(url), method, body });
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ id: "msg-3" }),
+      text: async () => "",
+    };
+  };
+
+  const adapter = new DiscordAdapter({
+    token: "token",
+    allowedChannels: ["123"],
+    minSendIntervalMs: 0,
+    logger: { warn() {}, error() {}, info() {}, debug() {} },
+  });
+  const text = [
+    "1. Delivery",
+    "2. Echo chat-only",
+    "```md",
+    "1. keep inside fence",
+    "```",
+  ].join("\n");
+
+  try {
+    await adapter.sendMessage({ channel: "discord", chatId: "123" }, text);
+    await adapter.stop();
+  } finally {
+    global.fetch = originalFetch;
+  }
+
+  const postCalls = calls.filter((call) => call.method === "POST" && call.url.includes("/channels/123/messages"));
+  assert.equal(postCalls.length, 1);
+  const content = String(postCalls[0].body?.content || "");
+  assert.equal(content.includes("1\\. Delivery"), true);
+  assert.equal(content.includes("2\\. Echo chat-only"), true);
+  assert.equal(content.includes("1. keep inside fence"), true);
+});
