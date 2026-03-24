@@ -1733,9 +1733,9 @@ export class DaemonApp {
     const adapter = this.#getAdapter(channel);
     const status = normalizeTurnStatus(params?.turn?.status);
     if (adapter && !suppressed) {
-      const fullAssistant = String(
-        finalFromStream.fullText || allAgentTextFromTurn(params?.turn || {})
-      ).trim();
+      const streamedAssistant = String(finalFromStream.fullText || "").trim();
+      const fallbackAssistant = String(allAgentTextFromTurn(params?.turn || {})).trim();
+      const fullAssistant = streamedAssistant || fallbackAssistant;
       const pendingAssistant = String(
         finalFromStream.pendingText || ""
       ).trim();
@@ -1746,6 +1746,19 @@ export class DaemonApp {
             adapter,
             { channel, chatId, threadId, turnId },
             pendingAssistant,
+            {
+              maxLen: this.outputPolicy.liveSectionMaxLen,
+              delayMs: this.outputPolicy.liveSectionDelayMs,
+            }
+          );
+        }
+      } else if (!streamedAssistant && fallbackAssistant) {
+        const fallbackKey = `turn-final-fallback:${cacheKey || "unknown"}:${shortHash(fallbackAssistant)}`;
+        if (this.#markDeliveryOnce(fallbackKey)) {
+          await this.#sendLongMessage(
+            adapter,
+            { channel, chatId, threadId, turnId },
+            fallbackAssistant,
             {
               maxLen: this.outputPolicy.liveSectionMaxLen,
               delayMs: this.outputPolicy.liveSectionDelayMs,

@@ -551,6 +551,39 @@ test("daemon requeues chat history after flush failure and persists after path r
   assert.equal(text.includes("Turn completed (completed)."), true);
 });
 
+test("daemon sends assistant text from turn/completed when no delta was streamed", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+  try {
+    runtime.emit("notification", {
+      method: "turn/started",
+      params: { threadId: "thread-1", turnId: "turn-fallback-1" },
+    });
+    await sleep(20);
+    runtime.emit("notification", {
+      method: "turn/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-fallback-1",
+        turn: {
+          status: { type: "completed" },
+          items: [
+            {
+              type: "agentMessage",
+              content: [{ type: "text", text: "Final plan output should be delivered." }],
+            },
+          ],
+        },
+      },
+    });
+    await sleep(40);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(adapter.messages.some((item) => item.text.includes("Final plan output should be delivered.")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Turn completed (completed).")), false);
+});
+
 test("daemon /resume sends thread history blocks through integrated command flow", async () => {
   const baseDir = tempDir();
   const app = new DaemonApp({ baseDir });
