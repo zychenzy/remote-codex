@@ -29,6 +29,34 @@ function pickDefined(value) {
   );
 }
 
+function normalizeCollaborationMode(collaborationMode, { model = null, effort = null } = {}) {
+  if (!collaborationMode) {
+    return null;
+  }
+  if (typeof collaborationMode === "object") {
+    return collaborationMode;
+  }
+  const mode = String(collaborationMode || "").trim();
+  if (!mode) {
+    return null;
+  }
+  const settings = {
+    developer_instructions: null,
+  };
+  const normalizedModel = String(model || "").trim();
+  const normalizedEffort = String(effort || "").trim();
+  if (normalizedModel) {
+    settings.model = normalizedModel;
+  }
+  if (normalizedEffort) {
+    settings.reasoning_effort = normalizedEffort;
+  }
+  return {
+    mode,
+    settings,
+  };
+}
+
 export class AppServerRuntime {
   constructor({
     launchSpec,
@@ -122,6 +150,7 @@ export class AppServerRuntime {
     summary = null,
   } = {}) {
     await this.initialize();
+    const normalizedCollaborationMode = normalizeCollaborationMode(collaborationMode, { model, effort });
     return this.rpc.request("turn/start", pickDefined({
       threadId,
       input: Array.isArray(input) ? input : toTextInput(String(input || "")),
@@ -129,7 +158,7 @@ export class AppServerRuntime {
       cwd,
       model,
       effort,
-      collaborationMode,
+      collaborationMode: normalizedCollaborationMode,
       personality,
       sandboxPolicy,
       outputSchema,

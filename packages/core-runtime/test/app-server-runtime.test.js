@@ -51,6 +51,23 @@ test("runtime emits notification events during turn flow", async () => {
   await runtime.stop();
 });
 
+test("runtime encodes string collaborationMode as structured payload", async () => {
+  const runtime = buildRuntime();
+  await runtime.initialize();
+
+  const started = await runtime.startThread({ cwd: process.cwd() });
+  const turn = await runtime.startTurn({
+    threadId: started.thread.id,
+    input: [{ type: "text", text: "plan this" }],
+    model: "gpt-5.4",
+    effort: "medium",
+    collaborationMode: "plan",
+  });
+
+  assert.equal(typeof turn?.turn?.id, "string");
+  await runtime.stop();
+});
+
 test("runtime exposes extended thread, review, model, and skills wrappers", async () => {
   const runtime = buildRuntime();
   await runtime.initialize();

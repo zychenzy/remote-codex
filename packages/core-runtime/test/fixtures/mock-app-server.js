@@ -169,6 +169,16 @@ rl.on("line", (line) => {
 
   if (method === "turn/start") {
     const threadId = msg.params?.threadId;
+    if (typeof msg.params?.collaborationMode === "string") {
+      send({
+        id: msg.id,
+        error: {
+          code: -32600,
+          message: "Invalid request: invalid type: string \"plan\", expected struct CollaborationMode",
+        },
+      });
+      return;
+    }
     if (!threads.has(threadId)) {
       send({ id: msg.id, error: { code: -32600, message: "thread not found" } });
       return;
