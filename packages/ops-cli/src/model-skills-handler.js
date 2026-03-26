@@ -105,7 +105,7 @@ export async function handleModelAndSkillsCommand({
         return true;
       }
       const raw = String(positional[1]).trim();
-      const collaborationMode = ["default", "auto"].includes(raw.toLowerCase()) ? null : raw;
+      const collaborationMode = ["default", "auto"].includes(raw.toLowerCase()) ? "default" : raw;
       const updated = store.upsertBinding({
         ...binding,
         policyProfile: {

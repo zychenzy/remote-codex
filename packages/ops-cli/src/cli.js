@@ -635,7 +635,7 @@ async function cmdPolicy(args) {
   const normalizedModeRaw = modeRaw == null ? null : String(modeRaw).trim().toLowerCase();
   const collaborationMode = modeRaw == null
     ? (binding.policyProfile.collaborationMode ?? null)
-    : (["default", "auto"].includes(normalizedModeRaw) ? null : (String(modeRaw).trim() || null));
+    : (["default", "auto"].includes(normalizedModeRaw) ? "default" : (String(modeRaw).trim() || null));
 
   const updated = store.upsertBinding({
     ...binding,

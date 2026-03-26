@@ -184,7 +184,7 @@ export function commandManual(topic = "") {
     return [
       "/plan <on|off|show>",
       "Convenience alias for collaboration mode on this binding.",
-      "on => mode plan, off => runtime default.",
+      "on => mode plan, off => mode default.",
       "Examples: /plan on, /plan show, /plan off",
     ].join("\n");
   }

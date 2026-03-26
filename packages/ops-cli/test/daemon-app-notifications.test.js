@@ -20,6 +20,7 @@ class FakeRuntime {
     this.threadReads = new Map(Object.entries(threadReads));
     this.handlers = new Map();
     this.serverResponses = [];
+    this.startTurnCalls = [];
   }
 
   on(event, handler) {
@@ -72,6 +73,12 @@ class FakeRuntime {
       };
     }
     return { thread: { id: threadId, cwd: "/Users/czy/auto" } };
+  }
+
+  async startTurn(params) {
+    this.startTurnCalls.push(params);
+    const turnId = "turn-start-" + this.startTurnCalls.length;
+    return { turn: { id: turnId, status: "inProgress" } };
   }
 
   async respondServerRequest(requestId, result) {
@@ -940,11 +947,71 @@ test("daemon supports /plan on|off|show alias", async () => {
   }
 
   const binding = app.store.getBinding("discord", "chat-1");
-  assert.equal(binding?.policyProfile?.collaborationMode ?? null, null);
+  assert.equal(binding?.policyProfile?.collaborationMode ?? null, "default");
   assert.equal(adapter.messages.some((item) => item.text.includes("Plan mode enabled")), true);
   assert.equal(adapter.messages.some((item) => item.text.includes("Plan mode is ON")), true);
   assert.equal(adapter.messages.some((item) => item.text.includes("Plan mode disabled")), true);
   assert.equal(adapter.messages.some((item) => item.text.includes("Plan mode is OFF")), true);
+});
+
+test("daemon /model mode set default stores explicit default mode", async () => {
+  const { app, adapter } = await setupDaemonHarness();
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/model mode set default",
+    });
+    await sleep(60);
+  } finally {
+    await app.stop();
+  }
+
+  const binding = app.store.getBinding("discord", "chat-1");
+  assert.equal(binding?.policyProfile?.collaborationMode ?? null, "default");
+  assert.equal(adapter.messages.some((item) => item.text.includes("Mode set to: default")), true);
+});
+
+test("daemon sends explicit collaboration mode default after /plan off", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/plan on",
+    });
+    await sleep(60);
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/ask first turn",
+    });
+    await sleep(60);
+
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/plan off",
+    });
+    await sleep(60);
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/ask second turn",
+    });
+    await sleep(60);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(runtime.startTurnCalls.length >= 2, true);
+  assert.equal(runtime.startTurnCalls[0]?.collaborationMode ?? null, "plan");
+  assert.equal(runtime.startTurnCalls[1]?.collaborationMode ?? null, "default");
 });
 
 test("daemon /answer resolves latest tool user-input request in binding", async () => {

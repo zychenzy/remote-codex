@@ -2458,11 +2458,11 @@ export class DaemonApp {
           ...binding,
           policyProfile: {
             ...binding.policyProfile,
-            collaborationMode: null,
+            collaborationMode: "default",
           },
         });
         Object.assign(binding, updated);
-        await this.#sendMessage(adapter, context, "Plan mode disabled. New turns will use runtime default mode.");
+        await this.#sendMessage(adapter, context, "Plan mode disabled. New turns will run with mode: default.");
         return;
       }
       await this.#sendMessage(adapter, context, "Usage: /plan <on|off|show>");
