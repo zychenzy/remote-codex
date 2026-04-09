@@ -16,6 +16,8 @@ test("discord adapter polls allowed channel and emits inbound messages", async (
         {
           id: "2",
           content: "/status",
+          channel_id: "123",
+          message_reference: { message_id: "1" },
           author: { id: "u-1", username: "tester", bot: false },
         },
       ]),
@@ -44,6 +46,9 @@ test("discord adapter polls allowed channel and emits inbound messages", async (
   assert.equal(seen[0].channel, "discord");
   assert.equal(seen[0].chatId, "123");
   assert.equal(seen[0].text, "/status");
+  assert.equal(seen[0].messageId, "2");
+  assert.equal(seen[0].replyToMessageId, "1");
+  assert.equal(seen[0].threadId, "123");
   assert.equal(calls.some((url) => url.includes("/channels/123/messages")), true);
 });
 
@@ -117,6 +122,91 @@ test("discord adapter sends message payload to channel endpoint", async () => {
   const postCalls = calls.filter((call) => call.method === "POST" && call.url.includes("/channels/123/messages"));
   assert.equal(postCalls.length, 1);
   assert.equal(postCalls[0].body?.content, "hello world!");
+});
+
+test("discord adapter sends reply-anchored rich message payload", async () => {
+  const originalFetch = global.fetch;
+  const calls = [];
+
+  global.fetch = async (url, options = {}) => {
+    const method = String(options.method || "GET");
+    let body = null;
+    if (typeof options.body === "string" && options.body) {
+      body = JSON.parse(options.body);
+    }
+    calls.push({ url: String(url), method, body });
+
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ id: "msg-9", channel_id: "thread-1" }),
+      text: async () => "",
+    };
+  };
+
+  const adapter = new DiscordAdapter({
+    token: "token",
+    allowedChannels: ["123"],
+    minSendIntervalMs: 0,
+    logger: { warn() {}, error() {}, info() {}, debug() {} },
+  });
+
+  try {
+    const result = await adapter.sendMessageRich(
+      { channel: "discord", chatId: "123" },
+      { text: "hello", replyToMessageId: "42", threadId: "thread-1" }
+    );
+    assert.equal(result.messageId, "msg-9");
+    assert.equal(result.chatId, "thread-1");
+  } finally {
+    global.fetch = originalFetch;
+  }
+
+  const postCalls = calls.filter((call) => call.method === "POST");
+  assert.equal(postCalls.length, 1);
+  assert.equal(postCalls[0].url.includes("/channels/thread-1/messages"), true);
+  assert.equal(postCalls[0].body?.message_reference?.message_id, "42");
+});
+
+test("discord adapter edits an existing message", async () => {
+  const originalFetch = global.fetch;
+  const calls = [];
+
+  global.fetch = async (url, options = {}) => {
+    const method = String(options.method || "GET");
+    let body = null;
+    if (typeof options.body === "string" && options.body) {
+      body = JSON.parse(options.body);
+    }
+    calls.push({ url: String(url), method, body });
+
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ id: "msg-10", channel_id: "123" }),
+      text: async () => "",
+    };
+  };
+
+  const adapter = new DiscordAdapter({
+    token: "token",
+    allowedChannels: ["123"],
+    minSendIntervalMs: 0,
+    logger: { warn() {}, error() {}, info() {}, debug() {} },
+  });
+
+  try {
+    const result = await adapter.editMessage({ channel: "discord", chatId: "123" }, "msg-10", "updated");
+    assert.equal(result.messageId, "msg-10");
+    assert.equal(result.chatId, "123");
+  } finally {
+    global.fetch = originalFetch;
+  }
+
+  const patchCalls = calls.filter((call) => call.method === "PATCH");
+  assert.equal(patchCalls.length, 1);
+  assert.equal(patchCalls[0].url.includes("/channels/123/messages/msg-10"), true);
+  assert.equal(patchCalls[0].body?.content, "updated");
 });
 
 test("discord adapter truncates oversized messages", async () => {

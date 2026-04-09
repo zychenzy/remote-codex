@@ -50,6 +50,14 @@ export class BaseAdapter extends EventEmitter {
     this.inboundHandler(context);
   }
 
+  async sendMessageRich(context, payload = {}) {
+    return this.sendMessage(context, payload.text || "");
+  }
+
+  async editMessage(_context, _messageId, _text) {
+    return null;
+  }
+
   isAuthorized(context, allowlist = []) {
     if (!allowlist || allowlist.length === 0) {
       return false;

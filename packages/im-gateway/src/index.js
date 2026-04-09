@@ -1,6 +1,8 @@
 /**
  * ChannelAdapter interface:
  * - sendMessage(context, text)
+ * - sendMessageRich(context, { text, replyToMessageId?, threadId? }) [optional]
+ * - editMessage(context, messageId, text) [optional]
  * - sendStreamingDelta(context, delta)
  * - sendApprovalPrompt(context, approvalRequest)
  * - registerInboundHandler(handler)

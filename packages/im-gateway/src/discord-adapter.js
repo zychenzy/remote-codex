@@ -46,6 +46,19 @@ function formatDiscordContent(text) {
   return `${raw.slice(0, keep)}${suffix}`;
 }
 
+function normalizeMessageRef(raw = {}) {
+  const messageId = String(
+    raw?.messageId || raw?.message_id || raw?.id || ""
+  ).trim();
+  const targetChatId = String(
+    raw?.chatId || raw?.chat_id || raw?.channelId || raw?.channel_id || ""
+  ).trim();
+  return {
+    messageId,
+    chatId: targetChatId,
+  };
+}
+
 export class DiscordAdapter extends BaseAdapter {
   constructor({
     token,
@@ -91,17 +104,59 @@ export class DiscordAdapter extends BaseAdapter {
   }
 
   async sendMessage(context, text) {
-    const content = formatDiscordContent(text);
+    return this.sendMessageRich(context, { text });
+  }
+
+  async sendMessageRich(context, payload = {}) {
+    const content = formatDiscordContent(payload.text || "");
     if (!content.trim()) {
-      return;
+      return null;
     }
+
+    const targetChatId = String(payload.threadId || context.threadId || context.chatId || "").trim();
+    const replyToMessageId = String(payload.replyToMessageId || context.replyToMessageId || "").trim();
+    let sent = null;
     await this.#enqueueSend(async () => {
-      await this.#api(`/channels/${context.chatId}/messages`, {
+      sent = await this.#api(`/channels/${targetChatId}/messages`, {
         method: "POST",
+        body: {
+          content,
+          ...(replyToMessageId ? {
+            message_reference: {
+              message_id: replyToMessageId,
+            },
+          } : {}),
+        },
+      });
+    });
+
+    return normalizeMessageRef({
+      id: sent?.id,
+      channel_id: sent?.channel_id || targetChatId,
+    });
+  }
+
+  async editMessage(context, messageId, text) {
+    const content = formatDiscordContent(text);
+    const resolvedMessageId = String(messageId || "").trim();
+    if (!resolvedMessageId || !content.trim()) {
+      return null;
+    }
+
+    const targetChatId = String(context.threadId || context.chatId || "").trim();
+    let edited = null;
+    await this.#enqueueSend(async () => {
+      edited = await this.#api(`/channels/${targetChatId}/messages/${resolvedMessageId}`, {
+        method: "PATCH",
         body: {
           content,
         },
       });
+    });
+
+    return normalizeMessageRef({
+      id: edited?.id || resolvedMessageId,
+      channel_id: edited?.channel_id || targetChatId,
     });
   }
 
@@ -158,6 +213,13 @@ export class DiscordAdapter extends BaseAdapter {
             userId: String(msg.author?.id || ""),
             userName: msg.author?.username || "",
             text: content,
+            messageId: String(msg.id || ""),
+            replyToMessageId: String(
+              msg.referenced_message?.id
+              || msg.message_reference?.message_id
+              || ""
+            ),
+            threadId: String(msg.thread?.id || msg.channel_id || channelId),
             raw: msg,
           });
         }
