@@ -36,8 +36,7 @@ export function summarizeToolActivity(item = {}, { mode = "compact" } = {}) {
     const command = clip(oneLine(item.command || ""), normalizedMode === "verbose" ? 220 : 90);
     const cwd = clip(oneLine(item.cwd || ""), normalizedMode === "verbose" ? 160 : 70);
     const lines = [
-      `Terminal ${status === "completed" ? "completed" : "running"}`,
-      command ? `Command: \`${command}\`` : "",
+      command ? `Terminal: \`${command}\`` : `Terminal ${status === "completed" ? "completed" : "running"}`,
       normalizedMode === "verbose" && cwd ? `Workdir: \`${cwd}\`` : "",
     ].filter(Boolean);
     return lines.join("\n");
@@ -108,20 +107,6 @@ export function summarizePlanUpdate(params = {}) {
     lines.push(`- [${status}] ${step}`);
   }
   return lines.join("\n");
-}
-
-export function summarizeTerminalProgress(commands = [], { maxCommands = 4 } = {}) {
-  const recent = (Array.isArray(commands) ? commands : [])
-    .map((entry) => clip(oneLine(entry || ""), 120))
-    .filter(Boolean)
-    .slice(-Math.max(1, maxCommands));
-  if (!recent.length) {
-    return "";
-  }
-  return [
-    "Terminal",
-    ...recent.map((command) => `- \`${command}\``),
-  ].join("\n");
 }
 
 export function appendOutputTail(existing = "", delta = "", maxChars = 4000) {
