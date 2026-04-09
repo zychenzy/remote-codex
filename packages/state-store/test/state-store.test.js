@@ -77,6 +77,14 @@ test("default config uses home directory as workingDir", () => {
   assert.equal(config.defaults.output.turnOutputSoftChunkChars, 280);
   assert.equal(config.defaults.output.liveSectionMaxLen, 1400);
   assert.equal(config.defaults.output.liveSectionDelayMs, 250);
+  assert.equal(config.defaults.output.discord.replyToUser, true);
+  assert.equal(config.defaults.output.discord.useLiveEdits, true);
+  assert.equal(config.defaults.output.discord.statusEditIntervalMs, 500);
+  assert.equal(config.defaults.output.discord.statusMessageMaxLen, 1600);
+  assert.equal(config.defaults.output.discord.toolProgressMode, "compact");
+  assert.equal(config.defaults.output.discord.toolOutputTailLines, 8);
+  assert.equal(config.defaults.output.discord.finalMessageMaxLen, 1600);
+  assert.equal(config.defaults.output.discord.finalMessageDelayMs, 350);
 });
 
 test("upsert binding preserves extended policy fields on partial updates", () => {

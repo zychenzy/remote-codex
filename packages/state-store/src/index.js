@@ -53,6 +53,11 @@ function normalizeInt(value, fallback, min = 1, max = 10_000) {
   return Math.min(Math.max(Math.floor(n), min), max);
 }
 
+function normalizeChoice(value, allowed, fallback) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return allowed.includes(normalized) ? normalized : fallback;
+}
+
 function parseAuditLine(line) {
   try {
     return JSON.parse(line);
@@ -131,6 +136,16 @@ export class StateStore {
           turnOutputSoftChunkChars: normalizeInt(raw?.defaults?.output?.turnOutputSoftChunkChars, 280, 40, 8_000),
           liveSectionMaxLen: normalizeInt(raw?.defaults?.output?.liveSectionMaxLen, 1400, 200, 1900),
           liveSectionDelayMs: normalizeInt(raw?.defaults?.output?.liveSectionDelayMs, 250, 0, 10_000),
+          discord: {
+            replyToUser: Boolean(raw?.defaults?.output?.discord?.replyToUser ?? true),
+            useLiveEdits: Boolean(raw?.defaults?.output?.discord?.useLiveEdits ?? true),
+            statusEditIntervalMs: normalizeInt(raw?.defaults?.output?.discord?.statusEditIntervalMs, 500, 50, 10_000),
+            statusMessageMaxLen: normalizeInt(raw?.defaults?.output?.discord?.statusMessageMaxLen, 1600, 200, 1900),
+            toolProgressMode: normalizeChoice(raw?.defaults?.output?.discord?.toolProgressMode, ["off", "compact", "verbose"], "compact"),
+            toolOutputTailLines: normalizeInt(raw?.defaults?.output?.discord?.toolOutputTailLines, 8, 1, 50),
+            finalMessageMaxLen: normalizeInt(raw?.defaults?.output?.discord?.finalMessageMaxLen, 1600, 200, 1900),
+            finalMessageDelayMs: normalizeInt(raw?.defaults?.output?.discord?.finalMessageDelayMs, 350, 0, 10_000),
+          },
         },
       },
       channels: {
