@@ -174,7 +174,7 @@ async function setupDaemonHarness() {
   return { app, runtime, adapter };
 }
 
-test("daemon creates reply-anchored live status message and edits it with assistant text", async () => {
+test("daemon creates direct live status message and reply-anchors final assistant output", async () => {
   const { app, runtime, adapter } = await setupDaemonHarness();
   app.outputPolicy.discord.statusEditIntervalMs = 0;
 
@@ -189,7 +189,7 @@ test("daemon creates reply-anchored live status message and edits it with assist
     await sleep(40);
 
     assert.equal(adapter.messages.some((item) => item.text.includes("Working on it...")), true);
-    assert.equal(adapter.messages.some((item) => item.replyToMessageId === "user-msg-1"), true);
+    assert.equal(adapter.messages.some((item) => item.text.includes("Working on it...") && !item.replyToMessageId), true);
 
     runtime.emit("notification", {
       method: "turn/started",
@@ -200,12 +200,21 @@ test("daemon creates reply-anchored live status message and edits it with assist
       params: { threadId: "thread-1", turnId: "turn-start-1", delta: "Live assistant text" },
     });
     await sleep(30);
+    runtime.emit("notification", {
+      method: "turn/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-start-1",
+        turn: { status: { type: "completed" } },
+      },
+    });
+    await sleep(30);
   } finally {
     await app.stop();
   }
 
-  assert.equal(adapter.messageEdits.some((item) => item.text.includes("Live assistant text")), true);
-  assert.equal(adapter.messages.filter((item) => item.replyToMessageId === "user-msg-1").length >= 1, true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Live assistant text") && item.replyToMessageId === "user-msg-1"), true);
+  assert.equal(adapter.messageEdits.some((item) => item.text.includes("Completed")), true);
 });
 
 test("daemon emits compact discord tool activity messages for started items", async () => {
@@ -246,6 +255,7 @@ test("daemon emits compact discord tool activity messages for started items", as
   assert.equal(adapter.messages.some((item) => item.text.includes("File changes proposed")), true);
   assert.equal(adapter.messages.some((item) => item.text.includes("MCP tool")), true);
   assert.equal(adapter.messages.some((item) => item.text.includes("Dynamic tool")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Terminal running") && item.replyToMessageId), false);
 });
 
 test("daemon surfaces discord plan updates as separate messages", async () => {
@@ -284,6 +294,7 @@ test("daemon surfaces discord plan updates as separate messages", async () => {
 
   assert.equal(adapter.messages.some((item) => item.text.includes("Plan update")), true);
   assert.equal(adapter.messages.some((item) => item.text.includes("Inspect files")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Plan update") && item.replyToMessageId), false);
 });
 
 test("daemon edits command activity message with compact terminal tail", async () => {
@@ -330,7 +341,7 @@ test("daemon edits command activity message with compact terminal tail", async (
   assert.equal(adapter.messageEdits.some((item) => item.text.includes("```")), true);
 });
 
-test("daemon starts a new assistant segment after a tool boundary on discord", async () => {
+test("daemon keeps tool activity live and sends a single final reply after tool boundaries", async () => {
   const { app, runtime, adapter } = await setupDaemonHarness();
   app.outputPolicy.discord.statusEditIntervalMs = 0;
 
@@ -366,16 +377,24 @@ test("daemon starts a new assistant segment after a tool boundary on discord", a
       params: { threadId: "thread-1", turnId: "turn-start-1", delta: "Segment two" },
     });
     await sleep(40);
+    runtime.emit("notification", {
+      method: "turn/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-start-1",
+        turn: { status: { type: "completed" } },
+      },
+    });
+    await sleep(30);
   } finally {
     await app.stop();
   }
 
-  assert.equal(adapter.messages.some((item) => item.text.includes("Segment one")), true);
-  assert.equal(adapter.messages.some((item) => item.text.includes("Segment two")), true);
-  assert.equal(adapter.messages.filter((item) => item.text.includes("Segment")).length, 2);
+  assert.equal(adapter.messages.filter((item) => item.text.includes("Segment")).length, 1);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Segment oneSegment two") && item.replyToMessageId === "user-msg-4"), true);
 });
 
-test("daemon avoids duplicating already-streamed discord final text on completion", async () => {
+test("daemon sends discord assistant output only once at completion", async () => {
   const { app, runtime, adapter } = await setupDaemonHarness();
   app.outputPolicy.discord.statusEditIntervalMs = 0;
 
@@ -398,7 +417,7 @@ test("daemon avoids duplicating already-streamed discord final text on completio
       params: { threadId: "thread-1", turnId: "turn-start-1", delta: "Already visible" },
     });
     await sleep(30);
-    const messageCountBeforeCompletion = adapter.messages.length;
+    const messagesBeforeCompletion = adapter.messages.filter((item) => item.text.includes("Already visible")).length;
     runtime.emit("notification", {
       method: "turn/completed",
       params: {
@@ -409,13 +428,14 @@ test("daemon avoids duplicating already-streamed discord final text on completio
     });
     await sleep(30);
 
-    assert.equal(adapter.messages.length, messageCountBeforeCompletion);
+    assert.equal(messagesBeforeCompletion, 0);
+    assert.equal(adapter.messages.filter((item) => item.text.includes("Already visible")).length, 1);
   } finally {
     await app.stop();
   }
 });
 
-test("daemon falls back to append-only assistant output when discord edits fail", async () => {
+test("daemon does not append assistant output live when discord edits fail", async () => {
   const { app, runtime, adapter } = await setupDaemonHarness();
   app.outputPolicy.discord.statusEditIntervalMs = 0;
 
@@ -439,11 +459,22 @@ test("daemon falls back to append-only assistant output when discord edits fail"
       params: { threadId: "thread-1", turnId: "turn-start-1", delta: "Fallback assistant text\n\n" },
     });
     await sleep(40);
+    assert.equal(adapter.messages.some((item) => item.text.includes("Fallback assistant text")), false);
+    runtime.emit("notification", {
+      method: "turn/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-start-1",
+        turn: { status: { type: "completed" } },
+      },
+    });
+    await sleep(40);
   } finally {
     await app.stop();
   }
 
-  assert.equal(adapter.messages.some((item) => item.text.includes("Fallback assistant text")), true);
+  assert.equal(adapter.messages.filter((item) => item.text.includes("Fallback assistant text")).length, 1);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Fallback assistant text") && item.replyToMessageId === "user-msg-6"), true);
 });
 
 test("daemon reply-anchors approval prompts to the originating discord message", async () => {

@@ -1250,10 +1250,24 @@ export class DaemonApp {
     return context;
   }
 
+  #discordProgressContext(channel, chatId, threadId, turnId) {
+    const context = this.#runtimeContext(channel, chatId, threadId, turnId);
+    context.replyToMessageId = null;
+    return context;
+  }
+
+  #discordFinalContext(channel, chatId, threadId, turnId) {
+    const context = this.#runtimeContext(channel, chatId, threadId, turnId);
+    if (!this.outputPolicy.discord.replyToUser) {
+      context.replyToMessageId = null;
+    }
+    return context;
+  }
+
   async #openDiscordLiveSegment(adapter, context, state, text, segmentKind = "assistant") {
     const payload = {
       text,
-      replyToMessageId: this.outputPolicy.discord.replyToUser ? (state.replyToMessageId || null) : null,
+      replyToMessageId: null,
       threadId: state.threadIdHint || context.threadId || null,
     };
     const sent = await this.#sendMessage(adapter, {
@@ -1353,7 +1367,7 @@ export class DaemonApp {
     }
     state.lastToolHash = nextHash;
 
-    const context = this.#runtimeContext(channel, chatId, threadId, turnId);
+    const context = this.#discordProgressContext(channel, chatId, threadId, turnId);
     const sent = await this.#sendMessage(adapter, context, summary);
     const itemId = String(item?.id || "").trim();
     if (itemId && sent?.messageId) {
@@ -1386,7 +1400,7 @@ export class DaemonApp {
     if (!state || !text) {
       return false;
     }
-    const context = this.#runtimeContext(channel, chatId, threadId, turnId);
+    const context = this.#discordProgressContext(channel, chatId, threadId, turnId);
     if (!state.planMessageId) {
       const sent = await this.#sendMessage(adapter, context, text);
       state.planMessageId = sent?.messageId || "";
@@ -1447,7 +1461,7 @@ export class DaemonApp {
       return false;
     }
 
-    const context = this.#runtimeContext(channel, chatId, threadId, turnId);
+    const context = this.#discordProgressContext(channel, chatId, threadId, turnId);
     const edited = await this.#editAdapterMessage(
       adapter,
       {
@@ -1909,27 +1923,10 @@ export class DaemonApp {
     if (adapter.channel === "discord") {
       const discordState = this.#discordTurnState(turnId);
       if (discordState?.presentationEnabled && this.outputPolicy.discord.useLiveEdits) {
-        if (discordState.pendingBoundary) {
-          discordState.pendingBoundary = false;
-          discordState.liveMessageId = "";
-          discordState.liveMessageChatId = "";
-          discordState.liveSegmentKind = "";
-          discordState.currentAssistantSegmentText = "";
-          discordState.liveEditsDisabled = false;
-        }
         discordState.assistantFullText += String(delta || "");
         discordState.currentAssistantSegmentText += String(delta || "");
-        const rendered = await this.#renderDiscordAssistantSegment(
-          adapter,
-          channel,
-          chatId,
-          threadId,
-          turnId,
-          { force: false }
-        );
-        if (rendered || !discordState.turnEditsDisabled) {
-          return;
-        }
+        discordState.pendingBoundary = false;
+        return;
       }
       const sectionUpdate = this.#turnOutputAppendDelta(threadId, turnId, bKey, delta);
       if (sectionUpdate.sectionText) {
@@ -2031,36 +2028,13 @@ export class DaemonApp {
     const state = this.#discordTurnState(turnId);
     if (state) {
       state.pendingBoundary = true;
-    }
-    if (state?.currentAssistantSegmentText) {
-      const rendered = await this.#renderDiscordAssistantSegment(
-        adapter,
-        channel,
-        chatId,
-        threadId,
-        turnId,
-        { force: true }
-      );
-      if (!rendered && state.turnEditsDisabled) {
-        await this.#sendLongMessage(
-          adapter,
-          this.#runtimeContext(channel, chatId, threadId, turnId),
-          state.currentAssistantSegmentText,
-          {
-            maxLen: this.outputPolicy.discord.finalMessageMaxLen,
-            delayMs: this.outputPolicy.discord.finalMessageDelayMs,
-          }
-        );
-        state.assistantShownLength = state.assistantFullText.length;
-      }
+      state.currentAssistantSegmentText = "";
     }
 
     if (item?.type === "plan") {
-      this.#closeDiscordAssistantSegment(turnId);
       return;
     }
 
-    this.#closeDiscordAssistantSegment(turnId);
     await this.#sendDiscordToolActivity(adapter, channel, chatId, threadId, turnId, item);
   }
 
@@ -2203,7 +2177,9 @@ export class DaemonApp {
       }
       await this.#sendLongMessage(
         adapter,
-        this.#runtimeContext(channel, chatId, threadId, turnId),
+        adapter.channel === "discord" && this.#discordTurnState(turnId)?.presentationEnabled
+          ? this.#discordProgressContext(channel, chatId, threadId, turnId)
+          : this.#runtimeContext(channel, chatId, threadId, turnId),
         text,
         {
           maxLen: this.outputPolicy.liveSectionMaxLen,
@@ -2287,7 +2263,9 @@ export class DaemonApp {
 
     await this.#sendLongMessageRaw(
       adapter,
-      this.#runtimeContext(channel, chatId, threadId, turnId),
+      adapter.channel === "discord" && this.#discordTurnState(turnId)?.presentationEnabled
+        ? this.#discordProgressContext(channel, chatId, threadId, turnId)
+        : this.#runtimeContext(channel, chatId, threadId, turnId),
       diffText,
       {
         maxLen: this.outputPolicy.liveSectionMaxLen,
@@ -2320,30 +2298,41 @@ export class DaemonApp {
     const adapter = this.#getAdapter(channel);
     const status = normalizeTurnStatus(params?.turn?.status);
     if (adapter?.channel === "discord" && discordState?.presentationEnabled && this.outputPolicy.discord.useLiveEdits) {
-      if (!suppressed) {
-        await this.#renderDiscordAssistantSegment(adapter, channel, chatId, threadId, turnId, { force: true });
-      }
-      const unseenAssistant = String(
-        discordState.assistantFullText.slice(discordState.assistantShownLength || 0) || ""
+      const finalAssistant = String(
+        discordState.assistantFullText || allAgentTextFromTurn(params?.turn || {})
       ).trim();
-      if (!suppressed && unseenAssistant) {
-        const deliveryKey = `turn-final:${cacheKey || "unknown"}:${shortHash(unseenAssistant)}`;
+      if (!suppressed) {
+        if (discordState.liveMessageId) {
+          await this.#editAdapterMessage(
+            adapter,
+            {
+              ...this.#discordProgressContext(channel, chatId, threadId, turnId),
+              chatId: discordState.liveMessageChatId || chatId,
+              threadId: discordState.liveMessageChatId || threadId || null,
+            },
+            discordState.liveMessageId,
+            `Completed (${status}).`
+          );
+        }
+      }
+      if (!suppressed && finalAssistant) {
+        const deliveryKey = `turn-final:${cacheKey || "unknown"}:${shortHash(finalAssistant)}`;
         if (this.#markDeliveryOnce(deliveryKey)) {
           await this.#sendLongMessage(
             adapter,
-            this.#runtimeContext(channel, chatId, threadId, turnId),
-            unseenAssistant,
+            this.#discordFinalContext(channel, chatId, threadId, turnId),
+            finalAssistant,
             {
               maxLen: this.outputPolicy.discord.finalMessageMaxLen,
               delayMs: this.outputPolicy.discord.finalMessageDelayMs,
             }
           );
         }
-      } else if (!suppressed && !String(discordState.assistantFullText || "").trim() && discordState.liveMessageId) {
+      } else if (!suppressed && !finalAssistant && discordState.liveMessageId) {
         await this.#editAdapterMessage(
           adapter,
           {
-            ...this.#runtimeContext(channel, chatId, threadId, turnId),
+            ...this.#discordProgressContext(channel, chatId, threadId, turnId),
             chatId: discordState.liveMessageChatId || chatId,
             threadId: discordState.liveMessageChatId || threadId || null,
           },
@@ -2435,14 +2424,26 @@ export class DaemonApp {
     const errorMessage = `Runtime error: ${params?.error?.message || "unknown"}`;
     if (adapter.channel === "discord" && discordState?.presentationEnabled && this.outputPolicy.discord.useLiveEdits) {
       const partial = String(
-        discordState.assistantFullText.slice(discordState.assistantShownLength || 0) || ""
+        discordState.assistantFullText || allAgentTextFromTurn(params?.turn || {})
       ).trim();
+      if (discordState.liveMessageId) {
+        await this.#editAdapterMessage(
+          adapter,
+          {
+            ...this.#discordProgressContext(channel, chatId, threadId, turnId),
+            chatId: discordState.liveMessageChatId || chatId,
+            threadId: discordState.liveMessageChatId || threadId || null,
+          },
+          discordState.liveMessageId,
+          "Failed."
+        );
+      }
       if (partial) {
         const partialKey = `turn-error-partial:${cacheKey || "unknown"}:${shortHash(partial)}`;
         if (this.#markDeliveryOnce(partialKey)) {
           await this.#sendLongMessage(
             adapter,
-            this.#runtimeContext(channel, chatId, threadId, turnId),
+            this.#discordFinalContext(channel, chatId, threadId, turnId),
             partial,
             {
               maxLen: this.outputPolicy.discord.finalMessageMaxLen,
@@ -2454,7 +2455,7 @@ export class DaemonApp {
       if (!suppressed) {
         const errorKey = `turn-error:${cacheKey || "unknown"}:${shortHash(errorMessage)}`;
         if (this.#markDeliveryOnce(errorKey)) {
-          await this.#sendMessage(adapter, this.#runtimeContext(channel, chatId, threadId, turnId), errorMessage);
+          await this.#sendMessage(adapter, this.#discordFinalContext(channel, chatId, threadId, turnId), errorMessage);
         }
       }
       if (turnId) {
