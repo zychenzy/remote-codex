@@ -90,9 +90,12 @@ class StubDiscordAdapter {
   constructor() {
     this.channel = "discord";
     this.messages = [];
+    this.messageEdits = [];
     this.streamingDeltas = [];
     this.approvalPrompts = [];
     this.inboundHandler = null;
+    this.nextMessageId = 1;
+    this.failEdits = false;
   }
 
   registerInboundHandler(handler) {
@@ -110,7 +113,31 @@ class StubDiscordAdapter {
   async stop() {}
 
   async sendMessage(context, text) {
-    this.messages.push({ context, text: String(text || "") });
+    return this.sendMessageRich(context, { text });
+  }
+
+  async sendMessageRich(context, payload = {}) {
+    const record = {
+      context,
+      text: String(payload.text || ""),
+      replyToMessageId: payload.replyToMessageId || context.replyToMessageId || null,
+      threadId: payload.threadId || context.threadId || null,
+      messageId: `msg-${this.nextMessageId++}`,
+    };
+    this.messages.push(record);
+    return { messageId: record.messageId, chatId: record.threadId || context.chatId };
+  }
+
+  async editMessage(context, messageId, text) {
+    if (this.failEdits) {
+      return null;
+    }
+    this.messageEdits.push({ context, messageId, text: String(text || "") });
+    const existing = this.messages.find((item) => item.messageId === messageId);
+    if (existing) {
+      existing.text = String(text || "");
+    }
+    return { messageId, chatId: context.threadId || context.chatId };
   }
 
   async sendStreamingDelta(context, delta) {
@@ -146,6 +173,309 @@ async function setupDaemonHarness() {
   await app.start();
   return { app, runtime, adapter };
 }
+
+test("daemon creates reply-anchored live status message and edits it with assistant text", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+  app.outputPolicy.discord.statusEditIntervalMs = 0;
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/ask describe current status",
+      messageId: "user-msg-1",
+    });
+    await sleep(40);
+
+    assert.equal(adapter.messages.some((item) => item.text.includes("Working on it...")), true);
+    assert.equal(adapter.messages.some((item) => item.replyToMessageId === "user-msg-1"), true);
+
+    runtime.emit("notification", {
+      method: "turn/started",
+      params: { threadId: "thread-1", turnId: "turn-start-1" },
+    });
+    runtime.emit("notification", {
+      method: "item/agentMessage/delta",
+      params: { threadId: "thread-1", turnId: "turn-start-1", delta: "Live assistant text" },
+    });
+    await sleep(30);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(adapter.messageEdits.some((item) => item.text.includes("Live assistant text")), true);
+  assert.equal(adapter.messages.filter((item) => item.replyToMessageId === "user-msg-1").length >= 1, true);
+});
+
+test("daemon emits compact discord tool activity messages for started items", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/ask inspect tools",
+      messageId: "user-msg-2",
+    });
+    await sleep(40);
+
+    runtime.emit("notification", {
+      method: "turn/started",
+      params: { threadId: "thread-1", turnId: "turn-start-1" },
+    });
+
+    for (const item of [
+      { id: "cmd-1", type: "commandExecution", command: "ls -la", cwd: "/tmp" },
+      { id: "file-1", type: "fileChange", changes: [{ path: "src/a.js", kind: "modified" }] },
+      { id: "mcp-1", type: "mcpToolCall", server: "docs", tool: "search", arguments: { q: "app-server" } },
+      { id: "dyn-1", type: "dynamicToolCall", tool: "search_files", arguments: { pattern: "TODO" } },
+    ]) {
+      runtime.emit("notification", {
+        method: "item/started",
+        params: { threadId: "thread-1", turnId: "turn-start-1", item },
+      });
+    }
+    await sleep(40);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(adapter.messages.some((item) => item.text.includes("Terminal running")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("File changes proposed")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("MCP tool")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Dynamic tool")), true);
+});
+
+test("daemon surfaces discord plan updates as separate messages", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/ask plan something",
+      messageId: "user-msg-plan",
+    });
+    await sleep(40);
+
+    runtime.emit("notification", {
+      method: "turn/started",
+      params: { threadId: "thread-1", turnId: "turn-start-1" },
+    });
+    runtime.emit("notification", {
+      method: "turn/plan/updated",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-start-1",
+        explanation: "Working through the repo",
+        plan: [
+          { step: "Inspect files", status: "completed" },
+          { step: "Draft response", status: "inProgress" },
+        ],
+      },
+    });
+    await sleep(30);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(adapter.messages.some((item) => item.text.includes("Plan update")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Inspect files")), true);
+});
+
+test("daemon edits command activity message with compact terminal tail", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+  app.outputPolicy.discord.statusEditIntervalMs = 0;
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/ask run command",
+      messageId: "user-msg-3",
+    });
+    await sleep(40);
+
+    runtime.emit("notification", {
+      method: "turn/started",
+      params: { threadId: "thread-1", turnId: "turn-start-1" },
+    });
+    runtime.emit("notification", {
+      method: "item/started",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-start-1",
+        item: { id: "cmd-tail-1", type: "commandExecution", command: "npm test", cwd: "/Users/czy/auto" },
+      },
+    });
+    runtime.emit("notification", {
+      method: "item/commandExecution/outputDelta",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-start-1",
+        itemId: "cmd-tail-1",
+        delta: "line one\nline two\nline three\n",
+      },
+    });
+    await sleep(40);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(adapter.messageEdits.some((item) => item.text.includes("line three")), true);
+  assert.equal(adapter.messageEdits.some((item) => item.text.includes("```")), true);
+});
+
+test("daemon starts a new assistant segment after a tool boundary on discord", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+  app.outputPolicy.discord.statusEditIntervalMs = 0;
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/ask split segments",
+      messageId: "user-msg-4",
+    });
+    await sleep(40);
+
+    runtime.emit("notification", {
+      method: "turn/started",
+      params: { threadId: "thread-1", turnId: "turn-start-1" },
+    });
+    runtime.emit("notification", {
+      method: "item/agentMessage/delta",
+      params: { threadId: "thread-1", turnId: "turn-start-1", delta: "Segment one" },
+    });
+    await sleep(30);
+    runtime.emit("notification", {
+      method: "item/started",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-start-1",
+        item: { id: "cmd-boundary-1", type: "commandExecution", command: "rg todo", cwd: "/tmp" },
+      },
+    });
+    runtime.emit("notification", {
+      method: "item/agentMessage/delta",
+      params: { threadId: "thread-1", turnId: "turn-start-1", delta: "Segment two" },
+    });
+    await sleep(40);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(adapter.messages.some((item) => item.text.includes("Segment one")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Segment two")), true);
+  assert.equal(adapter.messages.filter((item) => item.text.includes("Segment")).length, 2);
+});
+
+test("daemon avoids duplicating already-streamed discord final text on completion", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+  app.outputPolicy.discord.statusEditIntervalMs = 0;
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/ask no duplicate",
+      messageId: "user-msg-5",
+    });
+    await sleep(40);
+
+    runtime.emit("notification", {
+      method: "turn/started",
+      params: { threadId: "thread-1", turnId: "turn-start-1" },
+    });
+    runtime.emit("notification", {
+      method: "item/agentMessage/delta",
+      params: { threadId: "thread-1", turnId: "turn-start-1", delta: "Already visible" },
+    });
+    await sleep(30);
+    const messageCountBeforeCompletion = adapter.messages.length;
+    runtime.emit("notification", {
+      method: "turn/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-start-1",
+        turn: { status: { type: "completed" } },
+      },
+    });
+    await sleep(30);
+
+    assert.equal(adapter.messages.length, messageCountBeforeCompletion);
+  } finally {
+    await app.stop();
+  }
+});
+
+test("daemon falls back to append-only assistant output when discord edits fail", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+  app.outputPolicy.discord.statusEditIntervalMs = 0;
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/ask fallback path",
+      messageId: "user-msg-6",
+    });
+    await sleep(40);
+    adapter.failEdits = true;
+
+    runtime.emit("notification", {
+      method: "turn/started",
+      params: { threadId: "thread-1", turnId: "turn-start-1" },
+    });
+    runtime.emit("notification", {
+      method: "item/agentMessage/delta",
+      params: { threadId: "thread-1", turnId: "turn-start-1", delta: "Fallback assistant text\n\n" },
+    });
+    await sleep(40);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(adapter.messages.some((item) => item.text.includes("Fallback assistant text")), true);
+});
+
+test("daemon reply-anchors approval prompts to the originating discord message", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/ask approval flow",
+      messageId: "user-msg-approval",
+    });
+    await sleep(40);
+
+    runtime.emit("serverRequest", {
+      id: "srv-tool-approval",
+      method: "item/tool/requestUserInput",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-start-1",
+        questions: [{ id: "mode", question: "Which mode?", options: ["fast", "safe"] }],
+      },
+    });
+    await sleep(30);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(adapter.approvalPrompts.length, 1);
+  assert.equal(adapter.approvalPrompts[0].context.replyToMessageId, "user-msg-approval");
+});
 
 test("daemon emits completed sections during turn and only sends pending tail on completion", async () => {
   const { app, runtime, adapter } = await setupDaemonHarness();
