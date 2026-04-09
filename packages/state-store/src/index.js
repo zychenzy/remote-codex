@@ -130,7 +130,7 @@ export class StateStore {
         workingDir: raw?.defaults?.workingDir || os.homedir(),
         approvalMode: raw?.defaults?.approvalMode || "on-request",
         output: {
-          resumeHistoryTurns: normalizeInt(raw?.defaults?.output?.resumeHistoryTurns, 5, 1, 100),
+          resumeHistoryTurns: normalizeInt(raw?.defaults?.output?.resumeHistoryTurns, 3, 1, 100),
           chatHistoryFlushIntervalMs: normalizeInt(raw?.defaults?.output?.chatHistoryFlushIntervalMs, 250, 10, 10_000),
           turnOutputMinChunkChars: normalizeInt(raw?.defaults?.output?.turnOutputMinChunkChars, 160, 40, 8_000),
           turnOutputSoftChunkChars: normalizeInt(raw?.defaults?.output?.turnOutputSoftChunkChars, 280, 40, 8_000),

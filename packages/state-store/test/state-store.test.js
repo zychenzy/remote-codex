@@ -71,7 +71,7 @@ test("default config uses home directory as workingDir", () => {
   const store = new StateStore({ baseDir: dir });
   const config = store.readConfig();
   assert.equal(config.defaults.workingDir, os.homedir());
-  assert.equal(config.defaults.output.resumeHistoryTurns, 5);
+  assert.equal(config.defaults.output.resumeHistoryTurns, 3);
   assert.equal(config.defaults.output.chatHistoryFlushIntervalMs, 250);
   assert.equal(config.defaults.output.turnOutputMinChunkChars, 160);
   assert.equal(config.defaults.output.turnOutputSoftChunkChars, 280);

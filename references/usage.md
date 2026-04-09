@@ -50,7 +50,7 @@ Thread management:
 /thread archive <threadId> --confirm
 ```
 
-When you `/resume <threadId>`, daemon sends a formatted transcript window (last 5 turns by default) back to IM in chunked messages.
+When you `/resume <threadId>`, daemon sends a formatted transcript window (last 3 turns by default) back to IM in chunked messages.
 
 Model and skills:
 

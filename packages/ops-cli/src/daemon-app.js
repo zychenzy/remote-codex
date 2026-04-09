@@ -432,16 +432,15 @@ function clipText(text, maxLen = 400) {
   return `${input.slice(0, maxLen - 3)}...`;
 }
 
-function prefixFirstLineOnly(marker, text) {
-  const lines = String(text || "").split(/\r?\n/);
-  if (!lines.length) {
-    return "";
-  }
-  const [first, ...rest] = lines;
-  return [
-    `${marker} ${first}`,
-    ...rest.map((line) => `  ${line}`),
-  ].join("\n");
+function quoteMarkdown(text) {
+  return String(text || "")
+    .split("\n")
+    .map((line) => `> ${line}`)
+    .join("\n");
+}
+
+function firstLine(text) {
+  return String(text || "").split(/\r?\n/, 1)[0]?.trim() || "";
 }
 
 function turnOutputKey(threadId, turnId) {
@@ -665,7 +664,7 @@ export class DaemonApp {
 
     const outputConfig = this.config.defaults?.output || {};
     this.outputPolicy = {
-      resumeHistoryTurns: toInt(outputConfig.resumeHistoryTurns, 5, 1, 100),
+      resumeHistoryTurns: toInt(outputConfig.resumeHistoryTurns, 3, 1, 100),
       chatHistoryFlushIntervalMs: toInt(outputConfig.chatHistoryFlushIntervalMs, 250, 10, 10_000),
       turnOutputMinChunkChars: toInt(outputConfig.turnOutputMinChunkChars, 160, 40, 8_000),
       turnOutputSoftChunkChars: toInt(outputConfig.turnOutputSoftChunkChars, 280, 40, 8_000),
@@ -1211,6 +1210,9 @@ export class DaemonApp {
       pendingBoundary: false,
       lastLiveEditAt: 0,
       lastToolHash: "",
+      recentToolActivities: [],
+      pendingStatusRenderTimer: null,
+      lastStatusText: "",
       commandOutputsByItemId: new Map(),
       toolMessagesByItemId: new Map(),
       planMessageId: "",
@@ -1227,6 +1229,10 @@ export class DaemonApp {
       return null;
     }
     const state = this.discordTurnStateByTurnId.get(id) || null;
+    if (state?.pendingStatusRenderTimer) {
+      clearTimeout(state.pendingStatusRenderTimer);
+      state.pendingStatusRenderTimer = null;
+    }
     this.discordTurnStateByTurnId.delete(id);
     return state;
   }
@@ -1260,6 +1266,82 @@ export class DaemonApp {
       context.replyToMessageId = null;
     }
     return context;
+  }
+
+  #composeDiscordStatusText(state, baseText = "Working on it...") {
+    const base = String(baseText || "Working on it...").trim() || "Working on it...";
+    const recent = Array.isArray(state?.recentToolActivities)
+      ? state.recentToolActivities.filter(Boolean).slice(-4)
+      : [];
+    if (!recent.length) {
+      return base;
+    }
+    return [
+      base,
+      "",
+      "Recent activity:",
+      ...recent.map((line) => `- ${line}`),
+    ].join("\n");
+  }
+
+  async #renderDiscordStatusSegment(adapter, channel, chatId, threadId, turnId, { force = false } = {}) {
+    const state = this.#discordTurnState(turnId);
+    if (!state || state.turnEditsDisabled || state.liveEditsDisabled) {
+      return false;
+    }
+
+    const text = this.#composeDiscordStatusText(state);
+    if (!text) {
+      return false;
+    }
+    if (state.pendingStatusRenderTimer && force) {
+      clearTimeout(state.pendingStatusRenderTimer);
+      state.pendingStatusRenderTimer = null;
+    }
+    if (!force && text === state.lastStatusText) {
+      return false;
+    }
+
+    const context = this.#runtimeContext(channel, chatId, threadId, turnId);
+    if (!state.liveMessageId) {
+      await this.#openDiscordLiveSegment(adapter, context, state, text, "status");
+      state.lastStatusText = text;
+      return true;
+    }
+
+    const sinceLastEdit = Date.now() - state.lastLiveEditAt;
+    if (!force && sinceLastEdit < this.outputPolicy.discord.statusEditIntervalMs) {
+      if (!state.pendingStatusRenderTimer) {
+        state.pendingStatusRenderTimer = setTimeout(async () => {
+          const latest = this.#discordTurnState(turnId);
+          if (latest) {
+            latest.pendingStatusRenderTimer = null;
+          }
+          await this.#renderDiscordStatusSegment(adapter, channel, chatId, threadId, turnId, { force: true });
+        }, this.outputPolicy.discord.statusEditIntervalMs - sinceLastEdit);
+      }
+      return false;
+    }
+
+    const edited = await this.#editAdapterMessage(
+      adapter,
+      {
+        ...context,
+        chatId: state.liveMessageChatId || chatId,
+        threadId: state.liveMessageChatId || context.threadId,
+      },
+      state.liveMessageId,
+      text
+    );
+    if (!edited) {
+      state.liveEditsDisabled = true;
+      state.turnEditsDisabled = true;
+      return false;
+    }
+    state.liveSegmentKind = "status";
+    state.lastLiveEditAt = Date.now();
+    state.lastStatusText = text;
+    return true;
   }
 
   async #openDiscordLiveSegment(adapter, context, state, text, segmentKind = "assistant") {
@@ -1338,6 +1420,10 @@ export class DaemonApp {
     if (!state) {
       return;
     }
+    if (state.pendingStatusRenderTimer) {
+      clearTimeout(state.pendingStatusRenderTimer);
+      state.pendingStatusRenderTimer = null;
+    }
     state.liveMessageId = "";
     state.liveMessageChatId = "";
     state.liveSegmentKind = "";
@@ -1346,6 +1432,7 @@ export class DaemonApp {
     state.turnEditsDisabled = false;
     state.pendingBoundary = false;
     state.lastLiveEditAt = 0;
+    state.lastStatusText = "";
   }
 
   async #sendDiscordToolActivity(adapter, channel, chatId, threadId, turnId, item) {
@@ -1364,33 +1451,15 @@ export class DaemonApp {
       return false;
     }
     state.lastToolHash = nextHash;
-
-    const context = this.#discordProgressContext(channel, chatId, threadId, turnId);
-    const sent = await this.#sendMessage(adapter, context, summary);
-    const itemId = String(item?.id || "").trim();
-    if (itemId && sent?.messageId) {
-      state.toolMessagesByItemId.set(itemId, {
-        messageId: sent.messageId,
-        chatId: sent.chatId || context.threadId || context.chatId,
-        baseText: summary,
-        lastRendered: summary,
-        lastEditAt: Date.now(),
-        editsDisabled: false,
-      });
-      const pendingOutput = String(state.commandOutputsByItemId.get(itemId) || "");
-      if (pendingOutput) {
-        await this.#sendDiscordCommandOutput(
-          adapter,
-          channel,
-          chatId,
-          threadId,
-          turnId,
-          itemId,
-          ""
-        );
-      }
+    const headline = firstLine(summary);
+    if (!headline) {
+      return false;
     }
-    return true;
+    state.recentToolActivities.push(headline);
+    if (state.recentToolActivities.length > 4) {
+      state.recentToolActivities = state.recentToolActivities.slice(-4);
+    }
+    return this.#renderDiscordStatusSegment(adapter, channel, chatId, threadId, turnId);
   }
 
   async #sendDiscordPlanUpdate(adapter, channel, chatId, threadId, turnId, text) {
@@ -1483,6 +1552,7 @@ export class DaemonApp {
       const selectedTurns = Number.isFinite(Number(turns))
         ? allTurns.slice(-Math.max(0, Number(turns)))
         : allTurns;
+      const startIndex = Math.max(0, allTurns.length - selectedTurns.length);
       if (!selectedTurns.length) {
         return [];
       }
@@ -1494,17 +1564,21 @@ export class DaemonApp {
         messages.push(`Thread history (${allTurns.length} turns):`);
       }
 
-      for (const turn of selectedTurns) {
+      for (let index = 0; index < selectedTurns.length; index += 1) {
+        const turn = selectedTurns[index];
         const lines = [];
         const userRaw = String(allUserTextFromTurn(turn) || "").trim();
         const agentRaw = String(allAgentTextFromTurn(turn) || "").trim();
         const userText = textLimit ? clipText(userRaw, textLimit) : userRaw;
         const agentText = textLimit ? clipText(agentRaw, textLimit) : agentRaw;
+        lines.push(`Turn ${startIndex + index + 1}`);
         if (userText) {
-          lines.push(prefixFirstLineOnly("◇", userText));
+          lines.push("User:");
+          lines.push(quoteMarkdown(userText));
         }
         if (agentText) {
-          lines.push(prefixFirstLineOnly("•", agentText));
+          lines.push("Assistant:");
+          lines.push(agentText);
         }
         if (!userText && !agentText) {
           lines.push("(no visible text content)");
