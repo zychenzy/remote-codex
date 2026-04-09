@@ -251,11 +251,56 @@ test("daemon emits compact discord tool activity messages for started items", as
     await app.stop();
   }
 
-  assert.equal(adapter.messages.some((item) => item.text.includes("Terminal running")), true);
+  assert.equal(adapter.messages.some((item) => item.text.startsWith("Terminal")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("`ls -la`")), true);
   assert.equal(adapter.messages.some((item) => item.text.includes("File changes proposed")), true);
   assert.equal(adapter.messages.some((item) => item.text.includes("MCP tool")), true);
   assert.equal(adapter.messages.some((item) => item.text.includes("Dynamic tool")), true);
-  assert.equal(adapter.messages.some((item) => item.text.includes("Terminal running") && item.replyToMessageId), false);
+  assert.equal(adapter.messages.some((item) => item.text.startsWith("Terminal") && item.replyToMessageId), false);
+});
+
+test("daemon collapses consecutive terminal commands into one live discord message", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+  app.outputPolicy.discord.statusEditIntervalMs = 0;
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/ask inspect branch state",
+      messageId: "user-msg-terminal-compact",
+    });
+    await sleep(40);
+
+    runtime.emit("notification", {
+      method: "turn/started",
+      params: { threadId: "thread-1", turnId: "turn-start-1" },
+    });
+
+    for (const [index, command] of [
+      "/bin/zsh -lc 'git branch --show-current'",
+      "/bin/zsh -lc 'git status --short'",
+      "/bin/zsh -lc 'git log --oneline --decorate main..HEAD'",
+      "/bin/zsh -lc 'git diff --stat main...HEAD'",
+    ].entries()) {
+      runtime.emit("notification", {
+        method: "item/started",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-start-1",
+          item: { id: `cmd-compact-${index + 1}`, type: "commandExecution", command, cwd: "/Users/czy/auto" },
+        },
+      });
+    }
+    await sleep(40);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(adapter.messages.filter((item) => item.text.startsWith("Terminal")).length, 1);
+  assert.equal(adapter.messages.some((item) => item.text.includes("git diff --stat main...HEAD")), true);
+  assert.equal(adapter.messageEdits.some((item) => item.text.includes("git log --oneline --decorate main..HEAD")), true);
 });
 
 test("daemon surfaces discord plan updates as separate messages", async () => {
@@ -323,6 +368,7 @@ test("daemon edits command activity message with compact terminal tail", async (
         item: { id: "cmd-tail-1", type: "commandExecution", command: "npm test", cwd: "/Users/czy/auto" },
       },
     });
+    await sleep(20);
     runtime.emit("notification", {
       method: "item/commandExecution/outputDelta",
       params: {

@@ -110,6 +110,20 @@ export function summarizePlanUpdate(params = {}) {
   return lines.join("\n");
 }
 
+export function summarizeTerminalProgress(commands = [], { maxCommands = 4 } = {}) {
+  const recent = (Array.isArray(commands) ? commands : [])
+    .map((entry) => clip(oneLine(entry || ""), 120))
+    .filter(Boolean)
+    .slice(-Math.max(1, maxCommands));
+  if (!recent.length) {
+    return "";
+  }
+  return [
+    "Terminal",
+    ...recent.map((command) => `- \`${command}\``),
+  ].join("\n");
+}
+
 export function appendOutputTail(existing = "", delta = "", maxChars = 4000) {
   const joined = `${String(existing || "")}${String(delta || "")}`;
   if (joined.length <= maxChars) {

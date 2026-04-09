@@ -21,6 +21,7 @@ import {
   commandOutputMessage,
   normalizeToolProgressMode,
   summarizePlanUpdate,
+  summarizeTerminalProgress,
   summarizeToolActivity,
 } from "./discord-turn-ux.js";
 import { allAgentTextFromTurn, allUserTextFromTurn } from "./turn-text-utils.js";
@@ -1215,6 +1216,13 @@ export class DaemonApp {
       lastToolHash: "",
       commandOutputsByItemId: new Map(),
       toolMessagesByItemId: new Map(),
+      terminalMessageId: "",
+      terminalMessageChatId: "",
+      terminalCommands: [],
+      currentTerminalItemId: "",
+      terminalLastRendered: "",
+      terminalLastEditAt: 0,
+      terminalEditsDisabled: false,
       planMessageId: "",
       planMessageChatId: "",
       planText: "",
@@ -1350,10 +1358,95 @@ export class DaemonApp {
     state.lastLiveEditAt = 0;
   }
 
+  async #sendDiscordTerminalActivity(adapter, channel, chatId, threadId, turnId, item) {
+    const state = this.#discordTurnState(turnId);
+    if (!state) {
+      return false;
+    }
+
+    const itemId = String(item?.id || "").trim();
+    const command = String(item?.command || "").trim();
+    if (!itemId || !command) {
+      return false;
+    }
+
+    state.currentTerminalItemId = itemId;
+    state.terminalCommands = [...state.terminalCommands, command].slice(-4);
+    const nextText = summarizeTerminalProgress(state.terminalCommands);
+    if (!nextText) {
+      return false;
+    }
+
+    const context = this.#discordProgressContext(channel, chatId, threadId, turnId);
+    let messageId = state.terminalMessageId;
+    let messageChatId = state.terminalMessageChatId;
+
+    if (!messageId && state.liveMessageId && state.liveSegmentKind === "status") {
+      const edited = await this.#editAdapterMessage(
+        adapter,
+        {
+          ...context,
+          chatId: state.liveMessageChatId || chatId,
+          threadId: state.liveMessageChatId || context.threadId,
+        },
+        state.liveMessageId,
+        nextText
+      );
+      if (edited) {
+        messageId = state.liveMessageId;
+        messageChatId = state.liveMessageChatId || chatId;
+      }
+    }
+
+    if (messageId) {
+      const edited = await this.#editAdapterMessage(
+        adapter,
+        {
+          ...context,
+          chatId: messageChatId || chatId,
+          threadId: messageChatId || context.threadId,
+        },
+        messageId,
+        nextText
+      );
+      if (!edited) {
+        messageId = "";
+        messageChatId = "";
+      }
+    }
+
+    if (!messageId) {
+      const sent = await this.#sendMessage(adapter, context, nextText);
+      messageId = sent?.messageId || "";
+      messageChatId = sent?.chatId || context.threadId || context.chatId;
+    }
+
+    state.terminalMessageId = messageId;
+    state.terminalMessageChatId = messageChatId;
+    state.terminalLastRendered = nextText;
+    state.terminalLastEditAt = Date.now();
+    state.terminalEditsDisabled = false;
+    state.liveMessageId = messageId;
+    state.liveMessageChatId = messageChatId;
+    state.liveSegmentKind = "terminal";
+    state.toolMessagesByItemId.set(itemId, {
+      messageId,
+      chatId: messageChatId,
+      baseText: nextText,
+      lastRendered: nextText,
+      lastEditAt: Date.now(),
+      editsDisabled: false,
+    });
+    return true;
+  }
+
   async #sendDiscordToolActivity(adapter, channel, chatId, threadId, turnId, item) {
     const state = this.#discordTurnState(turnId);
     if (!state) {
       return false;
+    }
+    if (item?.type === "commandExecution") {
+      return this.#sendDiscordTerminalActivity(adapter, channel, chatId, threadId, turnId, item);
     }
     const mode = this.outputPolicy.discord.toolProgressMode;
     const summary = summarizeToolActivity(item, { mode });
@@ -1443,6 +1536,9 @@ export class DaemonApp {
     const existing = String(state.commandOutputsByItemId.get(itemId) || "");
     const nextBuffer = appendOutputTail(existing, delta);
     state.commandOutputsByItemId.set(itemId, nextBuffer);
+    if (itemId !== state.currentTerminalItemId) {
+      return false;
+    }
     const toolState = state.toolMessagesByItemId.get(itemId);
     if (!toolState || toolState.editsDisabled) {
       return false;
@@ -1452,8 +1548,9 @@ export class DaemonApp {
       return false;
     }
 
+    const baseText = summarizeTerminalProgress(state.terminalCommands) || toolState.baseText;
     const nextText = commandOutputMessage(
-      toolState.baseText,
+      baseText,
       nextBuffer,
       this.outputPolicy.discord.toolOutputTailLines
     );
@@ -1477,7 +1574,10 @@ export class DaemonApp {
       return false;
     }
     toolState.lastEditAt = Date.now();
+    toolState.baseText = baseText;
     toolState.lastRendered = nextText;
+    state.terminalLastRendered = nextText;
+    state.terminalLastEditAt = Date.now();
     return true;
   }
 
