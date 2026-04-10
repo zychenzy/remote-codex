@@ -16,6 +16,8 @@ If config changed:
 ./reco restart
 ```
 
+If you run `reco` under `launchd` or `systemd`, use the service manager for restart/status instead of `./reco start`.
+
 ## 2) Bind chats to Codex sessions
 
 Bind Discord (auto-infers IDs when unambiguous):
@@ -63,6 +65,18 @@ Model and skills:
 /skills use skill-creator draft a release helper skill
 ```
 
+Autopilot controls:
+
+```text
+/plan on
+/plan off
+/plan show
+/autopilot status
+/autopilot continue
+```
+
+Autopilot is intended for bounded continuation after a turn completes. Risky tool actions still flow through the normal approval policy.
+
 ## 4) Policy tuning
 
 ```bash
@@ -94,3 +108,5 @@ Health checks:
 ```bash
 ./reco doctor
 ```
+
+`reco doctor` is also the quickest way to catch multiple live daemon processes attached to the same state directory, which can cause duplicate turns and mixed Codex auth/account behavior.

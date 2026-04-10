@@ -4,13 +4,15 @@ IM-first remote control daemon for Codex, backed by `codex app-server`.
 
 This project lets you run Codex on your host machine and control it from Discord, while keeping operations local and policy-gated.
 
-Allowlisted Discord users can also operate the bot via direct message; the daemon resolves and polls their DM channels at startup.
+Allowlisted Discord users can also operate the bot via direct message; the daemon resolves and polls their DM channels at startup. DM-only operation is supported.
 
 ## Highlights
 
 - Native `codex app-server` integration (JSON-RPC, thread/turn/model/skills methods).
 - IM-first operator flow (Discord).
+- Discord server channels and Discord DMs share the same binding, approval, and thread model.
 - Discord turns now send direct live status/tool progress updates during execution and reply-anchor the final assistant output back to the triggering user message.
+- Optional autopilot continuation for safe follow-up turns, still bounded by local policy.
 - Local single-host deployment (no relay/control plane required).
 - Approval-gated risky operations and allowlist-based access control.
 - Persistent bindings, thread mapping, approvals, and audit logs.
@@ -118,6 +120,55 @@ If settings change, restart:
 ./reco restart
 ```
 
+## Recommended Service Setup
+
+For an always-on machine, let the OS supervise `daemon-run` directly.
+
+- macOS: use a user `LaunchAgent`
+- Linux: use a user or system `systemd` unit
+- Do not point a service manager at `reco start`, because `reco start` is already a detached wrapper
+
+macOS `LaunchAgent` shape:
+
+```xml
+<array>
+  <string>/opt/homebrew/bin/node</string>
+  <string>/Users/you/remote-codex/packages/ops-cli/src/cli.js</string>
+  <string>daemon-run</string>
+</array>
+```
+
+With `launchd`, prefer `launchctl` for lifecycle control:
+
+```bash
+launchctl print gui/$(id -u)/local.reco
+launchctl kickstart -k gui/$(id -u)/local.reco
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/local.reco.plist
+```
+
+## DM-Only Operation
+
+If you no longer want server-channel polling:
+
+- remove old server channel IDs from Discord config
+- keep your Discord allowlist user IDs
+- bind the DM chat instead of a server text channel
+- restart the daemon so the active poll set matches config
+
+DM-only setups still use the same thread, approval, and audit flow as server-channel bindings.
+
+## Autopilot
+
+Autopilot is an optional continuation mode for follow-up turns after a completion. It is designed to keep safe progress moving without removing the default approval model for risky actions.
+
+Useful IM commands:
+
+- `/plan on`
+- `/plan off`
+- `/plan show`
+- `/autopilot status`
+- `/autopilot continue`
+
 ## CLI Commands
 
 Core:
@@ -202,12 +253,11 @@ Contribution and commit conventions:
 
 - Docs index: [references/README.md](references/README.md)
 - Architecture: [references/architecture.md](references/architecture.md)
-- Autopilot implementation: [references/autopilot-implementation-checklist.md](references/autopilot-implementation-checklist.md)
-- Autopilot design: [references/autopilot-supervisor-design.md](references/autopilot-supervisor-design.md)
 - Setup: [references/setup-guides.md](references/setup-guides.md)
 - Usage: [references/usage.md](references/usage.md)
 - Troubleshooting: [references/troubleshooting.md](references/troubleshooting.md)
 - Token validation: [references/token-validation.md](references/token-validation.md)
+- Design notes: [references/autopilot-implementation-checklist.md](references/autopilot-implementation-checklist.md), [references/autopilot-supervisor-design.md](references/autopilot-supervisor-design.md)
 
 ## License
 
