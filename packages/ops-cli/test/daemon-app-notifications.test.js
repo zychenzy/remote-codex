@@ -15,12 +15,21 @@ function sleep(ms) {
 }
 
 class FakeRuntime {
-  constructor({ loadedThreadIds = [], threadReads = {} } = {}) {
+  constructor({
+    loadedThreadIds = [],
+    threadReads = {},
+    listThreadsResponse = { data: [], nextCursor: null },
+    modelsResponse = { data: [] },
+    collaborationModesResponse = { data: [] },
+  } = {}) {
     this.loadedThreadIds = loadedThreadIds;
     this.threadReads = new Map(Object.entries(threadReads));
     this.handlers = new Map();
     this.serverResponses = [];
     this.startTurnCalls = [];
+    this.listThreadsResponse = listThreadsResponse;
+    this.modelsResponse = modelsResponse;
+    this.collaborationModesResponse = collaborationModesResponse;
   }
 
   on(event, handler) {
@@ -46,6 +55,18 @@ class FakeRuntime {
 
   async listLoadedThreads() {
     return { data: this.loadedThreadIds };
+  }
+
+  async listThreads() {
+    return this.listThreadsResponse;
+  }
+
+  async listModels() {
+    return this.modelsResponse;
+  }
+
+  async listCollaborationModes() {
+    return this.collaborationModesResponse;
   }
 
   async readThread({ threadId, includeTurns = false }) {
@@ -120,6 +141,7 @@ class StubDiscordAdapter {
     const record = {
       context,
       text: String(payload.text || ""),
+      nativeUi: payload.nativeUi || null,
       replyToMessageId: payload.replyToMessageId || context.replyToMessageId || null,
       threadId: payload.threadId || context.threadId || null,
       messageId: `msg-${this.nextMessageId++}`,
@@ -149,10 +171,10 @@ class StubDiscordAdapter {
   }
 }
 
-async function setupDaemonHarness({ clearStartupMessages = true } = {}) {
+async function setupDaemonHarness({ clearStartupMessages = true, runtimeOptions = {} } = {}) {
   const baseDir = tempDir();
   const app = new DaemonApp({ baseDir });
-  const runtime = new FakeRuntime({ loadedThreadIds: ["thread-1"] });
+  const runtime = new FakeRuntime({ loadedThreadIds: ["thread-1"], ...runtimeOptions });
   const adapter = new StubDiscordAdapter();
 
   app.runtime = runtime;
@@ -1359,6 +1381,46 @@ test("daemon supports /plan on|off|show alias", async () => {
   assert.equal(adapter.messages.some((item) => item.text.includes("Plan mode is OFF")), true);
 });
 
+test("daemon /thread list on discord emits native thread controls alongside text fallback", async () => {
+  const { app, adapter } = await setupDaemonHarness({
+    runtimeOptions: {
+      listThreadsResponse: {
+        data: [
+          { id: "thread-1", title: "Current thread", cwd: "/Users/czy/auto" },
+          { id: "thread-2", title: "Review docs", cwd: "/Users/czy/docs" },
+        ],
+        nextCursor: "cursor-2",
+      },
+    },
+  });
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/thread list",
+    });
+    await sleep(80);
+  } finally {
+    await app.stop();
+  }
+
+  const message = adapter.messages.find((item) => item.nativeUi?.kind === "threadList");
+  assert.ok(message);
+  assert.equal(message.text.includes("Threads:"), true);
+  assert.equal(message.text.includes("Use /thread more for next page."), true);
+  assert.equal(message.nativeUi.title, "Threads");
+  assert.deepEqual(
+    message.nativeUi.components.selects[0].options.map((option) => option.commandText),
+    ["/resume thread-1", "/resume thread-2"]
+  );
+  assert.deepEqual(
+    message.nativeUi.components.buttons.map((button) => button.commandText),
+    ["/thread more"]
+  );
+});
+
 test("daemon /model mode set default stores explicit default mode", async () => {
   const { app, adapter } = await setupDaemonHarness();
   try {
@@ -1376,6 +1438,62 @@ test("daemon /model mode set default stores explicit default mode", async () => 
   const binding = app.store.getBinding("discord", "chat-1");
   assert.equal(binding?.policyProfile?.collaborationMode ?? null, "default");
   assert.equal(adapter.messages.some((item) => item.text.includes("Mode set to: default")), true);
+});
+
+test("daemon /model show on discord emits native model controls alongside text fallback", async () => {
+  const { app, adapter } = await setupDaemonHarness({
+    runtimeOptions: {
+      modelsResponse: {
+        data: [
+          {
+            model: "gpt-5",
+            isDefault: true,
+            supportedReasoningEfforts: ["low", "medium", "high"],
+          },
+          {
+            model: "gpt-5-mini",
+            supportedReasoningEfforts: ["low", "medium"],
+          },
+        ],
+      },
+      collaborationModesResponse: {
+        data: [{ mode: "default" }, { mode: "plan" }, { mode: "code-review" }],
+      },
+    },
+  });
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/model show",
+    });
+    await sleep(80);
+  } finally {
+    await app.stop();
+  }
+
+  const message = adapter.messages.find((item) => item.nativeUi?.kind === "modelPicker");
+  assert.ok(message);
+  assert.equal(message.text.includes("Model: runtime default"), true);
+  assert.equal(message.nativeUi.title, "Model Controls");
+  assert.deepEqual(
+    message.nativeUi.components.selects[0].options.map((option) => option.commandText),
+    ["/model set gpt-5", "/model set gpt-5-mini"]
+  );
+  assert.equal(
+    message.nativeUi.components.selects[1].options.some((option) => option.commandText === "/model effort set high"),
+    true
+  );
+  assert.equal(
+    message.nativeUi.components.selects[2].options.some((option) => option.commandText === "/model mode set plan"),
+    true
+  );
+  assert.deepEqual(
+    message.nativeUi.components.buttons.map((button) => button.commandText),
+    ["/model show", "/model list"]
+  );
 });
 
 test("daemon sends explicit collaboration mode default after /plan off", async () => {

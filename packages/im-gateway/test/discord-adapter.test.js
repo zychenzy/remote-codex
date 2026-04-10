@@ -3,514 +3,407 @@ import assert from "node:assert/strict";
 
 import { DiscordAdapter } from "../src/discord-adapter.js";
 
-test("discord adapter polls allowed channel and emits inbound messages", async () => {
-  const originalFetch = global.fetch;
-  const calls = [];
-  let pollCount = 0;
+function createFakeClient() {
+  const events = new Map();
+  const channels = new Map();
+  const commandSets = [];
+  let ready = false;
 
-  global.fetch = async (url) => {
-    calls.push(String(url));
-    return {
-      ok: true,
-      status: 200,
-      json: async () => {
-        pollCount += 1;
-        if (pollCount === 1) {
-          return [
-            {
-              id: "1",
-              content: "/old",
-              channel_id: "123",
-              author: { id: "u-1", username: "tester", bot: false },
-            },
-          ];
-        }
-        return [
-          {
-            id: "2",
-            content: "/status",
-            channel_id: "123",
-            message_reference: { message_id: "1" },
-            author: { id: "u-1", username: "tester", bot: false },
-          },
-          {
-            id: "1",
-            content: "/old",
-            channel_id: "123",
-            author: { id: "u-1", username: "tester", bot: false },
-          },
-        ];
+  const client = {
+    application: {
+      commands: {
+        async set(defs) {
+          commandSets.push(defs);
+          return defs;
+        },
       },
-      text: async () => "",
-    };
+    },
+    channels: {
+      cache: {
+        get(id) {
+          return channels.get(String(id)) || null;
+        },
+      },
+      async fetch(id) {
+        const channel = channels.get(String(id));
+        if (!channel) {
+          throw new Error(`missing channel ${id}`);
+        }
+        return channel;
+      },
+    },
+    on(event, handler) {
+      const list = events.get(event) || [];
+      list.push(handler);
+      events.set(event, list);
+    },
+    once(event, handler) {
+      const wrapped = (...args) => {
+        const list = events.get(event) || [];
+        events.set(event, list.filter((item) => item !== wrapped));
+        handler(...args);
+      };
+      client.on(event, wrapped);
+    },
+    emit(event, payload) {
+      const list = events.get(event) || [];
+      for (const handler of list) {
+        handler(payload);
+      }
+    },
+    isReady() {
+      return ready;
+    },
+    async login() {
+      ready = true;
+      client.emit("ready");
+      return "token";
+    },
+    async destroy() {
+      ready = false;
+    },
+    __channels: channels,
+    __commandSets: commandSets,
   };
 
-  const seen = [];
-  const adapter = new DiscordAdapter({
-    token: "token",
-    allowedChannels: ["123"],
-    pollIntervalMs: 10,
-    logger: { warn() {}, error() {}, info() {}, debug() {} },
-  });
-  adapter.registerInboundHandler((context) => seen.push(context));
+  return client;
+}
 
-  try {
-    await adapter.start();
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    await adapter.stop();
-  } finally {
-    global.fetch = originalFetch;
+function createFakeChannel({ id, parentId = null, isDm = false } = {}) {
+  const sent = [];
+  const storedMessages = new Map();
+  let nextMessageId = 1;
+
+  function createStoredMessage(messageId, payload = {}) {
+    const record = {
+      id: String(messageId),
+      channelId: String(id),
+      content: String(payload.content || ""),
+      embeds: payload.embeds || [],
+      components: payload.components || [],
+      reply: payload.reply || null,
+      async edit(nextPayload = {}) {
+        if (Object.prototype.hasOwnProperty.call(nextPayload, "content")) {
+          record.content = String(nextPayload.content || "");
+        }
+        if (Array.isArray(nextPayload.embeds)) {
+          record.embeds = nextPayload.embeds;
+        }
+        if (Array.isArray(nextPayload.components)) {
+          record.components = nextPayload.components;
+        }
+        return record;
+      },
+    };
+    storedMessages.set(record.id, record);
+    return record;
   }
 
-  assert.equal(seen.length >= 1, true);
-  assert.equal(seen[0].channel, "discord");
+  return {
+    id: String(id),
+    parentId: parentId ? String(parentId) : null,
+    parent: parentId ? { id: String(parentId) } : null,
+    sent,
+    messages: {
+      async fetch(messageId) {
+        if (!storedMessages.has(String(messageId))) {
+          return createStoredMessage(messageId, {});
+        }
+        return storedMessages.get(String(messageId));
+      },
+    },
+    isDMBased() {
+      return isDm;
+    },
+    async send(payload = {}) {
+      const message = createStoredMessage(`msg-${nextMessageId++}`, payload);
+      sent.push(message);
+      return message;
+    },
+  };
+}
+
+function createMessage({ id, content, channel, authorId = "user-1", userName = "tester", bot = false, replyToMessageId = "" } = {}) {
+  return {
+    id: String(id || "m-1"),
+    content: String(content || ""),
+    channel,
+    guild: channel.isDMBased() ? null : { id: "guild-1" },
+    author: {
+      id: String(authorId),
+      username: userName,
+      bot,
+    },
+    reference: replyToMessageId ? { messageId: String(replyToMessageId) } : null,
+  };
+}
+
+function createOptions({ subcommand = "", values = {} } = {}) {
+  return {
+    getSubcommand() {
+      return subcommand;
+    },
+    getString(name) {
+      return values[name] ?? null;
+    },
+    getInteger(name) {
+      return values[name] ?? null;
+    },
+    getBoolean(name) {
+      return values[name] ?? null;
+    },
+  };
+}
+
+function createSlashInteraction({ commandName, options, channel, userId = "user-1", userName = "tester" } = {}) {
+  const replies = [];
+  return {
+    id: "interaction-1",
+    commandName,
+    options,
+    channel,
+    channelId: channel.id,
+    guild: channel.isDMBased() ? null : { id: "guild-1" },
+    user: { id: userId, username: userName, displayName: userName },
+    replied: false,
+    responded: false,
+    deferred: false,
+    replies,
+    isChatInputCommand() {
+      return true;
+    },
+    isButton() {
+      return false;
+    },
+    isStringSelectMenu() {
+      return false;
+    },
+    async reply(payload = {}) {
+      this.replied = true;
+      this.responded = true;
+      replies.push(payload);
+      return {
+        id: "reply-1",
+        channelId: channel.id,
+      };
+    },
+    async editReply(payload = {}) {
+      replies.push(payload);
+      return {
+        id: "reply-1",
+        channelId: channel.id,
+      };
+    },
+    async followUp(payload = {}) {
+      replies.push(payload);
+      return payload;
+    },
+  };
+}
+
+function createComponentInteraction({
+  kind = "button",
+  customId,
+  values = [],
+  channel,
+  message,
+  userId = "user-1",
+  userName = "tester",
+} = {}) {
+  const replies = [];
+  const updates = [];
+  let deferred = false;
+  return {
+    id: "component-1",
+    customId,
+    values,
+    channel,
+    channelId: channel.id,
+    guild: channel.isDMBased() ? null : { id: "guild-1" },
+    message,
+    user: { id: userId, username: userName, displayName: userName },
+    replied: false,
+    deferred: false,
+    replies,
+    updates,
+    isChatInputCommand() {
+      return false;
+    },
+    isButton() {
+      return kind === "button";
+    },
+    isStringSelectMenu() {
+      return kind === "select";
+    },
+    async reply(payload = {}) {
+      this.replied = true;
+      replies.push(payload);
+      return payload;
+    },
+    async followUp(payload = {}) {
+      replies.push(payload);
+      return payload;
+    },
+    async update(payload = {}) {
+      updates.push(payload);
+      if (Object.prototype.hasOwnProperty.call(payload, "content")) {
+        message.content = String(payload.content || "");
+      }
+      if (Array.isArray(payload.embeds)) {
+        message.embeds = payload.embeds;
+      }
+      if (Array.isArray(payload.components)) {
+        message.components = payload.components;
+      }
+      return message;
+    },
+    async deferUpdate() {
+      deferred = true;
+      this.deferred = true;
+    },
+    get __deferred() {
+      return deferred;
+    },
+  };
+}
+
+function createAdapter({ client, authorizeInteraction = null, allowedChannels = ["123"], dmUserIds = ["user-1"] } = {}) {
+  return new DiscordAdapter({
+    token: "token",
+    client,
+    allowedChannels,
+    dmUserIds,
+    authorizeInteraction,
+    minSendIntervalMs: 0,
+    logger: { warn() {}, error() {}, info() {}, debug() {} },
+  });
+}
+
+test("discord adapter handles allowed channel messages through gateway events", async () => {
+  const client = createFakeClient();
+  const channel = createFakeChannel({ id: "123" });
+  client.__channels.set("123", channel);
+  const adapter = createAdapter({ client, allowedChannels: ["123"], dmUserIds: ["user-1"] });
+  const seen = [];
+  adapter.registerInboundHandler((context) => seen.push(context));
+
+  await adapter.start();
+  client.emit("messageCreate", createMessage({
+    id: "m-2",
+    content: "/status",
+    channel,
+    replyToMessageId: "m-1",
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await adapter.stop();
+
+  assert.equal(seen.length, 1);
   assert.equal(seen[0].chatId, "123");
   assert.equal(seen[0].text, "/status");
-  assert.equal(seen[0].messageId, "2");
-  assert.equal(seen[0].replyToMessageId, "1");
-  assert.equal(seen[0].threadId, "123");
-  assert.equal(seen.some((item) => item.text === "/old"), false);
-  assert.equal(calls.some((url) => url.includes("/channels/123/messages")), true);
+  assert.equal(seen[0].replyToMessageId, "m-1");
 });
 
-test("discord adapter resolves allowlisted DM channels and polls them", async () => {
-  const originalFetch = global.fetch;
-  const calls = [];
-  let dmPollCount = 0;
-
-  global.fetch = async (url, options = {}) => {
-    const method = String(options.method || "GET");
-    let body = null;
-    if (typeof options.body === "string" && options.body) {
-      body = JSON.parse(options.body);
-    }
-    calls.push({ url: String(url), method, body });
-
-    if (String(url).includes("/users/@me/channels") && method === "POST") {
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({ id: "dm-1", type: 1 }),
-        text: async () => "",
-      };
-    }
-
-    return {
-      ok: true,
-      status: 200,
-      json: async () => {
-        dmPollCount += 1;
-        if (dmPollCount === 1) {
-          return [
-            {
-              id: "4",
-              content: "/old",
-              channel_id: "dm-1",
-              author: { id: "u-7", username: "dm-user", bot: false },
-            },
-          ];
-        }
-        return [
-          {
-            id: "5",
-            content: "/status",
-            channel_id: "dm-1",
-            author: { id: "u-7", username: "dm-user", bot: false },
-          },
-          {
-            id: "4",
-            content: "/old",
-            channel_id: "dm-1",
-            author: { id: "u-7", username: "dm-user", bot: false },
-          },
-        ];
-      },
-      text: async () => "",
-    };
-  };
-
+test("discord adapter handles allowlisted DM messages", async () => {
+  const client = createFakeClient();
+  const dm = createFakeChannel({ id: "dm-1", isDm: true });
+  client.__channels.set("dm-1", dm);
+  const adapter = createAdapter({ client, allowedChannels: [], dmUserIds: ["user-7"] });
   const seen = [];
-  const adapter = new DiscordAdapter({
-    token: "token",
-    dmUserIds: ["u-7"],
-    pollIntervalMs: 10,
-    logger: { warn() {}, error() {}, info() {}, debug() {} },
-  });
   adapter.registerInboundHandler((context) => seen.push(context));
 
-  try {
-    await adapter.start();
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    await adapter.stop();
-  } finally {
-    global.fetch = originalFetch;
-  }
+  await adapter.start();
+  client.emit("messageCreate", createMessage({
+    id: "dm-msg-1",
+    content: "/status",
+    channel: dm,
+    authorId: "user-7",
+    userName: "dm-user",
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await adapter.stop();
 
-  assert.equal(calls.some((call) => call.method === "POST" && call.url.includes("/users/@me/channels")), true);
-  assert.equal(calls.some((call) => call.method === "GET" && call.url.includes("/channels/dm-1/messages")), true);
-  assert.equal(seen.length >= 1, true);
+  assert.equal(seen.length, 1);
   assert.equal(seen[0].chatId, "dm-1");
-  assert.equal(seen[0].userId, "u-7");
-  assert.equal(seen[0].threadId, "dm-1");
-  assert.equal(seen.some((item) => item.text === "/old"), false);
+  assert.equal(seen[0].userId, "user-7");
 });
 
-test("discord adapter does not replay the latest message on startup", async () => {
-  const originalFetch = global.fetch;
-  let pollCount = 0;
-
-  global.fetch = async () => ({
-    ok: true,
-    status: 200,
-    json: async () => {
-      pollCount += 1;
-      return [
-        {
-          id: "10",
-          content: "/repeat-me",
-          channel_id: "123",
-          author: { id: "u-1", username: "tester", bot: false },
-        },
-      ];
-    },
-    text: async () => "",
-  });
-
+test("discord adapter ignores bot messages", async () => {
+  const client = createFakeClient();
+  const channel = createFakeChannel({ id: "123" });
+  client.__channels.set("123", channel);
+  const adapter = createAdapter({ client, allowedChannels: ["123"], dmUserIds: ["user-1"] });
   const seen = [];
-  const adapter = new DiscordAdapter({
-    token: "token",
-    allowedChannels: ["123"],
-    pollIntervalMs: 10,
-    logger: { warn() {}, error() {}, info() {}, debug() {} },
-  });
   adapter.registerInboundHandler((context) => seen.push(context));
 
-  try {
-    await adapter.start();
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    await adapter.stop();
-  } finally {
-    global.fetch = originalFetch;
-  }
+  await adapter.start();
+  client.emit("messageCreate", createMessage({ id: "m-2", content: "/status", channel, bot: true }));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await adapter.stop();
 
-  assert.equal(pollCount >= 2, true);
   assert.equal(seen.length, 0);
 });
 
-test("discord adapter restores saved cursor and only emits newer messages", async () => {
-  const originalFetch = global.fetch;
-  let pollCount = 0;
-  const saved = [];
+test("discord adapter sends message payload to channel via discord.js", async () => {
+  const client = createFakeClient();
+  const channel = createFakeChannel({ id: "123" });
+  client.__channels.set("123", channel);
+  const adapter = createAdapter({ client, allowedChannels: ["123"] });
 
-  global.fetch = async () => ({
-    ok: true,
-    status: 200,
-    json: async () => {
-      pollCount += 1;
-      return [
-        {
-          id: "11",
-          content: "/new",
-          channel_id: "123",
-          author: { id: "u-1", username: "tester", bot: false },
-        },
-        {
-          id: "10",
-          content: "/old",
-          channel_id: "123",
-          author: { id: "u-1", username: "tester", bot: false },
-        },
-      ];
-    },
-    text: async () => "",
-  });
+  const result = await adapter.sendMessage({ channel: "discord", chatId: "123" }, "hello world!");
 
-  const seen = [];
-  const adapter = new DiscordAdapter({
-    token: "token",
-    allowedChannels: ["123"],
-    loadCursor: async (chatId) => (chatId === "123" ? "10" : null),
-    saveCursor: async (chatId, cursor) => saved.push([chatId, cursor]),
-    pollIntervalMs: 10,
-    logger: { warn() {}, error() {}, info() {}, debug() {} },
-  });
-  adapter.registerInboundHandler((context) => seen.push(context));
-
-  try {
-    await adapter.start();
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    await adapter.stop();
-  } finally {
-    global.fetch = originalFetch;
-  }
-
-  assert.equal(pollCount >= 1, true);
-  assert.deepEqual(seen.map((item) => item.text), ["/new"]);
-  assert.equal(saved.some(([chatId, cursor]) => chatId === "123" && cursor === "11"), true);
-});
-
-test("discord adapter marks unknown channels as invalid", async () => {
-  const originalFetch = global.fetch;
-  let fetchCalls = 0;
-
-  global.fetch = async () => {
-    fetchCalls += 1;
-    return {
-      ok: false,
-      status: 404,
-      text: async () => JSON.stringify({ message: "Unknown Channel", code: 10003 }),
-    };
-  };
-
-  const adapter = new DiscordAdapter({
-    token: "token",
-    allowedChannels: ["999"],
-    pollIntervalMs: 10,
-    logger: { warn() {}, error() {}, info() {}, debug() {} },
-  });
-
-  try {
-    await adapter.start();
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    await adapter.stop();
-  } finally {
-    global.fetch = originalFetch;
-  }
-
-  assert.equal(fetchCalls >= 1, true);
-  assert.equal(adapter.invalidChannels.has("999"), true);
-});
-
-test("discord adapter sends message payload to channel endpoint", async () => {
-  const originalFetch = global.fetch;
-  const calls = [];
-
-  global.fetch = async (url, options = {}) => {
-    const method = String(options.method || "GET");
-    let body = null;
-    if (typeof options.body === "string" && options.body) {
-      body = JSON.parse(options.body);
-    }
-    calls.push({ url: String(url), method, body });
-
-    return {
-      ok: true,
-      status: 200,
-      json: async () => ({ id: "msg-1" }),
-      text: async () => "",
-    };
-  };
-
-  const adapter = new DiscordAdapter({
-    token: "token",
-    allowedChannels: ["123"],
-    minSendIntervalMs: 0,
-    logger: { warn() {}, error() {}, info() {}, debug() {} },
-  });
-  const context = { channel: "discord", chatId: "123", turnId: "turn-1" };
-
-  try {
-    await adapter.sendMessage(context, "hello world!");
-    await adapter.stop();
-  } finally {
-    global.fetch = originalFetch;
-  }
-
-  const postCalls = calls.filter((call) => call.method === "POST" && call.url.includes("/channels/123/messages"));
-  assert.equal(postCalls.length, 1);
-  assert.equal(postCalls[0].body?.content, "hello world!");
+  assert.equal(result.messageId, "msg-1");
+  assert.equal(channel.sent.length, 1);
+  assert.equal(channel.sent[0].content, "hello world!");
 });
 
 test("discord adapter sends reply-anchored rich message payload", async () => {
-  const originalFetch = global.fetch;
-  const calls = [];
+  const client = createFakeClient();
+  const thread = createFakeChannel({ id: "thread-1", parentId: "123" });
+  client.__channels.set("thread-1", thread);
+  const adapter = createAdapter({ client, allowedChannels: ["123"] });
 
-  global.fetch = async (url, options = {}) => {
-    const method = String(options.method || "GET");
-    let body = null;
-    if (typeof options.body === "string" && options.body) {
-      body = JSON.parse(options.body);
-    }
-    calls.push({ url: String(url), method, body });
+  const result = await adapter.sendMessageRich(
+    { channel: "discord", chatId: "123" },
+    { text: "hello", replyToMessageId: "42", threadId: "thread-1" }
+  );
 
-    return {
-      ok: true,
-      status: 200,
-      json: async () => ({ id: "msg-9", channel_id: "thread-1" }),
-      text: async () => "",
-    };
-  };
-
-  const adapter = new DiscordAdapter({
-    token: "token",
-    allowedChannels: ["123"],
-    minSendIntervalMs: 0,
-    logger: { warn() {}, error() {}, info() {}, debug() {} },
-  });
-
-  try {
-    const result = await adapter.sendMessageRich(
-      { channel: "discord", chatId: "123" },
-      { text: "hello", replyToMessageId: "42", threadId: "thread-1" }
-    );
-    assert.equal(result.messageId, "msg-9");
-    assert.equal(result.chatId, "thread-1");
-  } finally {
-    global.fetch = originalFetch;
-  }
-
-  const postCalls = calls.filter((call) => call.method === "POST");
-  assert.equal(postCalls.length, 1);
-  assert.equal(postCalls[0].url.includes("/channels/thread-1/messages"), true);
-  assert.equal(postCalls[0].body?.message_reference?.message_id, "42");
+  assert.equal(result.chatId, "thread-1");
+  assert.equal(thread.sent.length, 1);
+  assert.equal(thread.sent[0].reply?.messageReference, "42");
 });
 
 test("discord adapter edits an existing message", async () => {
-  const originalFetch = global.fetch;
-  const calls = [];
+  const client = createFakeClient();
+  const channel = createFakeChannel({ id: "123" });
+  client.__channels.set("123", channel);
+  const message = await channel.send({ content: "before" });
+  const adapter = createAdapter({ client, allowedChannels: ["123"] });
 
-  global.fetch = async (url, options = {}) => {
-    const method = String(options.method || "GET");
-    let body = null;
-    if (typeof options.body === "string" && options.body) {
-      body = JSON.parse(options.body);
-    }
-    calls.push({ url: String(url), method, body });
+  const result = await adapter.editMessage({ channel: "discord", chatId: "123" }, message.id, "updated");
 
-    return {
-      ok: true,
-      status: 200,
-      json: async () => ({ id: "msg-10", channel_id: "123" }),
-      text: async () => "",
-    };
-  };
-
-  const adapter = new DiscordAdapter({
-    token: "token",
-    allowedChannels: ["123"],
-    minSendIntervalMs: 0,
-    logger: { warn() {}, error() {}, info() {}, debug() {} },
-  });
-
-  try {
-    const result = await adapter.editMessage({ channel: "discord", chatId: "123" }, "msg-10", "updated");
-    assert.equal(result.messageId, "msg-10");
-    assert.equal(result.chatId, "123");
-  } finally {
-    global.fetch = originalFetch;
-  }
-
-  const patchCalls = calls.filter((call) => call.method === "PATCH");
-  assert.equal(patchCalls.length, 1);
-  assert.equal(patchCalls[0].url.includes("/channels/123/messages/msg-10"), true);
-  assert.equal(patchCalls[0].body?.content, "updated");
+  assert.equal(result.messageId, message.id);
+  assert.equal(message.content, "updated");
 });
 
-test("discord adapter truncates oversized messages", async () => {
-  const originalFetch = global.fetch;
-  const calls = [];
+test("discord adapter truncates oversized messages and skips empty outbound content", async () => {
+  const client = createFakeClient();
+  const channel = createFakeChannel({ id: "123" });
+  client.__channels.set("123", channel);
+  const adapter = createAdapter({ client, allowedChannels: ["123"] });
 
-  global.fetch = async (url, options = {}) => {
-    const method = String(options.method || "GET");
-    let body = null;
-    if (typeof options.body === "string" && options.body) {
-      body = JSON.parse(options.body);
-    }
-    calls.push({ url: String(url), method, body });
+  await adapter.sendMessage({ channel: "discord", chatId: "123" }, "x".repeat(2200));
+  await adapter.sendMessage({ channel: "discord", chatId: "123" }, "   ");
 
-    return {
-      ok: true,
-      status: 200,
-      json: async () => ({ id: "msg-2" }),
-      text: async () => "",
-    };
-  };
-
-  const adapter = new DiscordAdapter({
-    token: "token",
-    allowedChannels: ["123"],
-    minSendIntervalMs: 0,
-    logger: { warn() {}, error() {}, info() {}, debug() {} },
-  });
-  const context = { channel: "discord", chatId: "123", turnId: "turn-2" };
-  const oversized = "x".repeat(2200);
-
-  try {
-    await adapter.sendMessage(context, oversized);
-    await adapter.stop();
-  } finally {
-    global.fetch = originalFetch;
-  }
-
-  const postCalls = calls.filter((call) => call.method === "POST" && call.url.includes("/channels/123/messages"));
-  assert.equal(postCalls.length, 1);
-  assert.equal(postCalls[0].body?.content.includes("...[truncated]"), true);
-  assert.equal(postCalls[0].body?.content.length <= 1900, true);
-});
-
-test("discord adapter skips empty outbound content", async () => {
-  const originalFetch = global.fetch;
-  const calls = [];
-
-  global.fetch = async (url, options = {}) => {
-    const method = String(options.method || "GET");
-    let body = null;
-    if (typeof options.body === "string" && options.body) {
-      body = JSON.parse(options.body);
-    }
-    calls.push({ url: String(url), method, body });
-
-    return {
-      ok: true,
-      status: 200,
-      json: async () => ({ id: "msg-1" }),
-      text: async () => "",
-    };
-  };
-
-  const adapter = new DiscordAdapter({
-    token: "token",
-    allowedChannels: ["123"],
-    minSendIntervalMs: 0,
-    logger: { warn() {}, error() {}, info() {}, debug() {} },
-  });
-
-  try {
-    await adapter.sendMessage({ channel: "discord", chatId: "123" }, "   ");
-    await adapter.stop();
-  } finally {
-    global.fetch = originalFetch;
-  }
-
-  const postCalls = calls.filter((call) => call.method === "POST" && call.url.includes("/channels/123/messages"));
-  assert.equal(postCalls.length, 0);
+  assert.equal(channel.sent.length, 1);
+  assert.equal(channel.sent[0].content.includes("...[truncated]"), true);
+  assert.equal(channel.sent[0].content.length <= 1900, true);
 });
 
 test("discord adapter escapes ordered-list markers outside code fences", async () => {
-  const originalFetch = global.fetch;
-  const calls = [];
-
-  global.fetch = async (url, options = {}) => {
-    const method = String(options.method || "GET");
-    let body = null;
-    if (typeof options.body === "string" && options.body) {
-      body = JSON.parse(options.body);
-    }
-    calls.push({ url: String(url), method, body });
-    return {
-      ok: true,
-      status: 200,
-      json: async () => ({ id: "msg-3" }),
-      text: async () => "",
-    };
-  };
-
-  const adapter = new DiscordAdapter({
-    token: "token",
-    allowedChannels: ["123"],
-    minSendIntervalMs: 0,
-    logger: { warn() {}, error() {}, info() {}, debug() {} },
-  });
+  const client = createFakeClient();
+  const channel = createFakeChannel({ id: "123" });
+  client.__channels.set("123", channel);
+  const adapter = createAdapter({ client, allowedChannels: ["123"] });
   const text = [
     "1. Delivery",
     "2. Echo chat-only",
@@ -519,17 +412,307 @@ test("discord adapter escapes ordered-list markers outside code fences", async (
     "```",
   ].join("\n");
 
-  try {
-    await adapter.sendMessage({ channel: "discord", chatId: "123" }, text);
-    await adapter.stop();
-  } finally {
-    global.fetch = originalFetch;
-  }
+  await adapter.sendMessage({ channel: "discord", chatId: "123" }, text);
 
-  const postCalls = calls.filter((call) => call.method === "POST" && call.url.includes("/channels/123/messages"));
-  assert.equal(postCalls.length, 1);
-  const content = String(postCalls[0].body?.content || "");
-  assert.equal(content.includes("1\\. Delivery"), true);
-  assert.equal(content.includes("2\\. Echo chat-only"), true);
-  assert.equal(content.includes("1. keep inside fence"), true);
+  assert.equal(channel.sent.length, 1);
+  assert.equal(channel.sent[0].content.includes("1\\. Delivery"), true);
+  assert.equal(channel.sent[0].content.includes("2\\. Echo chat-only"), true);
+  assert.equal(channel.sent[0].content.includes("1. keep inside fence"), true);
+});
+
+test("discord adapter syncs native slash commands on startup and degrades on sync failure", async () => {
+  const client = createFakeClient();
+  const channel = createFakeChannel({ id: "123" });
+  client.__channels.set("123", channel);
+
+  const adapter = createAdapter({ client, allowedChannels: ["123"] });
+  await adapter.start();
+  await adapter.stop();
+  assert.equal(client.__commandSets.length, 1);
+  assert.equal(client.__commandSets[0].some((entry) => entry.name === "model"), true);
+
+  const failingClient = createFakeClient();
+  failingClient.__channels.set("123", channel);
+  let warned = false;
+  failingClient.application.commands.set = async () => {
+    throw new Error("sync failed");
+  };
+  const adapter2 = new DiscordAdapter({
+    token: "token",
+    client: failingClient,
+    allowedChannels: ["123"],
+    dmUserIds: ["user-1"],
+    minSendIntervalMs: 0,
+    logger: { warn() { warned = true; }, error() {}, info() {}, debug() {} },
+  });
+  await adapter2.start();
+  await adapter2.stop();
+  assert.equal(warned, true);
+});
+
+test("discord adapter normalizes native slash commands into canonical text commands", async () => {
+  const client = createFakeClient();
+  const channel = createFakeChannel({ id: "123" });
+  client.__channels.set("123", channel);
+  const adapter = createAdapter({
+    client,
+    allowedChannels: ["123"],
+    authorizeInteraction: async () => true,
+  });
+  const seen = [];
+  adapter.registerInboundHandler((context) => seen.push(context));
+
+  await adapter.start();
+  client.emit("interactionCreate", createSlashInteraction({
+    commandName: "model",
+    options: createOptions({ subcommand: "set", values: { value: "gpt-5.4" } }),
+    channel,
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await adapter.stop();
+
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].text, "/model set gpt-5.4");
+  assert.equal(seen[0].discordMeta.kind, "slash");
+});
+
+test("discord adapter uses interaction reply for the first slash-command response", async () => {
+  const client = createFakeClient();
+  const channel = createFakeChannel({ id: "123" });
+  client.__channels.set("123", channel);
+  const adapter = createAdapter({ client, allowedChannels: ["123"] });
+  const interaction = createSlashInteraction({
+    commandName: "status",
+    options: createOptions(),
+    channel,
+  });
+  const context = {
+    channel: "discord",
+    chatId: "123",
+    threadId: "123",
+    raw: interaction,
+    discordMeta: { kind: "slash", responded: false },
+  };
+
+  await adapter.sendMessageRich(context, { text: "Status sent." });
+  await adapter.sendMessageRich(context, { text: "Second response." });
+
+  assert.equal(interaction.replies.length, 1);
+  assert.equal(interaction.replies[0].content, "Status sent.");
+  assert.equal(channel.sent.length, 1);
+  assert.equal(channel.sent[0].content, "Second response.");
+});
+
+test("discord adapter renders approval buttons and emits canonical approval commands", async () => {
+  const client = createFakeClient();
+  const channel = createFakeChannel({ id: "123" });
+  client.__channels.set("123", channel);
+  const adapter = createAdapter({
+    client,
+    allowedChannels: ["123"],
+    authorizeInteraction: async () => true,
+  });
+  const seen = [];
+  adapter.registerInboundHandler((context) => seen.push(context));
+
+  try {
+    await adapter.sendApprovalPrompt(
+      { channel: "discord", chatId: "123", threadId: "123" },
+      {
+        localRequestId: "req-1",
+        kind: "item/commandExecution/requestApproval",
+        summary: "Run npm test",
+      }
+    );
+
+    assert.equal(channel.sent.length, 1);
+    const message = channel.sent[0];
+    const buttonId = message.components[0].components[0].custom_id;
+    const interaction = createComponentInteraction({
+      kind: "button",
+      customId: buttonId,
+      channel,
+      message,
+    });
+
+    client.emit("interactionCreate", interaction);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].text, "/approve req-1 allow");
+    assert.equal(interaction.updates.length, 1);
+    assert.equal(interaction.updates[0].components[0].components.every((entry) => entry.disabled), true);
+  } finally {
+    await adapter.stop();
+  }
+});
+
+test("discord adapter renders tool input selects and emits canonical answer commands", async () => {
+  const client = createFakeClient();
+  const channel = createFakeChannel({ id: "123" });
+  client.__channels.set("123", channel);
+  const adapter = createAdapter({
+    client,
+    allowedChannels: ["123"],
+    authorizeInteraction: async () => true,
+  });
+  const seen = [];
+  adapter.registerInboundHandler((context) => seen.push(context));
+
+  try {
+    await adapter.sendApprovalPrompt(
+      { channel: "discord", chatId: "123", threadId: "123" },
+      {
+        localRequestId: "req-input",
+        kind: "item/tool/requestUserInput",
+        summary: "Need selections",
+        questions: [
+          { id: "mode", question: "Choose mode", options: ["fast", "safe"] },
+          { id: "target", question: "Choose target", options: ["tests", "docs"] },
+        ],
+      }
+    );
+
+    const message = channel.sent[0];
+    const firstSelect = message.components[0].components[0].custom_id;
+    const secondSelect = message.components[1].components[0].custom_id;
+    const submitButton = message.components[2].components[0].custom_id;
+
+    client.emit("interactionCreate", createComponentInteraction({
+      kind: "select",
+      customId: firstSelect,
+      values: ["o1"],
+      channel,
+      message,
+    }));
+    client.emit("interactionCreate", createComponentInteraction({
+      kind: "select",
+      customId: secondSelect,
+      values: ["o0"],
+      channel,
+      message,
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const submit = createComponentInteraction({
+      kind: "button",
+      customId: submitButton,
+      channel,
+      message,
+    });
+    client.emit("interactionCreate", submit);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].text, "/answer req-input mode=safe;target=tests");
+    assert.equal(submit.updates.length, 1);
+  } finally {
+    await adapter.stop();
+  }
+});
+
+test("discord adapter renders generic command controls and maps select/button actions to text commands", async () => {
+  const client = createFakeClient();
+  const channel = createFakeChannel({ id: "123" });
+  client.__channels.set("123", channel);
+  const adapter = createAdapter({
+    client,
+    allowedChannels: ["123"],
+    authorizeInteraction: async () => true,
+  });
+  const seen = [];
+  adapter.registerInboundHandler((context) => seen.push(context));
+
+  try {
+    await adapter.sendMessageRich(
+      { channel: "discord", chatId: "123", threadId: "123" },
+      {
+        text: "Threads:\n1. Alpha",
+        nativeUi: {
+          kind: "threadList",
+          title: "Threads",
+          description: "Choose a thread",
+          components: {
+            selects: [{
+              placeholder: "Resume",
+              options: [{ label: "Alpha", description: "/repo", commandText: "/resume thread-1" }],
+            }],
+            buttons: [{ label: "Next Page", style: 1, commandText: "/thread more" }],
+          },
+        },
+      }
+    );
+
+    const message = channel.sent[0];
+    const buttonId = message.components[0].components[0].custom_id;
+    const selectId = message.components[1].components[0].custom_id;
+
+    client.emit("interactionCreate", createComponentInteraction({
+      kind: "select",
+      customId: selectId,
+      values: ["o0"],
+      channel,
+      message,
+    }));
+    client.emit("interactionCreate", createComponentInteraction({
+      kind: "button",
+      customId: buttonId,
+      channel,
+      message,
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    assert.deepEqual(seen.map((entry) => entry.text), ["/resume thread-1", "/thread more"]);
+  } finally {
+    await adapter.stop();
+  }
+});
+
+test("discord adapter rejects unauthorized slash and component interactions ephemerally", async () => {
+  const client = createFakeClient();
+  const channel = createFakeChannel({ id: "123" });
+  client.__channels.set("123", channel);
+  const adapter = createAdapter({
+    client,
+    allowedChannels: ["123"],
+    authorizeInteraction: async () => false,
+  });
+  const seen = [];
+  adapter.registerInboundHandler((context) => seen.push(context));
+
+  await adapter.start();
+  try {
+    const slash = createSlashInteraction({
+      commandName: "status",
+      options: createOptions(),
+      channel,
+    });
+    client.emit("interactionCreate", slash);
+
+    await adapter.sendApprovalPrompt(
+      { channel: "discord", chatId: "123", threadId: "123" },
+      {
+        localRequestId: "req-unauth",
+        kind: "item/commandExecution/requestApproval",
+        summary: "Run tests",
+      }
+    );
+    const message = channel.sent[0];
+    const buttonId = message.components[0].components[0].custom_id;
+    const component = createComponentInteraction({
+      kind: "button",
+      customId: buttonId,
+      channel,
+      message,
+    });
+    client.emit("interactionCreate", component);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    assert.equal(seen.length, 0);
+    assert.equal(slash.replies.length, 1);
+    assert.equal(component.replies.length, 1);
+    assert.equal(String(component.replies[0].content || "").includes("Unauthorized"), true);
+  } finally {
+    await adapter.stop();
+  }
 });
