@@ -962,7 +962,7 @@ export class DiscordAdapter extends BaseAdapter {
       return;
     }
     state.selections[question.key] = optionValue;
-    await this.#replyEphemeral(interaction, `Saved ${question.key} = ${optionValue}`);
+    await interaction.deferUpdate();
   }
 
   async #handleCommandControlsInteraction(interaction, context, state, controlId) {

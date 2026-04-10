@@ -578,20 +578,22 @@ test("discord adapter renders tool input selects and emits canonical answer comm
     const secondSelect = message.components[1].components[0].custom_id;
     const submitButton = message.components[2].components[0].custom_id;
 
-    client.emit("interactionCreate", createComponentInteraction({
+    const firstSelection = createComponentInteraction({
       kind: "select",
       customId: firstSelect,
       values: ["o1"],
       channel,
       message,
-    }));
-    client.emit("interactionCreate", createComponentInteraction({
+    });
+    const secondSelection = createComponentInteraction({
       kind: "select",
       customId: secondSelect,
       values: ["o0"],
       channel,
       message,
-    }));
+    });
+    client.emit("interactionCreate", firstSelection);
+    client.emit("interactionCreate", secondSelection);
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     const submit = createComponentInteraction({
@@ -605,6 +607,10 @@ test("discord adapter renders tool input selects and emits canonical answer comm
 
     assert.equal(seen.length, 1);
     assert.equal(seen[0].text, "/answer req-input mode=safe;target=tests");
+    assert.equal(firstSelection.__deferred, true);
+    assert.equal(secondSelection.__deferred, true);
+    assert.equal(firstSelection.replies.length, 0);
+    assert.equal(secondSelection.replies.length, 0);
     assert.equal(submit.updates.length, 1);
   } finally {
     await adapter.stop();
