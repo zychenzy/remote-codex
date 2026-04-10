@@ -7,6 +7,7 @@ import path from "node:path";
 const AUDIT_FLUSH_INTERVAL_MS = 250;
 const DELIVERY_DEDUPE_TTL_MS = 24 * 60 * 60 * 1000;
 const DELIVERY_DEDUPE_MAX_ENTRIES = 5_000;
+const CHANNEL_CURSOR_MAX_ENTRIES = 5_000;
 const AUTOPILOT_DEFAULT_COMMAND_ALLOW_PREFIXES = [
   "pwd",
   "ls",
@@ -87,6 +88,15 @@ function normalizeDeliveryMap(raw = {}, { nowMs, ttlMs, maxEntries } = {}) {
 
   const trimmed = entries.slice(-max);
   return Object.fromEntries(trimmed);
+}
+
+function normalizeCursorMap(raw = {}, { maxEntries = CHANNEL_CURSOR_MAX_ENTRIES } = {}) {
+  const source = raw && typeof raw === "object" ? raw : {};
+  const entries = Object.entries(source)
+    .map(([key, value]) => [String(key || "").trim(), String(value || "").trim()])
+    .filter(([key, value]) => key && value)
+    .slice(-maxEntries);
+  return Object.fromEntries(entries);
 }
 
 function normalizeThreadAutoApproveByThreadId(raw = {}, { maxEntries = 500 } = {}) {
@@ -183,11 +193,13 @@ export class StateStore {
     this.autopilotSessionsPath = path.join(this.dataDir, "autopilot-sessions.json");
     this.auditPath = path.join(this.dataDir, "audit.jsonl");
     this.deliveryDedupePath = path.join(this.dataDir, "delivery-dedupe.json");
+    this.channelCursorPath = path.join(this.dataDir, "channel-cursors.json");
     this.auditBuffer = [];
     this.auditInFlight = [];
     this.auditFlushTimer = null;
     this.auditFlushChain = Promise.resolve();
     this.deliveryDedupeCache = null;
+    this.channelCursorCache = null;
 
     ensureDir(this.baseDir);
     ensureDir(this.dataDir);
@@ -536,6 +548,38 @@ export class StateStore {
     } catch (error) {
       console.warn(`[state-store] failed to persist delivery dedupe key: ${error.message}`);
       return true;
+    }
+  }
+
+  getChannelCursor(channel, chatId) {
+    const key = keyOf(channel, chatId);
+    if (!this.channelCursorCache) {
+      this.channelCursorCache = normalizeCursorMap(readJson(this.channelCursorPath, {}));
+    }
+    return this.channelCursorCache[key] || null;
+  }
+
+  setChannelCursor(channel, chatId, cursor) {
+    const key = keyOf(channel, chatId);
+    const value = String(cursor || "").trim();
+    if (!key || !value) {
+      return null;
+    }
+
+    try {
+      if (!this.channelCursorCache) {
+        this.channelCursorCache = normalizeCursorMap(readJson(this.channelCursorPath, {}));
+      }
+      const next = normalizeCursorMap({
+        ...this.channelCursorCache,
+        [key]: value,
+      });
+      this.channelCursorCache = next;
+      writeJson(this.channelCursorPath, next, 0o600);
+      return value;
+    } catch (error) {
+      console.warn(`[state-store] failed to persist channel cursor: ${error.message}`);
+      return null;
     }
   }
 

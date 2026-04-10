@@ -310,3 +310,16 @@ test("markDeliveryOnce persists dedupe keys across store reload", () => {
   assert.equal(store2.markDeliveryOnce("delivery:key:1"), false);
   assert.equal(store2.markDeliveryOnce("delivery:key:2"), true);
 });
+
+test("channel cursors persist across store reload", () => {
+  const dir = tempDir();
+  const store1 = new StateStore({ baseDir: dir });
+  assert.equal(store1.setChannelCursor("discord", "chat-1", "10"), "10");
+
+  const store2 = new StateStore({ baseDir: dir });
+  assert.equal(store2.getChannelCursor("discord", "chat-1"), "10");
+  assert.equal(store2.setChannelCursor("discord", "chat-1", "11"), "11");
+
+  const store3 = new StateStore({ baseDir: dir });
+  assert.equal(store3.getChannelCursor("discord", "chat-1"), "11");
+});

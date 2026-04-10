@@ -197,6 +197,58 @@ test("discord adapter does not replay the latest message on startup", async () =
   assert.equal(seen.length, 0);
 });
 
+test("discord adapter restores saved cursor and only emits newer messages", async () => {
+  const originalFetch = global.fetch;
+  let pollCount = 0;
+  const saved = [];
+
+  global.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => {
+      pollCount += 1;
+      return [
+        {
+          id: "11",
+          content: "/new",
+          channel_id: "123",
+          author: { id: "u-1", username: "tester", bot: false },
+        },
+        {
+          id: "10",
+          content: "/old",
+          channel_id: "123",
+          author: { id: "u-1", username: "tester", bot: false },
+        },
+      ];
+    },
+    text: async () => "",
+  });
+
+  const seen = [];
+  const adapter = new DiscordAdapter({
+    token: "token",
+    allowedChannels: ["123"],
+    loadCursor: async (chatId) => (chatId === "123" ? "10" : null),
+    saveCursor: async (chatId, cursor) => saved.push([chatId, cursor]),
+    pollIntervalMs: 10,
+    logger: { warn() {}, error() {}, info() {}, debug() {} },
+  });
+  adapter.registerInboundHandler((context) => seen.push(context));
+
+  try {
+    await adapter.start();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await adapter.stop();
+  } finally {
+    global.fetch = originalFetch;
+  }
+
+  assert.equal(pollCount >= 1, true);
+  assert.deepEqual(seen.map((item) => item.text), ["/new"]);
+  assert.equal(saved.some(([chatId, cursor]) => chatId === "123" && cursor === "11"), true);
+});
+
 test("discord adapter marks unknown channels as invalid", async () => {
   const originalFetch = global.fetch;
   let fetchCalls = 0;

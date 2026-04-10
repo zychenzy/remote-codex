@@ -924,6 +924,8 @@ export class DaemonApp {
         token: channels.discord.botToken,
         allowedChannels: channels.discord.allowedChannels || [],
         dmUserIds: channels.discord.allowlist || [],
+        loadCursor: (chatId) => this.store.getChannelCursor("discord", chatId),
+        saveCursor: (chatId, cursor) => this.store.setChannelCursor("discord", chatId, cursor),
         logger: this.logger,
       });
       this.adapters.push(discord);
@@ -946,14 +948,18 @@ export class DaemonApp {
       if (!adapter) {
         continue;
       }
-      const context = this.#runtimeContext(binding.channel, binding.chatId, binding.threadId, null);
-      await this.#sendMessage(
-        adapter,
-        context,
-        binding.workingDir
-          ? `Restored thread context: ${binding.threadId}\nWorkspace set to: ${binding.workingDir}`
-          : `Restored thread context: ${binding.threadId}`
-      );
+      try {
+        const context = this.#runtimeContext(binding.channel, binding.chatId, null, null);
+        await this.#sendMessage(
+          adapter,
+          context,
+          binding.workingDir
+            ? `Restored thread context: ${binding.threadId}\nWorkspace set to: ${binding.workingDir}`
+            : `Restored thread context: ${binding.threadId}`
+        );
+      } catch (error) {
+        this.logger.warn(`failed to announce restored binding ${bindingKey(binding.channel, binding.chatId)}: ${error.message}`);
+      }
     }
   }
 

@@ -64,6 +64,8 @@ export class DiscordAdapter extends BaseAdapter {
     token,
     allowedChannels = [],
     dmUserIds = [],
+    loadCursor = null,
+    saveCursor = null,
     pollIntervalMs = 1800,
     minSendIntervalMs = 450,
     logger = console,
@@ -72,6 +74,8 @@ export class DiscordAdapter extends BaseAdapter {
     this.token = token;
     this.allowedChannels = allowedChannels;
     this.dmUserIds = dmUserIds;
+    this.loadCursor = loadCursor;
+    this.saveCursor = saveCursor;
     this.pollIntervalMs = pollIntervalMs;
     this.minSendIntervalMs = minSendIntervalMs;
     this.running = false;
@@ -102,7 +106,7 @@ export class DiscordAdapter extends BaseAdapter {
       return;
     }
 
-    await this.#primeStartupCursor();
+    await this.#restoreStartupCursors();
     this.running = true;
     await this.#pollLoop();
   }
@@ -209,6 +213,7 @@ export class DiscordAdapter extends BaseAdapter {
           }
 
           this.lastSeenByChannel.set(channelId, id);
+          await this.#persistCursor(channelId, id);
 
           if (msg.author?.bot) {
             continue;
@@ -253,18 +258,23 @@ export class DiscordAdapter extends BaseAdapter {
     }, this.pollIntervalMs);
   }
 
-  async #primeStartupCursor() {
+  async #restoreStartupCursors() {
     for (const channelId of this.pollChannelIds) {
       if (this.invalidChannels.has(channelId)) {
         continue;
       }
 
       try {
-        const messages = await this.#api(`/channels/${channelId}/messages?limit=1`);
-        const newest = Array.isArray(messages) ? messages[0] : null;
-        const id = String(newest?.id || "").trim();
-        if (id) {
-          this.lastSeenByChannel.set(channelId, id);
+        const persisted = await this.#readCursor(channelId);
+        if (persisted) {
+          this.lastSeenByChannel.set(channelId, persisted);
+          continue;
+        }
+
+        const bootstrap = await this.#bootstrapCursor(channelId);
+        if (bootstrap) {
+          this.lastSeenByChannel.set(channelId, bootstrap);
+          await this.#persistCursor(channelId, bootstrap);
         }
       } catch (error) {
         if (isUnknownChannelError(error)) {
@@ -275,9 +285,31 @@ export class DiscordAdapter extends BaseAdapter {
           );
           continue;
         }
-        this.logger.error(`[discord] failed to prime startup cursor for channel ${channelId}: ${error.message}`);
+        this.logger.error(`[discord] failed to restore startup cursor for channel ${channelId}: ${error.message}`);
       }
     }
+  }
+
+  async #readCursor(channelId) {
+    if (typeof this.loadCursor !== "function") {
+      return null;
+    }
+    const value = await this.loadCursor(channelId);
+    return String(value || "").trim() || null;
+  }
+
+  async #persistCursor(channelId, messageId) {
+    if (typeof this.saveCursor !== "function") {
+      return null;
+    }
+    return this.saveCursor(channelId, messageId);
+  }
+
+  async #bootstrapCursor(channelId) {
+    const messages = await this.#api(`/channels/${channelId}/messages?limit=1`);
+    const newest = Array.isArray(messages) ? messages[0] : null;
+    const id = String(newest?.id || "").trim();
+    return id || null;
   }
 
   async #refreshPollChannelIds() {
