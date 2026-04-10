@@ -6,12 +6,14 @@ export async function handleModelAndSkillsCommand({
   runtime,
   store,
   sendMessage,
+  sendRichMessage,
   parseArgsAndOptions,
   resolveWorkspacePath,
   toBoolean,
   toInt,
   modelListFromResponse,
   collaborationModesFromResponse,
+  buildDiscordModelPickerNativeUi,
   loadSkillsForCwd,
   touchSkillsContext,
   resolveSkillByName,
@@ -21,6 +23,27 @@ export async function handleModelAndSkillsCommand({
   if (command.type === "modelNs") {
     const { positional } = parseArgsAndOptions(command.args);
     if (command.action === "show") {
+      if (adapter?.channel === "discord" && typeof sendRichMessage === "function" && typeof buildDiscordModelPickerNativeUi === "function") {
+        const [modelsResponse, modesResponse] = await Promise.all([
+          runtime.listModels({ includeHidden: false, limit: 30 }),
+          runtime.listCollaborationModes().catch(() => ({ data: [] })),
+        ]);
+        await sendRichMessage(adapter, context, {
+          text: [
+            `Model: ${binding.policyProfile?.model || "runtime default"}`,
+            `Effort: ${binding.policyProfile?.reasoningEffort || "runtime default"}`,
+            `Mode: ${binding.policyProfile?.collaborationMode || "runtime default"}`,
+          ].join("\n"),
+          nativeUi: buildDiscordModelPickerNativeUi({
+            currentModel: binding.policyProfile?.model || "",
+            currentEffort: binding.policyProfile?.reasoningEffort || "",
+            currentMode: binding.policyProfile?.collaborationMode || "",
+            models: modelListFromResponse(modelsResponse),
+            modes: collaborationModesFromResponse(modesResponse),
+          }),
+        });
+        return true;
+      }
       await sendMessage(adapter, context, [
         `Model: ${binding.policyProfile?.model || "runtime default"}`,
         `Effort: ${binding.policyProfile?.reasoningEffort || "runtime default"}`,
@@ -29,7 +52,10 @@ export async function handleModelAndSkillsCommand({
       return true;
     }
     if (command.action === "list") {
-      const response = await runtime.listModels({ includeHidden: false, limit: 30 });
+      const [response, modesResponse] = await Promise.all([
+        runtime.listModels({ includeHidden: false, limit: 30 }),
+        runtime.listCollaborationModes().catch(() => ({ data: [] })),
+      ]);
       const models = modelListFromResponse(response);
       if (!models.length) {
         await sendMessage(adapter, context, "No models returned by runtime.");
@@ -43,6 +69,19 @@ export async function handleModelAndSkillsCommand({
         const hidden = Boolean(item.hidden ?? item.isHidden);
         return `${item.model || item.id}${item.isDefault ? " (default)" : ""}${hidden ? " (hidden)" : ""}${efforts ? ` | efforts:${efforts}` : ""}`;
       });
+      if (adapter?.channel === "discord" && typeof sendRichMessage === "function" && typeof buildDiscordModelPickerNativeUi === "function") {
+        await sendRichMessage(adapter, context, {
+          text: `Models:\n${lines.join("\n")}`,
+          nativeUi: buildDiscordModelPickerNativeUi({
+            currentModel: binding.policyProfile?.model || "",
+            currentEffort: binding.policyProfile?.reasoningEffort || "",
+            currentMode: binding.policyProfile?.collaborationMode || "",
+            models,
+            modes: collaborationModesFromResponse(modesResponse),
+          }),
+        });
+        return true;
+      }
       await sendMessage(adapter, context, `Models:\n${lines.join("\n")}`);
       return true;
     }
@@ -202,6 +241,23 @@ export async function handleModelAndSkillsCommand({
   if (command.type === "model") {
     const nextModelRaw = String(command.value || "").trim();
     if (!nextModelRaw) {
+      if (adapter?.channel === "discord" && typeof sendRichMessage === "function" && typeof buildDiscordModelPickerNativeUi === "function") {
+        const [modelsResponse, modesResponse] = await Promise.all([
+          runtime.listModels({ includeHidden: false, limit: 30 }),
+          runtime.listCollaborationModes().catch(() => ({ data: [] })),
+        ]);
+        await sendRichMessage(adapter, context, {
+          text: `Model: ${binding.policyProfile?.model || "runtime default"}`,
+          nativeUi: buildDiscordModelPickerNativeUi({
+            currentModel: binding.policyProfile?.model || "",
+            currentEffort: binding.policyProfile?.reasoningEffort || "",
+            currentMode: binding.policyProfile?.collaborationMode || "",
+            models: modelListFromResponse(modelsResponse),
+            modes: collaborationModesFromResponse(modesResponse),
+          }),
+        });
+        return true;
+      }
       await sendMessage(adapter, context, `Model: ${binding.policyProfile?.model || "runtime default"}`);
       return true;
     }
@@ -220,4 +276,3 @@ export async function handleModelAndSkillsCommand({
 
   return false;
 }
-

@@ -332,6 +332,106 @@ function skillsEntriesFromResponse(response) {
   return [];
 }
 
+function buildDiscordThreadListNativeUi({ threads = [], nextCursor = null } = {}) {
+  return {
+    kind: "threadList",
+    title: "Threads",
+    description: "Choose a thread to resume. Use typed commands for read/archive/fork controls.",
+    components: {
+      selects: threads.length ? [{
+        placeholder: "Resume a thread",
+        options: threads.slice(0, 25).map((thread, index) => ({
+          label: `${index + 1}. ${thread.title || "Untitled"}`.slice(0, 100),
+          description: `${thread.cwd || "unknown"}${thread.current ? " | current" : ""}`.slice(0, 100),
+          commandText: `/resume ${thread.threadId}`,
+        })),
+      }] : [],
+      buttons: [
+        ...(nextCursor ? [{ label: "Next Page", style: 1, commandText: "/thread more" }] : []),
+      ],
+    },
+  };
+}
+
+function buildDiscordModelPickerNativeUi({
+  currentModel = "",
+  currentEffort = "",
+  currentMode = "",
+  models = [],
+  modes = [],
+} = {}) {
+  const normalizedModels = models
+    .map((item) => {
+      const id = String(item?.model || item?.id || "").trim();
+      if (!id) {
+        return null;
+      }
+      const efforts = (item?.supportedReasoningEfforts || [])
+        .map((entry) => (typeof entry === "string" ? entry : entry?.reasoningEffort))
+        .filter(Boolean)
+        .join(",");
+      return {
+        id,
+        description: `${item?.isDefault ? "default | " : ""}${efforts ? `efforts:${efforts}` : "model"}`.slice(0, 100),
+      };
+    })
+    .filter(Boolean)
+    .slice(0, 25);
+  const normalizedModes = modes
+    .map((item) => String(item?.mode || item?.name || "").trim())
+    .filter(Boolean)
+    .slice(0, 25);
+
+  return {
+    kind: "modelPicker",
+    title: "Model Controls",
+    description: [
+      `Current model: ${currentModel || "runtime default"}`,
+      `Current effort: ${currentEffort || "runtime default"}`,
+      `Current mode: ${currentMode || "runtime default"}`,
+    ].join("\n"),
+    components: {
+      selects: [
+        ...(normalizedModels.length ? [{
+          placeholder: "Set model",
+          options: normalizedModels.map((item) => ({
+            label: item.id,
+            description: item.description,
+            commandText: `/model set ${item.id}`,
+            defaultValue: item.id === currentModel,
+          })),
+        }] : []),
+        {
+          placeholder: "Set reasoning effort",
+          options: [
+            { label: "runtime default", description: "Reset sticky effort", commandText: "/model effort set default", defaultValue: !currentEffort },
+            { label: "low", description: "Low reasoning effort", commandText: "/model effort set low", defaultValue: currentEffort === "low" },
+            { label: "medium", description: "Medium reasoning effort", commandText: "/model effort set medium", defaultValue: currentEffort === "medium" },
+            { label: "high", description: "High reasoning effort", commandText: "/model effort set high", defaultValue: currentEffort === "high" },
+            { label: "xhigh", description: "Extra high reasoning effort", commandText: "/model effort set xhigh", defaultValue: currentEffort === "xhigh" },
+          ],
+        },
+        {
+          placeholder: "Set collaboration mode",
+          options: [
+            { label: "default", description: "Use runtime default mode", commandText: "/model mode set default", defaultValue: !currentMode || currentMode === "default" },
+            ...normalizedModes.map((mode) => ({
+              label: mode,
+              description: "Available collaboration mode",
+              commandText: `/model mode set ${mode}`,
+              defaultValue: currentMode === mode,
+            })),
+          ].slice(0, 25),
+        },
+      ],
+      buttons: [
+        { label: "Show Profile", style: 2, commandText: "/model show" },
+        { label: "Refresh Models", style: 2, commandText: "/model list" },
+      ],
+    },
+  };
+}
+
 function formatRuntimeError(error) {
   const message = String(error?.message || "unknown error");
   const lower = message.toLowerCase();
@@ -926,6 +1026,7 @@ export class DaemonApp {
         dmUserIds: channels.discord.allowlist || [],
         loadCursor: (chatId) => this.store.getChannelCursor("discord", chatId),
         saveCursor: (chatId, cursor) => this.store.setChannelCursor("discord", chatId, cursor),
+        authorizeInteraction: (context) => this.#isAuthorizedInteractiveContext(context),
         logger: this.logger,
       });
       this.adapters.push(discord);
@@ -1014,6 +1115,15 @@ export class DaemonApp {
       return false;
     }
     return allowlist.includes(String(context.userId));
+  }
+
+  #isAuthorizedInteractiveContext(context) {
+    const existing = this.store.getBinding(context.channel, context.chatId);
+    if (existing) {
+      return this.#isAuthorized(existing, context);
+    }
+    const allowlist = this.#channelAllowlist(context.channel) || [];
+    return allowlist.includes(String(context.userId || ""));
   }
 
   #getAdapter(channel) {
@@ -1247,6 +1357,19 @@ export class DaemonApp {
     return this.#sendAdapterMessage(adapter, context, { text: String(text || "") });
   }
 
+  async #sendRichMessage(adapter, context, payload = {}) {
+    this.#appendChatHistory({
+      direction: "outbound",
+      type: "message",
+      channel: context.channel,
+      chatId: String(context.chatId),
+      userId: context.userId ? String(context.userId) : null,
+      turnId: context.turnId || null,
+      text: String(payload?.text || ""),
+    });
+    return this.#sendAdapterMessage(adapter, context, payload);
+  }
+
   async #sendMessageRaw(adapter, context, text) {
     return this.#sendAdapterMessage(adapter, context, { text: String(text || "") });
   }
@@ -1341,6 +1464,9 @@ export class DaemonApp {
         if (inboundContext.messageId || inboundContext.replyToMessageId) {
           existing.presentationEnabled = true;
         }
+        if (inboundContext.discordMeta?.kind === "slash" && !inboundContext.discordMeta?.responded) {
+          existing.interactionMeta = inboundContext.discordMeta;
+        }
       }
       return existing;
     }
@@ -1356,6 +1482,7 @@ export class DaemonApp {
         inboundContext
         && (inboundContext.messageId || inboundContext.replyToMessageId)
       ),
+      interactionMeta: inboundContext?.discordMeta?.kind === "slash" ? inboundContext.discordMeta : null,
       liveMessageId: "",
       liveMessageChatId: "",
       liveSegmentKind: "",
@@ -1406,6 +1533,9 @@ export class DaemonApp {
       context.replyToMessageId = state.replyToMessageId || null;
       if (state.threadIdHint) {
         context.threadId = state.threadIdHint;
+      }
+      if (state.interactionMeta && !state.interactionMeta.responded) {
+        context.discordMeta = state.interactionMeta;
       }
     }
     return context;
@@ -3090,17 +3220,33 @@ export class DaemonApp {
           const cwd = extractThreadCwd(thread) || "unknown";
           return `${index + 1}. ${title}\t\t${cwd}\t\t${id}${marker}`;
         });
-        await this.#sendMessage(
-          adapter,
-          context,
-          [
-            "Threads:",
-            entries.join("\n"),
-            "",
-            nextCursor ? "Use /thread more for next page." : "No more pages.",
-            "Use /resume <threadId> to switch.",
-          ].join("\n")
-        );
+        const threadListText = [
+          "Threads:",
+          entries.join("\n"),
+          "",
+          nextCursor ? "Use /thread more for next page." : "No more pages.",
+          "Use /resume <threadId> to switch.",
+          "Use typed /thread read|archive|fork commands for additional thread actions.",
+        ].join("\n");
+        if (adapter.channel === "discord") {
+          await this.#sendRichMessage(adapter, context, {
+            text: threadListText,
+            nativeUi: buildDiscordThreadListNativeUi({
+              threads: threads.map((thread) => {
+                const id = extractThreadId(thread) || "";
+                return {
+                  threadId: id,
+                  title: threadDisplayTitle(thread),
+                  cwd: extractThreadCwd(thread) || "unknown",
+                  current: Boolean(binding.threadId && id === binding.threadId),
+                };
+              }),
+              nextCursor,
+            }),
+          });
+          return;
+        }
+        await this.#sendMessage(adapter, context, threadListText);
         return;
       }
 
@@ -3261,12 +3407,14 @@ export class DaemonApp {
       runtime: this.runtime,
       store: this.store,
       sendMessage: (targetAdapter, targetContext, message) => this.#sendMessage(targetAdapter, targetContext, message),
+      sendRichMessage: (targetAdapter, targetContext, payload) => this.#sendRichMessage(targetAdapter, targetContext, payload),
       parseArgsAndOptions,
       resolveWorkspacePath,
       toBoolean,
       toInt,
       modelListFromResponse,
       collaborationModesFromResponse,
+      buildDiscordModelPickerNativeUi,
       loadSkillsForCwd: (cwd, options) => this.#loadSkillsForCwd(cwd, options),
       touchSkillsContext: (targetBinding, cwd, skills) => this.#touchSkillsContext(targetBinding, cwd, skills),
       resolveSkillByName: (targetBinding, cwd, name, options) => this.#resolveSkillByName(targetBinding, cwd, name, options),
