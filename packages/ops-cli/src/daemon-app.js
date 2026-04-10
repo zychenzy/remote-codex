@@ -16,6 +16,8 @@ import { commandManual } from "./help-manual.js";
 import { createLogger } from "./logger.js";
 import { handleModelAndSkillsCommand } from "./model-skills-handler.js";
 import { reconcileRuntimeState } from "./runtime-state-reconciler.js";
+import { formatAutopilotAction, formatAutopilotPause, formatAutopilotStatus } from "./autopilot-format.js";
+import { AutopilotSupervisor } from "./autopilot-supervisor.js";
 import {
   normalizeToolProgressMode,
   summarizePlanUpdate,
@@ -358,6 +360,10 @@ function riskyThreadActionRequiresConfirm(approvalMode) {
   return approvalMode !== "never";
 }
 
+function autopilotConfigForBinding(binding) {
+  return binding?.policyProfile?.autopilot || {};
+}
+
 function extractSkillNameFromPrompt(prompt = "") {
   const match = String(prompt || "").match(/\$([a-zA-Z0-9_-]+)/);
   return match ? match[1] : "";
@@ -694,6 +700,7 @@ export class DaemonApp {
     });
 
     this.approvalBroker = new ApprovalBroker({ timeoutMs: 5 * 60 * 1000 });
+    this.autopilotSupervisor = null;
     this.adapters = [];
 
     this.threadToBinding = new Map();
@@ -714,6 +721,7 @@ export class DaemonApp {
 
   async start() {
     this.running = true;
+    this.#ensureAutopilotSupervisor();
 
     this.#wireRuntimeEvents();
     this.#wireApprovalBroker();
@@ -731,6 +739,7 @@ export class DaemonApp {
   async stop() {
     this.running = false;
     this.approvalBroker.clearAll();
+    this.autopilotSupervisor = null;
     this.#resetEphemeralTurnState();
 
     for (const adapter of this.adapters) {
@@ -822,14 +831,88 @@ export class DaemonApp {
       );
       const adapter = this.#getAdapter(record.binding.channel);
       if (adapter) {
-        const text = resolution.timeout
+        let text = resolution.timeout
           ? `Approval timed out (${resolution.localRequestId}); defaulted to deny.`
           : `Approval ${resolution.decision === "allow" ? "granted" : "denied"} (${resolution.localRequestId}).`;
+        if (!resolution.timeout && resolution.actor === "autopilot") {
+          if (record.method === "item/tool/requestUserInput" && resolution.decision === "allow") {
+            text = `Autopilot answered tool input (${resolution.localRequestId}).`;
+          } else {
+            text = `Autopilot ${resolution.decision === "allow" ? "approved" : "denied"} ${record.method} (${resolution.localRequestId}).`;
+          }
+        }
         await this.#sendMessage(adapter, context, text);
       }
 
       this.store.deletePendingApproval(resolution.localRequestId);
     });
+  }
+
+  #ensureAutopilotSupervisor() {
+    this.autopilotSupervisor = new AutopilotSupervisor({
+      store: this.store,
+      approvalBroker: this.approvalBroker,
+      logger: this.logger,
+      startFollowupTurn: (binding, prompt) => this.#startAutopilotFollowupTurn(binding, prompt),
+    });
+  }
+
+  async #startAutopilotFollowupTurn(binding, prompt) {
+    const adapter = this.#getAdapter(binding.channel);
+    if (!adapter) {
+      throw new Error(`No adapter available for ${binding.channel}`);
+    }
+    const bKey = bindingKey(binding.channel, binding.chatId);
+    const context = this.#contextFromBinding(binding);
+    const started = await this.#startTurnWithRecovery(
+      adapter,
+      context,
+      binding,
+      bKey,
+      prompt,
+      {}
+    );
+    if (!started) {
+      throw new Error("Failed to start autopilot follow-up turn");
+    }
+    const { threadId, turnResponse } = started;
+    const turnId = turnIdFromResponse(turnResponse);
+    if (turnId) {
+      this.turnToBinding.set(turnId, bKey);
+      this.activeTurnByBinding.set(bKey, turnId);
+      if (adapter.channel === "discord") {
+        const state = this.#ensureDiscordTurnState({
+          bindingKeyValue: bKey,
+          threadId,
+          turnId,
+          inboundContext: context,
+        });
+        if (state && this.outputPolicy.discord.useLiveEdits) {
+          await this.#openDiscordLiveSegment(
+            adapter,
+            this.#runtimeContext(binding.channel, binding.chatId, threadId, turnId),
+            state,
+            "Autopilot continuing...",
+            "status"
+          );
+        }
+      }
+    }
+    this.store.appendAudit({
+      type: "turn_started_autopilot",
+      channel: binding.channel,
+      chatId: binding.chatId,
+      threadId,
+      turnId,
+    });
+    if (adapter) {
+      await this.#sendMessage(
+        adapter,
+        context,
+        `Autopilot started a follow-up turn${turnId ? ` (${turnId})` : ""}.`
+      );
+    }
+    return { threadId, turnId };
   }
 
   async #startAdapters() {
@@ -839,6 +922,7 @@ export class DaemonApp {
       const discord = new DiscordAdapter({
         token: channels.discord.botToken,
         allowedChannels: channels.discord.allowedChannels || [],
+        dmUserIds: channels.discord.allowlist || [],
         logger: this.logger,
       });
       this.adapters.push(discord);
@@ -975,6 +1059,54 @@ export class DaemonApp {
         threadAutoApproveByThreadId: nextMap,
       },
     });
+  }
+
+  #claimThreadForBinding(binding, threadId, { workingDir } = {}) {
+    if (!binding) {
+      return null;
+    }
+
+    const id = String(threadId || "").trim();
+    if (!id) {
+      return binding;
+    }
+
+    const targetKey = bindingKey(binding.channel, binding.chatId);
+    const previousThreadId = String(binding.threadId || "").trim();
+    if (previousThreadId && previousThreadId !== id && this.threadToBinding.get(previousThreadId) === targetKey) {
+      this.threadToBinding.delete(previousThreadId);
+    }
+
+    for (const existing of this.store.listBindings()) {
+      const existingKey = bindingKey(existing.channel, existing.chatId);
+      if (existingKey === targetKey) {
+        continue;
+      }
+      if (String(existing.threadId || "").trim() !== id) {
+        continue;
+      }
+
+      this.store.upsertBinding({
+        ...existing,
+        threadId: null,
+      });
+      this.activeTurnByBinding.delete(existingKey);
+      this.#turnOutputClearByBinding(existingKey);
+      this.#discordTurnStateClearByBinding(existingKey);
+      for (const [turnId, mappedKey] of this.turnToBinding.entries()) {
+        if (mappedKey === existingKey) {
+          this.turnToBinding.delete(turnId);
+        }
+      }
+    }
+
+    this.threadToBinding.set(id, targetKey);
+    const updated = this.store.upsertBinding({
+      ...binding,
+      threadId: id,
+      ...(workingDir ? { workingDir } : {}),
+    });
+    return updated;
   }
 
   #findPendingToolInputRequest(binding, { requestId = "", preferredThreadId = "" } = {}) {
@@ -1505,8 +1637,8 @@ export class DaemonApp {
     });
     const threadId = threadIdFromResponse(response);
     if (threadId) {
-      this.threadToBinding.set(threadId, bKey);
-      this.store.setBindingThread(binding.channel, binding.chatId, threadId);
+      const updated = this.#claimThreadForBinding(binding, threadId);
+      Object.assign(binding, updated);
     }
     return threadId;
   }
@@ -1731,14 +1863,11 @@ export class DaemonApp {
       isThreadNotFoundError,
       onRecovered: async ({ threadId: recoveredThreadId, resumeResponse }) => {
         this.logger.warn(`thread not found on turn/start for ${bKey}: ${recoveredThreadId}; attempting resume`);
-        this.threadToBinding.set(recoveredThreadId, bKey);
         let resumedCwd = extractThreadCwd(resumeResponse);
         if (!resumedCwd) {
           resumedCwd = await this.#resolveThreadCwd(recoveredThreadId);
         }
-        const updated = this.store.upsertBinding({
-          ...binding,
-          threadId: recoveredThreadId,
+        const updated = this.#claimThreadForBinding(binding, recoveredThreadId, {
           ...(resumedCwd ? { workingDir: resumedCwd } : {}),
         });
         Object.assign(binding, updated);
@@ -1963,6 +2092,9 @@ export class DaemonApp {
         threadId,
         turnId,
       });
+      const [channel, chatId] = bKey.split(":");
+      const binding = this.store.getBinding(channel, chatId);
+      this.autopilotSupervisor?.onTurnStarted({ threadId, turnId }, binding);
     }
   }
 
@@ -2284,6 +2416,7 @@ export class DaemonApp {
     const threadId = detectThreadId(params);
     const turnId = detectTurnId(params);
     const cacheKey = cacheKeyFromIds(threadId, turnId);
+    const hadTurnDiff = Boolean(cacheKey && String(this.latestTurnDiffByKey.get(cacheKey) || "").trim());
     if (cacheKey) {
       this.latestTurnDiffByKey.delete(cacheKey);
       this.deliveredTurnDiffByKey.delete(cacheKey);
@@ -2302,6 +2435,7 @@ export class DaemonApp {
 
     const [channel, chatId] = bKey.split(":");
     const adapter = this.#getAdapter(channel);
+    const binding = this.store.getBinding(channel, chatId);
     const status = normalizeTurnStatus(params?.turn?.status);
     if (adapter?.channel === "discord" && discordState?.presentationEnabled && this.outputPolicy.discord.useLiveEdits) {
       const finalAssistant = String(
@@ -2399,6 +2533,48 @@ export class DaemonApp {
     }
     this.turnToBinding.delete(turnId);
     this.activeTurnByBinding.delete(bKey);
+
+    if (!suppressed && binding) {
+      const finalAssistantText = String(
+        (adapter?.channel === "discord"
+          ? (discordState?.assistantFullText || "")
+          : "") || finalFromStream.fullText || allAgentTextFromTurn(params?.turn || {})
+      ).trim();
+      const pendingApprovalsCount = this.approvalBroker
+        .listPending()
+        .filter((record) => (
+          String(record.binding?.channel || "") === channel
+          && String(record.binding?.chatId || "") === chatId
+        ))
+        .length;
+      const autoResult = await this.autopilotSupervisor?.onTurnCompleted({
+        threadId,
+        turnId,
+        status,
+        finalAssistant: finalAssistantText,
+        pendingApprovalsCount,
+        turnItems: Array.isArray(params?.turn?.items) ? params.turn.items : [],
+        hasTurnDiff: hadTurnDiff,
+      }, binding);
+      if (autoResult?.decision?.action === "continue" && adapter) {
+        await this.#sendMessage(
+          adapter,
+          this.#contextFromBinding(binding),
+          formatAutopilotAction(autoResult.decision)
+        );
+      } else if (
+        autopilotConfigForBinding(binding).enabled
+        && autopilotConfigForBinding(binding).continueOnTurnComplete
+        && autoResult?.decision?.action === "pause"
+        && adapter
+      ) {
+        await this.#sendMessage(
+          adapter,
+          this.#contextFromBinding(binding),
+          formatAutopilotPause(autoResult.decision.reason)
+        );
+      }
+    }
   }
 
   async #handleRuntimeError(params) {
@@ -2541,6 +2717,8 @@ export class DaemonApp {
       const threadScopedAutoApprove = binding.threadId
         ? (this.#threadAutoApproveEnabled(binding, binding.threadId) ? "on" : "off")
         : "n/a";
+      const autopilot = autopilotConfigForBinding(binding);
+      const autopilotSession = this.autopilotSupervisor?.status(binding);
       await this.#sendMessage(adapter, context, [
         `Binding: ${bKey}`,
         `Thread: ${binding.threadId || "none"}`,
@@ -2548,6 +2726,9 @@ export class DaemonApp {
         `Model: ${binding.policyProfile?.model || "runtime default"}`,
         `Effort: ${binding.policyProfile?.reasoningEffort || "runtime default"}`,
         `Mode: ${binding.policyProfile?.collaborationMode || "runtime default"}`,
+        `Autopilot: ${autopilot.enabled ? "on" : "off"} (${autopilot.mode || "rules"})`,
+        `Autopilot continue: ${autopilot.continueOnTurnComplete ? "on" : "off"}`,
+        `Autopilot auto turns: ${autopilotSession?.automaticTurns || 0}/${autopilot.maxAutomaticTurns || 5}`,
         `Auth mode: inherited from current Codex login state`,
         `Thread auto-approve (command/file): ${threadScopedAutoApprove}`,
         `Active turn: ${active || "none"}`,
@@ -2599,14 +2780,11 @@ export class DaemonApp {
         throw error;
       }
 
-      this.threadToBinding.set(threadId, bKey);
       let resumedCwd = extractThreadCwd(resumeResponse);
       if (!resumedCwd) {
         resumedCwd = await this.#resolveThreadCwd(threadId);
       }
-      const updated = this.store.upsertBinding({
-        ...binding,
-        threadId,
+      const updated = this.#claimThreadForBinding(binding, threadId, {
         ...(resumedCwd ? { workingDir: resumedCwd } : {}),
       });
       if (resumedCwd) {
@@ -2765,13 +2943,11 @@ export class DaemonApp {
         });
         const reviewTurnId = turnIdFromResponse(review);
         const reviewThreadId = review?.reviewThreadId || binding.threadId;
-        this.threadToBinding.set(reviewThreadId, bKey);
         if (delivery === "detached" && reviewThreadId && reviewThreadId !== binding.threadId) {
-          const updated = this.store.upsertBinding({
-            ...binding,
-            threadId: reviewThreadId,
-          });
+          const updated = this.#claimThreadForBinding(binding, reviewThreadId);
           Object.assign(binding, updated);
+        } else if (reviewThreadId) {
+          this.threadToBinding.set(reviewThreadId, bKey);
         }
         if (reviewTurnId) {
           this.turnToBinding.set(reviewTurnId, bKey);
@@ -2822,10 +2998,7 @@ export class DaemonApp {
         });
         const threadId = threadIdFromResponse(response);
         if (threadId) {
-          this.threadToBinding.set(threadId, bKey);
-          const updated = this.store.upsertBinding({
-            ...binding,
-            threadId,
+          const updated = this.#claimThreadForBinding(binding, threadId, {
             workingDir: cwdResolved.value,
           });
           Object.assign(binding, updated);
@@ -3111,6 +3284,109 @@ export class DaemonApp {
         return;
       }
       await this.#sendMessage(adapter, context, "Usage: /plan <on|off|show>");
+      return;
+    }
+
+    if (command.type === "autopilot") {
+      const action = String(command.action || "status").toLowerCase();
+      if (["status", "show"].includes(action)) {
+        await this.#sendMessage(
+          adapter,
+          context,
+          formatAutopilotStatus(this.autopilotSupervisor?.status(binding), binding)
+        );
+        return;
+      }
+
+      if (["on", "enable", "enabled"].includes(action)) {
+        const updated = this.store.upsertBinding({
+          ...binding,
+          policyProfile: {
+            ...binding.policyProfile,
+            autopilot: {
+              ...autopilotConfigForBinding(binding),
+              enabled: true,
+            },
+          },
+        });
+        Object.assign(binding, updated);
+        this.autopilotSupervisor?.reset(binding);
+        await this.#sendMessage(
+          adapter,
+          context,
+          `Autopilot enabled.\n\n${formatAutopilotStatus(this.autopilotSupervisor?.status(binding), binding)}`
+        );
+        return;
+      }
+
+      if (["off", "disable", "disabled"].includes(action)) {
+        const updated = this.store.upsertBinding({
+          ...binding,
+          policyProfile: {
+            ...binding.policyProfile,
+            autopilot: {
+              ...autopilotConfigForBinding(binding),
+              enabled: false,
+            },
+          },
+        });
+        Object.assign(binding, updated);
+        this.autopilotSupervisor?.reset(binding);
+        await this.#sendMessage(adapter, context, "Autopilot disabled.");
+        return;
+      }
+
+      if (action === "continue") {
+        const mode = String(command.args?.[0] || "").toLowerCase();
+        if (!["on", "off"].includes(mode)) {
+          await this.#sendMessage(adapter, context, "Usage: /autopilot continue <on|off>");
+          return;
+        }
+        const updated = this.store.upsertBinding({
+          ...binding,
+          policyProfile: {
+            ...binding.policyProfile,
+            autopilot: {
+              ...autopilotConfigForBinding(binding),
+              continueOnTurnComplete: mode === "on",
+            },
+          },
+        });
+        Object.assign(binding, updated);
+        await this.#sendMessage(
+          adapter,
+          context,
+          `Autopilot turn continuation ${mode === "on" ? "enabled" : "disabled"}.`
+        );
+        return;
+      }
+
+      if (action === "mode") {
+        const mode = String(command.args?.[0] || "").toLowerCase();
+        if (!["conservative", "aggressive"].includes(mode)) {
+          await this.#sendMessage(adapter, context, "Usage: /autopilot mode <conservative|aggressive>");
+          return;
+        }
+        const updated = this.store.upsertBinding({
+          ...binding,
+          policyProfile: {
+            ...binding.policyProfile,
+            autopilot: {
+              ...autopilotConfigForBinding(binding),
+              mode,
+            },
+          },
+        });
+        Object.assign(binding, updated);
+        await this.#sendMessage(
+          adapter,
+          context,
+          `Autopilot mode set to ${mode}.`
+        );
+        return;
+      }
+
+      await this.#sendMessage(adapter, context, "Usage: /autopilot <on|off|status|continue on|continue off|mode conservative|mode aggressive>");
       return;
     }
 
@@ -3406,6 +3682,19 @@ export class DaemonApp {
     });
 
     if (created.autoResolved) {
+      return;
+    }
+
+    const autopilot = await this.autopilotSupervisor?.onServerRequest(serverRequest, binding, created.record);
+    if (autopilot?.handled) {
+      this.store.appendAudit({
+        type: "approval_autopilot_resolved",
+        localRequestId: created.record.localRequestId,
+        method: serverRequest.method,
+        action: autopilot.decision?.action || "allow",
+        channel,
+        chatId,
+      });
       return;
     }
 

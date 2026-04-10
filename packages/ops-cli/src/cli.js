@@ -133,12 +133,13 @@ const HELP_TOPICS = {
     ],
   },
   policy: {
-    summary: "Update binding policy options (approval, model profile, allowlist).",
-    usage: "reco policy set <channel> <chatId> [--approval <mode>] [--auto-approve <bool>] [--allowlist <csv>] [--model <id>] [--effort <level>] [--mode <name>]",
+    summary: "Update binding policy options (approval, model profile, allowlist, autopilot).",
+    usage: "reco policy set <channel> <chatId> [--approval <mode>] [--auto-approve <bool>] [--allowlist <csv>] [--model <id>] [--effort <level>] [--mode <name>] [--autopilot <on|off>] [--autopilot-mode <rules>] [--autopilot-continue <on|off>]",
     examples: [
       "reco policy set discord 123456789012345678 --approval on-request --auto-approve false",
       "reco policy set discord 123456789012345678 --model gpt-5.3-codex",
       "reco policy set discord 123456789012345678 --effort high --mode default",
+      "reco policy set discord 123456789012345678 --autopilot on --autopilot-continue on",
     ],
   },
   help: {
@@ -173,6 +174,7 @@ function printGeneralHelp() {
   console.log("  reco bind discord");
   console.log("  reco discord channels");
   console.log("  reco policy set discord <chatId> --approval on-request");
+  console.log("  reco policy set discord <chatId> --autopilot on --autopilot-continue on");
   console.log("  reco help bind");
 }
 
@@ -608,7 +610,7 @@ async function cmdThreads(args) {
 async function cmdPolicy(args) {
   const sub = args[0];
   if (sub !== "set") {
-    console.log("Usage: reco policy set <channel> <chatId> [--approval <mode>] [--auto-approve <bool>] [--allowlist <csv>] [--model <id>] [--effort <level>] [--mode <name>]");
+    console.log("Usage: reco policy set <channel> <chatId> [--approval <mode>] [--auto-approve <bool>] [--allowlist <csv>] [--model <id>] [--effort <level>] [--mode <name>] [--autopilot <on|off>] [--autopilot-mode <rules>] [--autopilot-continue <on|off>]");
     return;
   }
 
@@ -636,6 +638,24 @@ async function cmdPolicy(args) {
   const collaborationMode = modeRaw == null
     ? (binding.policyProfile.collaborationMode ?? null)
     : (["default", "auto"].includes(normalizedModeRaw) ? "default" : (String(modeRaw).trim() || null));
+  const autopilotRaw = getArgValue(args, "--autopilot", null);
+  const autopilotModeRaw = getArgValue(args, "--autopilot-mode", null);
+  const autopilotContinueRaw = getArgValue(args, "--autopilot-continue", null);
+  const autopilot = {
+    ...(binding.policyProfile.autopilot || {}),
+  };
+  if (autopilotRaw != null) {
+    autopilot.enabled = toBoolean(String(autopilotRaw), Boolean(autopilot.enabled));
+  }
+  if (autopilotModeRaw != null) {
+    autopilot.mode = String(autopilotModeRaw).trim() || autopilot.mode || "rules";
+  }
+  if (autopilotContinueRaw != null) {
+    autopilot.continueOnTurnComplete = toBoolean(
+      String(autopilotContinueRaw),
+      Boolean(autopilot.continueOnTurnComplete)
+    );
+  }
 
   const updated = store.upsertBinding({
     ...binding,
@@ -647,6 +667,7 @@ async function cmdPolicy(args) {
       model,
       reasoningEffort,
       collaborationMode,
+      autopilot,
     },
   });
 

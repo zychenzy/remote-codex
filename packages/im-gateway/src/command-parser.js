@@ -160,6 +160,15 @@ export function parseIncomingCommand(text = "") {
     return { type: "status" };
   }
 
+  if (cmd === "/autopilot") {
+    return {
+      type: "autopilot",
+      action: (parts[1] || "status").toLowerCase(),
+      args: parts.slice(2),
+      raw: trimmed,
+    };
+  }
+
   if (cmd === "/help" || cmd === "/?") {
     return { type: "help", topic: (parts[1] || "").trim() };
   }

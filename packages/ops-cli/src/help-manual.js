@@ -24,6 +24,7 @@ export function commandManual(topic = "") {
       "/approve <requestId> <allow|deny> [payload] - resolve approval.",
       "/approve auto <on|off|show> [threadId] - thread-scoped auto-approve for command/file requests.",
       "/answer [requestId] <questionId>=<answer>[;<questionId>=<answer>] - reply to tool user-input prompts.",
+      "/autopilot <on|off|status|continue on|continue off|mode ...> - unattended helper.",
       "/plan <on|off|show> - quick collaboration mode toggle (plan/default).",
       "/status - show binding/thread/runtime status.",
       "/help [command] - show this help or details for one command.",
@@ -41,6 +42,9 @@ export function commandManual(topic = "") {
       "/skills list",
       "/archive",
       "/approve auto on",
+      "/autopilot on",
+      "/autopilot continue on",
+      "/autopilot mode aggressive",
       "/plan on",
       "/answer req-123 mode=fast",
       "/answer rec",
@@ -186,6 +190,18 @@ export function commandManual(topic = "") {
       "Convenience alias for collaboration mode on this binding.",
       "on => mode plan, off => mode default.",
       "Examples: /plan on, /plan show, /plan off",
+    ].join("\n");
+  }
+
+  if (t === "autopilot") {
+    return [
+      "/autopilot <on|off|status|continue on|continue off|mode conservative|mode aggressive>",
+      "Controls the rules-based unattended supervisor for this binding.",
+      "on/off toggles autopilot approval and tool-input handling.",
+      "continue on/off controls whether autopilot starts a fresh follow-up turn after completion.",
+      "mode conservative requires concrete execution progress before continuing.",
+      "mode aggressive continues unless a hard stop is detected.",
+      "Examples: /autopilot on, /autopilot status, /autopilot continue on, /autopilot mode aggressive",
     ].join("\n");
   }
 

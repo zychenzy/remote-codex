@@ -63,6 +63,7 @@ export class DiscordAdapter extends BaseAdapter {
   constructor({
     token,
     allowedChannels = [],
+    dmUserIds = [],
     pollIntervalMs = 1800,
     minSendIntervalMs = 450,
     logger = console,
@@ -70,6 +71,7 @@ export class DiscordAdapter extends BaseAdapter {
     super({ channel: "discord", logger });
     this.token = token;
     this.allowedChannels = allowedChannels;
+    this.dmUserIds = dmUserIds;
     this.pollIntervalMs = pollIntervalMs;
     this.minSendIntervalMs = minSendIntervalMs;
     this.running = false;
@@ -78,6 +80,7 @@ export class DiscordAdapter extends BaseAdapter {
     this.invalidChannels = new Set();
     this.sendQueue = Promise.resolve();
     this.nextAllowedSendAt = 0;
+    this.pollChannelIds = [];
   }
 
   async start() {
@@ -86,8 +89,16 @@ export class DiscordAdapter extends BaseAdapter {
       return;
     }
 
-    if (!Array.isArray(this.allowedChannels) || this.allowedChannels.length === 0) {
-      this.logger.warn("[discord] no allowed channels configured; adapter idle");
+    const allowedChannels = Array.isArray(this.allowedChannels) ? this.allowedChannels : [];
+    const dmUserIds = Array.isArray(this.dmUserIds) ? this.dmUserIds : [];
+    if (allowedChannels.length === 0 && dmUserIds.length === 0) {
+      this.logger.warn("[discord] no allowed channels or DM users configured; adapter idle");
+      return;
+    }
+
+    await this.#refreshPollChannelIds();
+    if (this.pollChannelIds.length === 0) {
+      this.logger.warn("[discord] no pollable channels resolved; adapter idle");
       return;
     }
 
@@ -179,7 +190,7 @@ export class DiscordAdapter extends BaseAdapter {
       return;
     }
 
-    for (const channelId of this.allowedChannels) {
+    for (const channelId of this.pollChannelIds) {
       if (this.invalidChannels.has(channelId)) {
         continue;
       }
@@ -228,7 +239,7 @@ export class DiscordAdapter extends BaseAdapter {
           this.invalidChannels.add(channelId);
           this.logger.error(
             `[discord] channel ${channelId} is invalid/inaccessible (code 10003). ` +
-            "Use the actual text-channel ID and restart daemon after updating config."
+            "Use a valid Discord channel/DM target and restart daemon after updating config."
           );
           continue;
         }
@@ -239,6 +250,34 @@ export class DiscordAdapter extends BaseAdapter {
     this.loopTimer = setTimeout(() => {
       this.#pollLoop().catch((err) => this.logger.error(`[discord] loop failed: ${err.message}`));
     }, this.pollIntervalMs);
+  }
+
+  async #refreshPollChannelIds() {
+    const pollChannelIds = new Set(
+      (Array.isArray(this.allowedChannels) ? this.allowedChannels : [])
+        .map((value) => String(value || "").trim())
+        .filter(Boolean)
+    );
+    const dmUserIds = (Array.isArray(this.dmUserIds) ? this.dmUserIds : [])
+      .map((value) => String(value || "").trim())
+      .filter(Boolean);
+
+    for (const userId of dmUserIds) {
+      try {
+        const dmChannel = await this.#api("/users/@me/channels", {
+          method: "POST",
+          body: { recipient_id: userId },
+        });
+        const channelId = String(dmChannel?.id || "").trim();
+        if (channelId) {
+          pollChannelIds.add(channelId);
+        }
+      } catch (error) {
+        this.logger.error(`[discord] failed to resolve DM channel for user ${userId}: ${error.message}`);
+      }
+    }
+
+    this.pollChannelIds = [...pollChannelIds];
   }
 
   async #api(path, { method = "GET", body = null } = {}) {

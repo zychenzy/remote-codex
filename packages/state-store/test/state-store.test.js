@@ -26,6 +26,16 @@ test("binding persistence across store reload", () => {
       model: "gpt-5.3-codex",
       reasoningEffort: "medium",
       collaborationMode: "default",
+      autopilot: {
+        enabled: true,
+        mode: "conservative",
+        continueOnTurnComplete: true,
+        maxAutomaticTurns: 7,
+        maxConsecutivePauses: 3,
+        commandAllowPrefixes: ["npm test"],
+        allowedWriteRoots: ["/tmp"],
+        toolInputStrategy: "recommended_only",
+      },
       skillsContext: {
         cwd: "/tmp",
         lastListedAt: "2026-01-01T00:00:00.000Z",
@@ -43,6 +53,9 @@ test("binding persistence across store reload", () => {
   assert.equal(binding.policyProfile.model, "gpt-5.3-codex");
   assert.equal(binding.policyProfile.reasoningEffort, "medium");
   assert.equal(binding.policyProfile.collaborationMode, "default");
+  assert.equal(binding.policyProfile.autopilot.enabled, true);
+  assert.equal(binding.policyProfile.autopilot.continueOnTurnComplete, true);
+  assert.equal(binding.policyProfile.autopilot.commandAllowPrefixes[0], "npm test");
   assert.equal(binding.policyProfile.skillsContext.cwd, "/tmp");
   assert.equal(binding.policyProfile.threadAutoApproveByThreadId["thread-1"], true);
 });
@@ -87,6 +100,23 @@ test("default config uses home directory as workingDir", () => {
   assert.equal(config.defaults.output.discord.finalMessageDelayMs, 350);
 });
 
+test("bindings normalize autopilot defaults with safe command prefixes", () => {
+  const dir = tempDir();
+  const store = new StateStore({ baseDir: dir });
+
+  store.upsertBinding({
+    channel: "discord",
+    chatId: "defaults",
+    policyProfile: {},
+  });
+
+  const binding = store.getBinding("discord", "defaults");
+  assert.equal(binding.policyProfile.autopilot.enabled, false);
+  assert.equal(binding.policyProfile.autopilot.mode, "conservative");
+  assert.equal(binding.policyProfile.autopilot.commandAllowPrefixes.includes("npm test"), true);
+  assert.equal(binding.policyProfile.autopilot.commandAllowPrefixes.includes("git status"), true);
+});
+
 test("upsert binding preserves extended policy fields on partial updates", () => {
   const dir = tempDir();
   const store = new StateStore({ baseDir: dir });
@@ -103,6 +133,11 @@ test("upsert binding preserves extended policy fields on partial updates", () =>
       model: "gpt-5.4",
       reasoningEffort: "high",
       collaborationMode: "default",
+      autopilot: {
+        enabled: true,
+        mode: "conservative",
+        continueOnTurnComplete: false,
+      },
       skillsContext: {
         cwd: "/tmp",
         count: 1,
@@ -128,6 +163,7 @@ test("upsert binding preserves extended policy fields on partial updates", () =>
   assert.equal(binding.policyProfile.model, "gpt-5.4");
   assert.equal(binding.policyProfile.reasoningEffort, "high");
   assert.equal(binding.policyProfile.collaborationMode, "default");
+  assert.equal(binding.policyProfile.autopilot.enabled, true);
   assert.equal(binding.policyProfile.skillsContext.cwd, "/tmp");
   assert.equal(binding.policyProfile.threadAutoApproveByThreadId["thread-keep"], true);
 });
@@ -163,6 +199,48 @@ test("upsert binding supports explicit clearing of nullable policy fields", () =
   assert.equal(binding.policyProfile.reasoningEffort, null);
   assert.equal(binding.policyProfile.collaborationMode, null);
   assert.equal(binding.policyProfile.skillsContext, null);
+});
+
+test("upsert binding supports explicit clearing of threadId", () => {
+  const dir = tempDir();
+  const store = new StateStore({ baseDir: dir });
+
+  store.upsertBinding({
+    channel: "discord",
+    chatId: "thread-clear",
+    threadId: "thread-1",
+  });
+
+  store.upsertBinding({
+    channel: "discord",
+    chatId: "thread-clear",
+    threadId: null,
+  });
+
+  const binding = store.getBinding("discord", "thread-clear");
+  assert.equal(binding.threadId, null);
+});
+
+test("autopilot sessions persist across writes", () => {
+  const dir = tempDir();
+  const store = new StateStore({ baseDir: dir });
+
+  store.upsertAutopilotSession({
+    bindingKey: "discord:123",
+    threadId: "thread-1",
+    activeTurnId: "turn-1",
+    status: "running_turn",
+    automaticTurns: 2,
+    consecutivePauses: 1,
+    lastAction: { type: "continue" },
+  });
+
+  const store2 = new StateStore({ baseDir: dir });
+  const session = store2.getAutopilotSession("discord:123");
+  assert.equal(session.threadId, "thread-1");
+  assert.equal(session.activeTurnId, "turn-1");
+  assert.equal(session.automaticTurns, 2);
+  assert.equal(session.lastAction.type, "continue");
 });
 
 test("appendAudit writes through buffered async flush", async () => {

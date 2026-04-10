@@ -4,6 +4,8 @@ IM-first remote control daemon for Codex, backed by `codex app-server`.
 
 This project lets you run Codex on your host machine and control it from Discord, while keeping operations local and policy-gated.
 
+Allowlisted Discord users can also operate the bot via direct message; the daemon resolves and polls their DM channels at startup.
+
 ## Highlights
 
 - Native `codex app-server` integration (JSON-RPC, thread/turn/model/skills methods).
@@ -108,6 +110,8 @@ reco help
 /ask summarize this repo
 ```
 
+Allowlisted users can send the same commands in a Discord DM after the daemon restarts with the updated config.
+
 If settings change, restart:
 
 ```bash
@@ -198,6 +202,8 @@ Contribution and commit conventions:
 
 - Docs index: [references/README.md](references/README.md)
 - Architecture: [references/architecture.md](references/architecture.md)
+- Autopilot implementation: [references/autopilot-implementation-checklist.md](references/autopilot-implementation-checklist.md)
+- Autopilot design: [references/autopilot-supervisor-design.md](references/autopilot-supervisor-design.md)
 - Setup: [references/setup-guides.md](references/setup-guides.md)
 - Usage: [references/usage.md](references/usage.md)
 - Troubleshooting: [references/troubleshooting.md](references/troubleshooting.md)

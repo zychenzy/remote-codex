@@ -7,6 +7,14 @@ import path from "node:path";
 const AUDIT_FLUSH_INTERVAL_MS = 250;
 const DELIVERY_DEDUPE_TTL_MS = 24 * 60 * 60 * 1000;
 const DELIVERY_DEDUPE_MAX_ENTRIES = 5_000;
+const AUTOPILOT_DEFAULT_COMMAND_ALLOW_PREFIXES = [
+  "pwd",
+  "ls",
+  "rg ",
+  "git status",
+  "npm test",
+  "pnpm test",
+];
 
 function nowIso() {
   return new Date().toISOString();
@@ -90,6 +98,75 @@ function normalizeThreadAutoApproveByThreadId(raw = {}, { maxEntries = 500 } = {
   return Object.fromEntries(entries);
 }
 
+function normalizeStringList(raw = [], { maxEntries = 200 } = {}) {
+  const values = Array.isArray(raw) ? raw : [];
+  return [...new Set(
+    values
+      .map((value) => String(value || "").trim())
+      .filter(Boolean)
+      .slice(0, maxEntries)
+  )];
+}
+
+function normalizeAutopilotMode(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "rules") {
+    return "conservative";
+  }
+  return ["conservative", "aggressive"].includes(normalized) ? normalized : "conservative";
+}
+
+function normalizeAutopilotToolInputStrategy(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return ["recommended_only"].includes(normalized) ? normalized : "recommended_only";
+}
+
+function normalizeAutopilotPolicy(raw = {}) {
+  const source = raw && typeof raw === "object" ? raw : {};
+  return {
+    enabled: Boolean(source.enabled),
+    mode: normalizeAutopilotMode(source.mode),
+    continueOnTurnComplete: Boolean(source.continueOnTurnComplete),
+    maxAutomaticTurns: normalizeInt(source.maxAutomaticTurns, 5, 1, 100),
+    maxConsecutivePauses: normalizeInt(source.maxConsecutivePauses, 2, 1, 100),
+    commandAllowPrefixes: normalizeStringList(
+      Array.isArray(source.commandAllowPrefixes) && source.commandAllowPrefixes.length
+        ? source.commandAllowPrefixes
+        : AUTOPILOT_DEFAULT_COMMAND_ALLOW_PREFIXES
+    ),
+    allowedWriteRoots: normalizeStringList(source.allowedWriteRoots || []),
+    toolInputStrategy: normalizeAutopilotToolInputStrategy(source.toolInputStrategy),
+  };
+}
+
+function normalizeAutopilotSessions(raw = {}) {
+  const source = raw && typeof raw === "object" ? raw : {};
+  const normalized = {};
+  for (const [bindingKey, session] of Object.entries(source)) {
+    const key = String(bindingKey || "").trim();
+    if (!key || !session || typeof session !== "object") {
+      continue;
+    }
+    normalized[key] = {
+      bindingKey: key,
+      threadId: session.threadId ? String(session.threadId) : null,
+      activeTurnId: session.activeTurnId ? String(session.activeTurnId) : null,
+      status: String(session.status || "idle").trim() || "idle",
+      automaticTurns: normalizeInt(session.automaticTurns, 0, 0, 10_000),
+      consecutivePauses: normalizeInt(session.consecutivePauses, 0, 0, 10_000),
+      lastCompletionFingerprint: session.lastCompletionFingerprint
+        ? String(session.lastCompletionFingerprint)
+        : null,
+      repeatedCompletionCount: normalizeInt(session.repeatedCompletionCount, 0, 0, 10_000),
+      lastAction: session.lastAction && typeof session.lastAction === "object"
+        ? { ...session.lastAction }
+        : null,
+      updatedAt: String(session.updatedAt || nowIso()),
+    };
+  }
+  return normalized;
+}
+
 export class StateStore {
   constructor({ baseDir } = {}) {
     const preferred = baseDir || path.join(os.homedir(), ".im-codex-tool");
@@ -103,6 +180,7 @@ export class StateStore {
     this.bindingsPath = path.join(this.dataDir, "bindings.json");
     this.pendingApprovalsPath = path.join(this.dataDir, "pending-approvals.json");
     this.sessionsPath = path.join(this.dataDir, "sessions.json");
+    this.autopilotSessionsPath = path.join(this.dataDir, "autopilot-sessions.json");
     this.auditPath = path.join(this.dataDir, "audit.jsonl");
     this.deliveryDedupePath = path.join(this.dataDir, "delivery-dedupe.json");
     this.auditBuffer = [];
@@ -188,6 +266,11 @@ export class StateStore {
         policy.threadAutoApproveByThreadId = normalizedThreadAutoApprove;
         changed = true;
       }
+      const normalizedAutopilot = normalizeAutopilotPolicy(policy.autopilot);
+      if (JSON.stringify(policy.autopilot || {}) !== JSON.stringify(normalizedAutopilot)) {
+        policy.autopilot = normalizedAutopilot;
+        changed = true;
+      }
       normalized[key] = {
         ...binding,
         policyProfile: policy,
@@ -244,6 +327,9 @@ export class StateStore {
       skillsContext: hasPolicyField("skillsContext")
         ? (incomingPolicy.skillsContext ?? null)
         : (existing.policyProfile?.skillsContext ?? null),
+      autopilot: hasPolicyField("autopilot")
+        ? normalizeAutopilotPolicy(incomingPolicy.autopilot)
+        : normalizeAutopilotPolicy(existing.policyProfile?.autopilot),
       threadAutoApproveByThreadId: normalizeThreadAutoApproveByThreadId(
         hasPolicyField("threadAutoApproveByThreadId")
           ? (incomingPolicy.threadAutoApproveByThreadId ?? {})
@@ -255,7 +341,9 @@ export class StateStore {
       channel: binding.channel,
       chatId: String(binding.chatId),
       userId: binding.userId ? String(binding.userId) : existing.userId || null,
-      threadId: binding.threadId ?? existing.threadId ?? null,
+      threadId: Object.prototype.hasOwnProperty.call(binding, "threadId")
+        ? (binding.threadId ? String(binding.threadId) : null)
+        : (existing.threadId ?? null),
       workingDir: binding.workingDir || existing.workingDir || os.homedir(),
       policyProfile,
       updatedAt: nowIso(),
@@ -335,6 +423,49 @@ export class StateStore {
     };
     writeJson(this.sessionsPath, sessions, 0o600);
     return sessions[session.id];
+  }
+
+  getAutopilotSessions() {
+    const raw = readJson(this.autopilotSessionsPath, {});
+    const normalized = normalizeAutopilotSessions(raw);
+    if (JSON.stringify(raw || {}) !== JSON.stringify(normalized)) {
+      writeJson(this.autopilotSessionsPath, normalized, 0o600);
+    }
+    return normalized;
+  }
+
+  getAutopilotSession(bindingKey) {
+    const sessions = this.getAutopilotSessions();
+    return sessions[String(bindingKey || "").trim()] || null;
+  }
+
+  upsertAutopilotSession(session) {
+    const key = String(session?.bindingKey || "").trim();
+    if (!key) {
+      return null;
+    }
+    const sessions = this.getAutopilotSessions();
+    const next = normalizeAutopilotSessions({
+      ...sessions,
+      [key]: {
+        ...sessions[key],
+        ...session,
+        bindingKey: key,
+        updatedAt: nowIso(),
+      },
+    });
+    writeJson(this.autopilotSessionsPath, next, 0o600);
+    return next[key];
+  }
+
+  deleteAutopilotSession(bindingKey) {
+    const key = String(bindingKey || "").trim();
+    if (!key) {
+      return;
+    }
+    const sessions = this.getAutopilotSessions();
+    delete sessions[key];
+    writeJson(this.autopilotSessionsPath, sessions, 0o600);
   }
 
   appendAudit(event) {

@@ -52,6 +52,67 @@ test("discord adapter polls allowed channel and emits inbound messages", async (
   assert.equal(calls.some((url) => url.includes("/channels/123/messages")), true);
 });
 
+test("discord adapter resolves allowlisted DM channels and polls them", async () => {
+  const originalFetch = global.fetch;
+  const calls = [];
+
+  global.fetch = async (url, options = {}) => {
+    const method = String(options.method || "GET");
+    let body = null;
+    if (typeof options.body === "string" && options.body) {
+      body = JSON.parse(options.body);
+    }
+    calls.push({ url: String(url), method, body });
+
+    if (String(url).includes("/users/@me/channels") && method === "POST") {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ id: "dm-1", type: 1 }),
+        text: async () => "",
+      };
+    }
+
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ([
+        {
+          id: "5",
+          content: "/status",
+          channel_id: "dm-1",
+          author: { id: "u-7", username: "dm-user", bot: false },
+        },
+      ]),
+      text: async () => "",
+    };
+  };
+
+  const seen = [];
+  const adapter = new DiscordAdapter({
+    token: "token",
+    dmUserIds: ["u-7"],
+    pollIntervalMs: 10,
+    logger: { warn() {}, error() {}, info() {}, debug() {} },
+  });
+  adapter.registerInboundHandler((context) => seen.push(context));
+
+  try {
+    await adapter.start();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await adapter.stop();
+  } finally {
+    global.fetch = originalFetch;
+  }
+
+  assert.equal(calls.some((call) => call.method === "POST" && call.url.includes("/users/@me/channels")), true);
+  assert.equal(calls.some((call) => call.method === "GET" && call.url.includes("/channels/dm-1/messages")), true);
+  assert.equal(seen.length >= 1, true);
+  assert.equal(seen[0].chatId, "dm-1");
+  assert.equal(seen[0].userId, "u-7");
+  assert.equal(seen[0].threadId, "dm-1");
+});
+
 test("discord adapter marks unknown channels as invalid", async () => {
   const originalFetch = global.fetch;
   let fetchCalls = 0;

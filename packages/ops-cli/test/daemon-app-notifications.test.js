@@ -1559,3 +1559,149 @@ test("daemon /answer supports recommended and numeric shorthand", async () => {
     },
   });
 });
+
+test("daemon autopilot auto-approves safe command requests without prompting", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+  const binding = app.store.getBinding("discord", "chat-1");
+  app.store.upsertBinding({
+    ...binding,
+    policyProfile: {
+      ...binding.policyProfile,
+      autopilot: {
+        enabled: true,
+        mode: "conservative",
+        continueOnTurnComplete: false,
+        maxAutomaticTurns: 5,
+        maxConsecutivePauses: 2,
+        commandAllowPrefixes: ["npm test"],
+        allowedWriteRoots: ["/Users/czy/auto"],
+        toolInputStrategy: "recommended_only",
+      },
+    },
+  });
+
+  try {
+    runtime.emit("serverRequest", {
+      id: "srv-approve-1",
+      method: "item/commandExecution/requestApproval",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-approve-1",
+        command: "npm test",
+        cwd: "/Users/czy/auto",
+      },
+    });
+    await sleep(60);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(adapter.approvalPrompts.length, 0);
+  assert.equal(runtime.serverResponses.some((entry) => entry.requestId === "srv-approve-1"), true);
+  assert.equal(adapter.messages.some((entry) => entry.text.includes("Autopilot approved")), true);
+});
+
+test("daemon autopilot starts a fresh follow-up turn after completion", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+  const binding = app.store.getBinding("discord", "chat-1");
+  app.store.upsertBinding({
+    ...binding,
+    policyProfile: {
+      ...binding.policyProfile,
+      autopilot: {
+        enabled: true,
+        mode: "conservative",
+        continueOnTurnComplete: true,
+        maxAutomaticTurns: 5,
+        maxConsecutivePauses: 2,
+        commandAllowPrefixes: ["npm test"],
+        allowedWriteRoots: ["/Users/czy/auto"],
+        toolInputStrategy: "recommended_only",
+      },
+    },
+  });
+
+  try {
+    runtime.emit("notification", {
+      method: "turn/started",
+      params: { threadId: "thread-1", turnId: "turn-complete-1" },
+    });
+    runtime.emit("notification", {
+      method: "turn/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-complete-1",
+        turn: {
+          status: { type: "completed" },
+          items: [
+            { type: "commandExecution", command: "npm test" },
+            { type: "agentMessage", text: "Updated the failing tests." },
+          ],
+        },
+      },
+    });
+    await sleep(80);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(runtime.startTurnCalls.length, 1);
+  assert.equal(
+    runtime.startTurnCalls[0]?.input?.some((item) => String(item?.text || "").includes("Continue with the next concrete step")),
+    true
+  );
+  assert.equal(adapter.messages.some((entry) => entry.text.includes("Autopilot continued the task")), true);
+});
+
+test("daemon rebinds a resumed thread from channel binding to DM binding", async () => {
+  const baseDir = tempDir();
+  const app = new DaemonApp({ baseDir });
+  const runtime = new FakeRuntime({ loadedThreadIds: ["thread-1"] });
+  const adapter = new StubDiscordAdapter();
+
+  app.runtime = runtime;
+  app.adapters.push(adapter);
+  app.store.upsertBinding({
+    channel: "discord",
+    chatId: "channel-1",
+    userId: "user-1",
+    threadId: "thread-1",
+    workingDir: "/Users/czy/auto",
+    policyProfile: {
+      approvalMode: "on-request",
+      allowlist: ["user-1"],
+      autoApprove: false,
+    },
+  });
+  app.store.upsertBinding({
+    channel: "discord",
+    chatId: "dm-1",
+    userId: "user-1",
+    threadId: null,
+    workingDir: "/Users/czy/auto",
+    policyProfile: {
+      approvalMode: "on-request",
+      allowlist: ["user-1"],
+      autoApprove: false,
+    },
+  });
+
+  try {
+    await app.start();
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "dm-1",
+      userId: "user-1",
+      text: "/resume thread-1",
+      messageId: "dm-msg-1",
+    });
+    await sleep(80);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(app.threadToBinding.get("thread-1"), "discord:dm-1");
+  assert.equal(app.store.getBinding("discord", "dm-1")?.threadId, "thread-1");
+  assert.equal(app.store.getBinding("discord", "channel-1")?.threadId, null);
+  assert.equal(adapter.messages.some((item) => item.context.chatId === "dm-1" && item.text.includes("Resumed thread: thread-1")), true);
+});

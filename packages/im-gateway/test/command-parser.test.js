@@ -93,6 +93,26 @@ test("parser handles help command", () => {
   assert.equal(result.topic, "approve");
 });
 
+test("parser handles autopilot status command", () => {
+  const result = parseIncomingCommand("/autopilot status");
+  assert.equal(result.type, "autopilot");
+  assert.equal(result.action, "status");
+});
+
+test("parser handles autopilot continue command", () => {
+  const result = parseIncomingCommand("/autopilot continue on");
+  assert.equal(result.type, "autopilot");
+  assert.equal(result.action, "continue");
+  assert.deepEqual(result.args, ["on"]);
+});
+
+test("parser handles autopilot mode command", () => {
+  const result = parseIncomingCommand("/autopilot mode aggressive");
+  assert.equal(result.type, "autopilot");
+  assert.equal(result.action, "mode");
+  assert.deepEqual(result.args, ["aggressive"]);
+});
+
 test("parser maps stop to interrupt", () => {
   const result = parseIncomingCommand("/stop");
   assert.equal(result.type, "interrupt");
