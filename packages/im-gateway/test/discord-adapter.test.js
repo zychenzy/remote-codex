@@ -6,21 +6,41 @@ import { DiscordAdapter } from "../src/discord-adapter.js";
 test("discord adapter polls allowed channel and emits inbound messages", async () => {
   const originalFetch = global.fetch;
   const calls = [];
+  let pollCount = 0;
 
   global.fetch = async (url) => {
     calls.push(String(url));
     return {
       ok: true,
       status: 200,
-      json: async () => ([
-        {
-          id: "2",
-          content: "/status",
-          channel_id: "123",
-          message_reference: { message_id: "1" },
-          author: { id: "u-1", username: "tester", bot: false },
-        },
-      ]),
+      json: async () => {
+        pollCount += 1;
+        if (pollCount === 1) {
+          return [
+            {
+              id: "1",
+              content: "/old",
+              channel_id: "123",
+              author: { id: "u-1", username: "tester", bot: false },
+            },
+          ];
+        }
+        return [
+          {
+            id: "2",
+            content: "/status",
+            channel_id: "123",
+            message_reference: { message_id: "1" },
+            author: { id: "u-1", username: "tester", bot: false },
+          },
+          {
+            id: "1",
+            content: "/old",
+            channel_id: "123",
+            author: { id: "u-1", username: "tester", bot: false },
+          },
+        ];
+      },
       text: async () => "",
     };
   };
@@ -49,12 +69,14 @@ test("discord adapter polls allowed channel and emits inbound messages", async (
   assert.equal(seen[0].messageId, "2");
   assert.equal(seen[0].replyToMessageId, "1");
   assert.equal(seen[0].threadId, "123");
+  assert.equal(seen.some((item) => item.text === "/old"), false);
   assert.equal(calls.some((url) => url.includes("/channels/123/messages")), true);
 });
 
 test("discord adapter resolves allowlisted DM channels and polls them", async () => {
   const originalFetch = global.fetch;
   const calls = [];
+  let dmPollCount = 0;
 
   global.fetch = async (url, options = {}) => {
     const method = String(options.method || "GET");
@@ -76,14 +98,33 @@ test("discord adapter resolves allowlisted DM channels and polls them", async ()
     return {
       ok: true,
       status: 200,
-      json: async () => ([
-        {
-          id: "5",
-          content: "/status",
-          channel_id: "dm-1",
-          author: { id: "u-7", username: "dm-user", bot: false },
-        },
-      ]),
+      json: async () => {
+        dmPollCount += 1;
+        if (dmPollCount === 1) {
+          return [
+            {
+              id: "4",
+              content: "/old",
+              channel_id: "dm-1",
+              author: { id: "u-7", username: "dm-user", bot: false },
+            },
+          ];
+        }
+        return [
+          {
+            id: "5",
+            content: "/status",
+            channel_id: "dm-1",
+            author: { id: "u-7", username: "dm-user", bot: false },
+          },
+          {
+            id: "4",
+            content: "/old",
+            channel_id: "dm-1",
+            author: { id: "u-7", username: "dm-user", bot: false },
+          },
+        ];
+      },
       text: async () => "",
     };
   };
@@ -111,6 +152,49 @@ test("discord adapter resolves allowlisted DM channels and polls them", async ()
   assert.equal(seen[0].chatId, "dm-1");
   assert.equal(seen[0].userId, "u-7");
   assert.equal(seen[0].threadId, "dm-1");
+  assert.equal(seen.some((item) => item.text === "/old"), false);
+});
+
+test("discord adapter does not replay the latest message on startup", async () => {
+  const originalFetch = global.fetch;
+  let pollCount = 0;
+
+  global.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => {
+      pollCount += 1;
+      return [
+        {
+          id: "10",
+          content: "/repeat-me",
+          channel_id: "123",
+          author: { id: "u-1", username: "tester", bot: false },
+        },
+      ];
+    },
+    text: async () => "",
+  });
+
+  const seen = [];
+  const adapter = new DiscordAdapter({
+    token: "token",
+    allowedChannels: ["123"],
+    pollIntervalMs: 10,
+    logger: { warn() {}, error() {}, info() {}, debug() {} },
+  });
+  adapter.registerInboundHandler((context) => seen.push(context));
+
+  try {
+    await adapter.start();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await adapter.stop();
+  } finally {
+    global.fetch = originalFetch;
+  }
+
+  assert.equal(pollCount >= 2, true);
+  assert.equal(seen.length, 0);
 });
 
 test("discord adapter marks unknown channels as invalid", async () => {

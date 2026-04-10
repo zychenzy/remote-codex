@@ -102,6 +102,7 @@ export class DiscordAdapter extends BaseAdapter {
       return;
     }
 
+    await this.#primeStartupCursor();
     this.running = true;
     await this.#pollLoop();
   }
@@ -250,6 +251,33 @@ export class DiscordAdapter extends BaseAdapter {
     this.loopTimer = setTimeout(() => {
       this.#pollLoop().catch((err) => this.logger.error(`[discord] loop failed: ${err.message}`));
     }, this.pollIntervalMs);
+  }
+
+  async #primeStartupCursor() {
+    for (const channelId of this.pollChannelIds) {
+      if (this.invalidChannels.has(channelId)) {
+        continue;
+      }
+
+      try {
+        const messages = await this.#api(`/channels/${channelId}/messages?limit=1`);
+        const newest = Array.isArray(messages) ? messages[0] : null;
+        const id = String(newest?.id || "").trim();
+        if (id) {
+          this.lastSeenByChannel.set(channelId, id);
+        }
+      } catch (error) {
+        if (isUnknownChannelError(error)) {
+          this.invalidChannels.add(channelId);
+          this.logger.error(
+            `[discord] channel ${channelId} is invalid/inaccessible (code 10003). ` +
+            "Use a valid Discord channel/DM target and restart daemon after updating config."
+          );
+          continue;
+        }
+        this.logger.error(`[discord] failed to prime startup cursor for channel ${channelId}: ${error.message}`);
+      }
+    }
   }
 
   async #refreshPollChannelIds() {

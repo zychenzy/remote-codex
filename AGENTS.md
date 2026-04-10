@@ -15,7 +15,7 @@ This repository contains an IM-first Codex remote-control daemon.
 - `packages/im-gateway`: IM adapters and command parsing.
 - `packages/state-store`: local config/state/audit persistence.
 - `packages/ops-cli`: daemon orchestration and CLI commands.
-- `ref/`: local reference projects (`Claude-to-IM-skill`, `remodex`) for lookup only.
+- `ref/`: local reference projects (`Claude-to-IM-skill`) for lookup only.
 
 ## Development workflow
 

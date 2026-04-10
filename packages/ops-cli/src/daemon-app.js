@@ -731,6 +731,7 @@ export class DaemonApp {
     await this.#rehydrateRuntimeState("startup");
 
     await this.#startAdapters();
+    await this.#announceRestoredBindings();
     this.logger.info("adapters started", this.adapters.map((adapter) => adapter.channel).join(","));
 
     this.store.appendAudit({ type: "daemon_started", pid: process.pid });
@@ -935,6 +936,24 @@ export class DaemonApp {
         });
       }
       await adapter.start();
+    }
+  }
+
+  async #announceRestoredBindings() {
+    const bindings = this.store.listBindings().filter((binding) => binding?.threadId);
+    for (const binding of bindings) {
+      const adapter = this.#getAdapter(binding.channel);
+      if (!adapter) {
+        continue;
+      }
+      const context = this.#runtimeContext(binding.channel, binding.chatId, binding.threadId, null);
+      await this.#sendMessage(
+        adapter,
+        context,
+        binding.workingDir
+          ? `Restored thread context: ${binding.threadId}\nWorkspace set to: ${binding.workingDir}`
+          : `Restored thread context: ${binding.threadId}`
+      );
     }
   }
 

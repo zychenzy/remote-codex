@@ -257,7 +257,6 @@ Contribution and commit conventions:
 - Usage: [references/usage.md](references/usage.md)
 - Troubleshooting: [references/troubleshooting.md](references/troubleshooting.md)
 - Token validation: [references/token-validation.md](references/token-validation.md)
-- Design notes: [references/autopilot-implementation-checklist.md](references/autopilot-implementation-checklist.md), [references/autopilot-supervisor-design.md](references/autopilot-supervisor-design.md)
 
 ## License
 

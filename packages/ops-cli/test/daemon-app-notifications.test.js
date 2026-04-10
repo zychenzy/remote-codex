@@ -149,7 +149,7 @@ class StubDiscordAdapter {
   }
 }
 
-async function setupDaemonHarness() {
+async function setupDaemonHarness({ clearStartupMessages = true } = {}) {
   const baseDir = tempDir();
   const app = new DaemonApp({ baseDir });
   const runtime = new FakeRuntime({ loadedThreadIds: ["thread-1"] });
@@ -171,8 +171,27 @@ async function setupDaemonHarness() {
   });
 
   await app.start();
+  if (clearStartupMessages) {
+    adapter.messages = [];
+    adapter.messageEdits = [];
+    adapter.streamingDeltas = [];
+    adapter.approvalPrompts = [];
+  }
   return { app, runtime, adapter };
 }
+
+test("daemon sends lightweight restored thread context on startup without transcript replay", async () => {
+  const { app, adapter } = await setupDaemonHarness({ clearStartupMessages: false });
+
+  try {
+    assert.equal(
+      adapter.messages.some((item) => item.text === "Restored thread context: thread-1\nWorkspace set to: /Users/czy/auto"),
+      true
+    );
+  } finally {
+    await app.stop();
+  }
+});
 
 test("daemon creates direct live status message and reply-anchors final assistant output", async () => {
   const { app, runtime, adapter } = await setupDaemonHarness();
