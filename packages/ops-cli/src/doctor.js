@@ -1,5 +1,24 @@
 import fs from "node:fs";
 import { spawnSync } from "node:child_process";
+import path from "node:path";
+
+function parsePidList(stdout) {
+  return String(stdout || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const match = line.match(/^(\d+)\s+(.*)$/);
+      if (!match) {
+        return null;
+      }
+      return {
+        pid: Number(match[1]),
+        command: match[2],
+      };
+    })
+    .filter(Boolean);
+}
 
 export function runDoctor({ store, spawn = spawnSync } = {}) {
   const findings = [];
@@ -39,6 +58,32 @@ export function runDoctor({ store, spawn = spawnSync } = {}) {
 
   const pending = Object.keys(store.getPendingApprovals()).length;
   findings.push({ level: "info", message: `pending approvals: ${pending}` });
+
+  const daemonMatches = spawn("pgrep", ["-fal", "packages/ops-cli/src/cli.js daemon-run"], { encoding: "utf8" });
+  if (daemonMatches.status === 0) {
+    const daemons = parsePidList(daemonMatches.stdout);
+    if (daemons.length > 1) {
+      const pids = daemons.map((entry) => entry.pid).join(", ");
+      findings.push({
+        level: "error",
+        message: `multiple reco daemon processes detected (${daemons.length}: ${pids}); this can duplicate turns and mix codex auth state`,
+      });
+    } else if (daemons.length === 1) {
+      findings.push({ level: "info", message: `reco daemon pid: ${daemons[0].pid}` });
+    }
+  }
+
+  const statusPath = store.runtimeDir ? path.join(store.runtimeDir, "status.json") : null;
+  if (statusPath) {
+    try {
+      const status = JSON.parse(fs.readFileSync(statusPath, "utf8"));
+      if (status?.running && status?.pid) {
+        findings.push({ level: "info", message: `runtime status pid: ${status.pid}` });
+      }
+    } catch {
+      // ignore missing or unreadable runtime status
+    }
+  }
 
   return findings;
 }

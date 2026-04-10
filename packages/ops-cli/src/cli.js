@@ -9,6 +9,7 @@ import readline from "node:readline/promises";
 import { StateStore } from "../../state-store/src/index.js";
 import { AppServerRuntime } from "../../core-runtime/src/index.js";
 import { DaemonApp } from "./daemon-app.js";
+import { claimDaemonLock, isPidRunning, readPidFile } from "./daemon-instance.js";
 import { runDoctor } from "./doctor.js";
 import {
   getArgValue,
@@ -37,6 +38,7 @@ const BASE_DIR = resolveBaseDir();
 const store = new StateStore({ baseDir: BASE_DIR });
 
 const PID_FILE = path.join(store.runtimeDir, "daemon.pid");
+const LOCK_FILE = path.join(store.runtimeDir, "daemon.lock");
 const STATUS_FILE = path.join(store.runtimeDir, "status.json");
 const DISCORD_API = "https://discord.com/api/v10";
 
@@ -214,21 +216,7 @@ function readStatus() {
 }
 
 function readPid() {
-  try {
-    return Number(fs.readFileSync(PID_FILE, "utf8").trim());
-  } catch {
-    return 0;
-  }
-}
-
-function isPidRunning(pid) {
-  if (!pid) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+  return readPidFile(PID_FILE);
 }
 
 async function cmdSetup() {
@@ -288,8 +276,22 @@ async function cmdStart() {
 }
 
 async function cmdDaemonRun() {
+  const daemonLock = await claimDaemonLock({
+    pidFile: PID_FILE,
+    lockFile: LOCK_FILE,
+    currentPid: process.pid,
+  });
   const app = new DaemonApp({ baseDir: BASE_DIR });
   const keepAlive = setInterval(() => {}, 45_000);
+  let released = false;
+
+  const releaseLock = () => {
+    if (released) {
+      return;
+    }
+    released = true;
+    daemonLock.release();
+  };
 
   fs.writeFileSync(PID_FILE, String(process.pid));
   writeStatus({ running: true, pid: process.pid, startedAt: new Date().toISOString() });
@@ -304,6 +306,7 @@ async function cmdDaemonRun() {
     try {
       await app.stop();
     } finally {
+      releaseLock();
       clearInterval(keepAlive);
       process.exit(0);
     }
@@ -315,12 +318,14 @@ async function cmdDaemonRun() {
   process.on("uncaughtException", async (error) => {
     writeStatus({ running: false, pid: process.pid, crashedAt: new Date().toISOString(), reason: `uncaughtException: ${error.message}` });
     await app.stop();
+    releaseLock();
     process.exit(1);
   });
 
   process.on("unhandledRejection", async (error) => {
     writeStatus({ running: false, pid: process.pid, crashedAt: new Date().toISOString(), reason: `unhandledRejection: ${String(error)}` });
     await app.stop();
+    releaseLock();
     clearInterval(keepAlive);
     fs.rmSync(PID_FILE, { force: true });
     process.exit(1);
@@ -337,6 +342,7 @@ async function cmdDaemonRun() {
     });
     fs.rmSync(PID_FILE, { force: true });
     await app.stop();
+    releaseLock();
     clearInterval(keepAlive);
     process.exit(1);
   }
