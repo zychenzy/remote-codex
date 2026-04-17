@@ -109,9 +109,10 @@ Why this shape:
 Useful lifecycle commands:
 
 ```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.reco.plist
 launchctl print gui/$(id -u)/local.reco
 launchctl kickstart -k gui/$(id -u)/local.reco
-launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/local.reco.plist
+launchctl bootout gui/$(id -u)/local.reco
 ```
 
 If you use `launchd`, avoid mixing that with repeated manual `./reco start` runs against the same `IM_CODEX_HOME`.

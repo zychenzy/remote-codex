@@ -9,7 +9,7 @@ import readline from "node:readline/promises";
 import { StateStore } from "../../state-store/src/index.js";
 import { AppServerRuntime } from "../../core-runtime/src/index.js";
 import { DaemonApp } from "./daemon-app.js";
-import { claimDaemonLock, isPidRunning, readPidFile } from "./daemon-instance.js";
+import { claimDaemonLock, isPidRunning, readPidFile, restartDaemon } from "./daemon-instance.js";
 import { runDoctor } from "./doctor.js";
 import {
   getArgValue,
@@ -362,20 +362,7 @@ async function cmdStop() {
 
 async function cmdRestart() {
   const existingPid = readPid();
-  if (existingPid && isPidRunning(existingPid)) {
-    process.kill(existingPid, "SIGTERM");
-    console.log(`Sent SIGTERM to daemon pid ${existingPid}`);
-
-    const deadline = Date.now() + 10_000;
-    while (Date.now() < deadline) {
-      if (!isPidRunning(existingPid)) {
-        break;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 250));
-    }
-  }
-
-  await cmdStart();
+  await restartDaemon(existingPid, async () => cmdStart());
 }
 
 async function cmdStatus() {

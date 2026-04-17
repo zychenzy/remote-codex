@@ -60,14 +60,14 @@ async function waitForExit(pid, {
   return !isPidRunning(pid, { killFn });
 }
 
-async function stopExistingDaemon(pid, {
+export async function stopExistingDaemon(pid, {
   timeoutMs = 10_000,
   pollIntervalMs = 100,
   killFn = process.kill,
   sleepFn = sleep,
 } = {}) {
   if (!pid || !isPidRunning(pid, { killFn })) {
-    return;
+    return false;
   }
   killFn(pid, "SIGTERM");
   const stopped = await waitForExit(pid, {
@@ -79,6 +79,24 @@ async function stopExistingDaemon(pid, {
   if (!stopped) {
     throw new Error(`existing daemon pid ${pid} did not exit after SIGTERM`);
   }
+  return true;
+}
+
+export async function restartDaemon(existingPid, startFn, {
+  timeoutMs = 10_000,
+  pollIntervalMs = 100,
+  killFn = process.kill,
+  sleepFn = sleep,
+} = {}) {
+  if (existingPid && isPidRunning(existingPid, { killFn })) {
+    await stopExistingDaemon(existingPid, {
+      timeoutMs,
+      pollIntervalMs,
+      killFn,
+      sleepFn,
+    });
+  }
+  return startFn();
 }
 
 export async function claimDaemonLock({
