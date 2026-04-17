@@ -12,6 +12,7 @@ Allowlisted Discord users can also operate the bot via direct message; the daemo
 - IM-first operator flow (Discord).
 - Discord server channels and Discord DMs share the same binding, approval, and thread model.
 - Discord turns now send direct live status/tool progress updates during execution and reply-anchor the final assistant output back to the triggering user message.
+- Discord-native workspace and file navigation with `/cwd`, `/files`, and recursive `/search`.
 - Optional autopilot continuation for safe follow-up turns, still bounded by local policy.
 - Local single-host deployment (no relay/control plane required).
 - Approval-gated risky operations and allowlist-based access control.
@@ -110,6 +111,9 @@ reco help
 /status
 /new
 /ask summarize this repo
+/cwd
+/files
+/search daemon-app
 ```
 
 Allowlisted users can send the same commands in a Discord DM after the daemon restarts with the updated config.
@@ -141,9 +145,10 @@ macOS `LaunchAgent` shape:
 With `launchd`, prefer `launchctl` for lifecycle control:
 
 ```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.reco.plist
 launchctl print gui/$(id -u)/local.reco
 launchctl kickstart -k gui/$(id -u)/local.reco
-launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/local.reco.plist
+launchctl bootout gui/$(id -u)/local.reco
 ```
 
 ## DM-Only Operation
@@ -209,7 +214,13 @@ Namespaced commands:
 Shortcuts/aliases:
 
 - `/new`, `/ask`, `/resume`, `/interrupt`, `/stop`
-- `/threads`, `/archive`, `/status`, `/help`, `/approve`, `/cwd`
+- `/threads`, `/archive`, `/status`, `/help`, `/approve`, `/cwd`, `/files`, `/search`
+
+Discord-native navigation:
+
+- `/cwd` opens a subdirectory picker for the current workspace on Discord.
+- `/files` opens a file browser rooted at the current workspace. Selecting a directory enters it immediately; selecting a file enables `Preview`.
+- `/search <pattern>` searches the current workspace recursively for matching file paths and lets you preview a selected result.
 
 ## Security Model
 
