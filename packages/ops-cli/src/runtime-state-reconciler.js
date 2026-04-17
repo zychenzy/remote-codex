@@ -28,6 +28,7 @@ export async function reconcileRuntimeState({
   bindingKeyFn,
   isThreadNotFoundError,
   extractThreadCwd,
+  resumeThread = null,
 } = {}) {
   turnToBinding.clear();
   activeTurnByBinding.clear();
@@ -66,6 +67,22 @@ export async function reconcileRuntimeState({
 
     try {
       const read = await runtime.readThread({ threadId, includeTurns: false });
+      if (typeof resumeThread === "function") {
+        try {
+          await resumeThread(threadId);
+        } catch (resumeError) {
+          if (isThreadNotFoundError(resumeError)) {
+            store.upsertBinding({
+              ...binding,
+              threadId: null,
+            });
+            threadToBinding.delete(threadId);
+            clearedBindings += 1;
+            continue;
+          }
+          logger.warn(`thread resume failed during runtime reconciliation (${threadId}): ${resumeError.message}`);
+        }
+      }
       verifiedThreads += 1;
       const cwd = extractThreadCwd(read?.thread || read);
       if (cwd && cwd !== binding.workingDir) {
