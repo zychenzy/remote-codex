@@ -13,7 +13,7 @@ function extractTextParts(content) {
       return "";
     })
     .filter(Boolean)
-    .join("\n");
+    .join("");
 }
 
 export function allUserTextFromTurn(turn) {
