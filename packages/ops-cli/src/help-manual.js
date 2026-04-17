@@ -13,7 +13,9 @@ export function commandManual(topic = "") {
       "/resume <threadId> - attach to an existing thread.",
       "/ask <prompt> - start a turn with prompt text.",
       "plain text message - same as /ask <text>.",
-      "/cwd <path> or /workspace <path> - set workspace directory.",
+      "/cwd [path] or /workspace <path> - set workspace directory.",
+      "/files - browse directories and preview files in the current workspace.",
+      "/search <pattern> - recursively search current workspace for files.",
       "/thread ... - thread operations (list/read/fork/archive/unarchive/rollback/compact).",
       "/turn ... - turn operations (ask/steer/interrupt/review).",
       "/model ... - model profile and catalog operations.",
@@ -35,6 +37,8 @@ export function commandManual(topic = "") {
       "Examples:",
       "/ask summarize this repo",
       "/cwd ~/auto",
+      "/files",
+      "/search daemon-app",
       "/threads 20",
       "/threads all",
       "/thread list all 20",
@@ -79,10 +83,28 @@ export function commandManual(topic = "") {
 
   if (t === "cwd" || t === "workspace") {
     return [
-      "/cwd <path>  (alias: /workspace <path>)",
+      "/cwd [path]  (alias: /workspace <path>)",
       "Updates this binding workspace directory.",
+      "On Discord, bare /cwd opens a subdirectory picker for the current workspace.",
       "Supports absolute path, relative path, and ~.",
       "Examples: /cwd ~/auto, /cwd /Users/czy/auto",
+    ].join("\n");
+  }
+
+  if (t === "files") {
+    return [
+      "/files",
+      "Browses the current workspace on this binding.",
+      "On Discord, selecting a directory enters it immediately; selecting a file enables Preview.",
+    ].join("\n");
+  }
+
+  if (t === "search") {
+    return [
+      "/search <pattern>",
+      "Recursively searches the current workspace for matching file paths.",
+      "On Discord, select a matching file result and use Preview.",
+      "Example: /search daemon-app",
     ].join("\n");
   }
 
@@ -187,8 +209,9 @@ export function commandManual(topic = "") {
   if (t === "plan") {
     return [
       "/plan <on|off|show>",
-      "Convenience alias for collaboration mode on this binding.",
-      "on => mode plan, off => mode default.",
+      "Convenience alias for plan mode on the current thread.",
+      "on => enable plan mode for current thread, off => disable it, show => inspect current thread state.",
+      "Plan mode is OFF by default unless toggled on for a thread.",
       "Examples: /plan on, /plan show, /plan off",
     ].join("\n");
   }

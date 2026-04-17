@@ -7,6 +7,8 @@ test("commandManual returns general manual", () => {
   const text = commandManual("");
   assert.equal(text.includes("IM command manual"), true);
   assert.equal(text.includes("/thread ..."), true);
+  assert.equal(text.includes("/files - browse"), true);
+  assert.equal(text.includes("/search <pattern>"), true);
   assert.equal(text.includes("/skills ..."), true);
   assert.equal(text.includes("/approve auto <on|off|show>"), true);
   assert.equal(text.includes("/plan <on|off|show>"), true);

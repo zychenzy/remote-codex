@@ -67,6 +67,10 @@ function shortId() {
   return crypto.randomUUID().replace(/-/g, "").slice(0, 12);
 }
 
+function encodeCommandValue(value = "") {
+  return Buffer.from(String(value || ""), "utf8").toString("base64url");
+}
+
 function row(components) {
   return {
     type: 1,
@@ -270,7 +274,20 @@ export class DiscordAdapter extends BaseAdapter {
     let sent = null;
     await this.#enqueueSend(async () => {
       const interaction = this.#interactionForContext(context);
-      if (interaction && !interaction.responded && !interaction.deferred) {
+      const interactionKind = String(context?.discordMeta?.kind || "");
+      const isComponentInteraction = interactionKind === "button" || interactionKind === "select";
+      if (interaction && isComponentInteraction && !interaction.responded && !interaction.deferred && typeof interaction.update === "function") {
+        sent = await interaction.update({
+          content: prepared.content || undefined,
+          embeds: prepared.embeds,
+          components: prepared.components,
+          allowedMentions: { repliedUser: false },
+        });
+        interaction.responded = true;
+        if (context?.discordMeta) {
+          context.discordMeta.responded = true;
+        }
+      } else if (interaction && !interaction.responded && !interaction.deferred) {
         sent = await interaction.reply({
           content: prepared.content || undefined,
           embeds: prepared.embeds,
@@ -282,7 +299,7 @@ export class DiscordAdapter extends BaseAdapter {
         if (context?.discordMeta) {
           context.discordMeta.responded = true;
         }
-      } else if (interaction && interaction.deferred && !interaction.replied) {
+      } else if (interaction && interaction.deferred && !interaction.replied && !isComponentInteraction) {
         sent = await interaction.editReply({
           content: prepared.content || undefined,
           embeds: prepared.embeds,
@@ -299,7 +316,7 @@ export class DiscordAdapter extends BaseAdapter {
     });
 
     const messageRef = normalizeMessageRef({
-      messageId: sent?.id,
+      messageId: sent?.id || context?.messageId,
       chatId: String(sent?.channelId || payload.threadId || context.threadId || context.chatId || ""),
     });
     if (prepared.nativeUi) {
@@ -399,7 +416,7 @@ export class DiscordAdapter extends BaseAdapter {
     if (!meta || meta.responded || !raw) {
       return null;
     }
-    if (meta.kind !== "slash") {
+    if (!["slash", "button", "select"].includes(String(meta.kind || ""))) {
       return null;
     }
     return raw;
@@ -488,8 +505,14 @@ export class DiscordAdapter extends BaseAdapter {
       },
       {
         name: "cwd",
-        description: "Set workspace directory.",
-        options: [{ type: STRING, name: "path", description: "Absolute path, relative path, or ~ path.", required: true }],
+        description: "Set or browse workspace directory.",
+        options: [{ type: STRING, name: "path", description: "Absolute path, relative path, or ~ path.", required: false }],
+      },
+      { name: "files", description: "Browse files in the current workspace." },
+      {
+        name: "search",
+        description: "Search current workspace recursively for files.",
+        options: [{ type: STRING, name: "query", description: "File name or path fragment.", required: true }],
       },
       {
         name: "help",
@@ -852,6 +875,14 @@ export class DiscordAdapter extends BaseAdapter {
       await this.#handleQuestionInteraction(interaction, baseContext, state, controlId, extra);
       return;
     }
+    if (state.kind === "cwdBrowser") {
+      await this.#handleCwdBrowserInteraction(interaction, baseContext, state, controlId);
+      return;
+    }
+    if (state.kind === "filePicker") {
+      await this.#handleFilePickerInteraction(interaction, baseContext, state, controlId);
+      return;
+    }
     if (state.kind === "commandControls") {
       await this.#handleCommandControlsInteraction(interaction, baseContext, state, controlId);
     }
@@ -994,6 +1025,160 @@ export class DiscordAdapter extends BaseAdapter {
     });
   }
 
+  async #handleCwdBrowserInteraction(interaction, context, state, controlId) {
+    if (controlId === "cancel") {
+      state.closed = true;
+      const embed = plainEmbed({
+        title: "Workspace Browse Cancelled",
+        description: state.selectedPath
+          ? `No workspace change applied.\nSelected: ${state.selectedPath}`
+          : "No workspace change applied.",
+        color: 0xed4245,
+        footer: `Closed by ${context.userName || context.userId || "unknown user"}`,
+      });
+      state.embeds = [embed];
+      await interaction.update({
+        content: state.content || "",
+        embeds: [embed],
+        components: disableComponents(state.components),
+      });
+      this.#expireView(state.viewId, { keepDisabled: true });
+      return;
+    }
+
+    if (controlId === "confirm") {
+      if (!state.selectedPath) {
+        await this.#replyEphemeral(interaction, "Choose a subdirectory before confirming.");
+        return;
+      }
+      state.closed = true;
+      const embed = plainEmbed({
+        title: "Workspace Change Submitted",
+        description: `Jumping to:\n${state.selectedPath}`,
+        color: 0x57f287,
+        footer: `Submitted by ${context.userName || context.userId || "unknown user"}`,
+      });
+      state.embeds = [embed];
+      await interaction.update({
+        content: state.content || "",
+        embeds: [embed],
+        components: disableComponents(state.components),
+      });
+      this.#expireView(state.viewId, { keepDisabled: true });
+      this.emitInbound({
+        ...context,
+        text: `/cwd ${state.selectedPath}`,
+      });
+      return;
+    }
+
+    if (controlId !== "pick") {
+      await this.#replyEphemeral(interaction, "Unknown control.");
+      return;
+    }
+
+    const valueKey = String(interaction.values?.[0] || "");
+    const selectedPath = state.valueMap?.[valueKey];
+    if (!selectedPath) {
+      await this.#replyEphemeral(interaction, "Unknown option.");
+      return;
+    }
+    state.selectedPath = selectedPath;
+    const view = this.#buildCwdBrowserView(state);
+    state.embeds = [view.embed];
+    state.components = view.components;
+    state.valueMap = view.valueMap;
+    await interaction.update({
+      content: state.content || "",
+      embeds: [view.embed],
+      components: view.components,
+    });
+  }
+
+  async #handleFilePickerInteraction(interaction, context, state, controlId) {
+    if (controlId === "cancel") {
+      state.closed = true;
+      const embed = plainEmbed({
+        title: "File Picker Closed",
+        description: state.selectedPath
+          ? `No action applied.\nSelected: ${state.selectedPath}`
+          : "No action applied.",
+        color: 0xed4245,
+        footer: `Closed by ${context.userName || context.userId || "unknown user"}`,
+      });
+      state.embeds = [embed];
+      await interaction.update({
+        content: state.content || "",
+        embeds: [embed],
+        components: disableComponents(state.components),
+      });
+      this.#expireView(state.viewId, { keepDisabled: true });
+      return;
+    }
+
+    if (controlId === "preview") {
+      if (!state.selectedPath) {
+        await this.#replyEphemeral(interaction, "Choose a file before previewing.");
+        return;
+      }
+      await interaction.deferUpdate();
+      const commandText = state.mode === "search"
+        ? `/search --preview64 ${encodeCommandValue(state.selectedPath)} --root64 ${encodeCommandValue(state.rootDir)} --query64 ${encodeCommandValue(state.query || "")}`
+        : `/files --preview64 ${encodeCommandValue(state.selectedPath)} --dir64 ${encodeCommandValue(state.currentDir)} --root64 ${encodeCommandValue(state.rootDir)}`;
+      this.emitInbound({
+        ...context,
+        text: commandText,
+      });
+      return;
+    }
+
+    if (controlId === "up") {
+      if (!state.canGoUp) {
+        await this.#replyEphemeral(interaction, "Already at the workspace root.");
+        return;
+      }
+      const nextDir = state.parentDir || state.rootDir;
+      this.emitInbound({
+        ...context,
+        text: `/files --dir64 ${encodeCommandValue(nextDir)} --root64 ${encodeCommandValue(state.rootDir)}`,
+      });
+      return;
+    }
+
+    if (controlId !== "pick") {
+      await this.#replyEphemeral(interaction, "Unknown control.");
+      return;
+    }
+
+    const valueKey = String(interaction.values?.[0] || "");
+    const selectedEntry = state.valueMap?.[valueKey] || null;
+    if (!selectedEntry) {
+      await this.#replyEphemeral(interaction, "Unknown option.");
+      return;
+    }
+    if (selectedEntry.entryType === "dir" && state.mode === "browser") {
+      this.emitInbound({
+        ...context,
+        text: `/files --dir64 ${encodeCommandValue(selectedEntry.path)} --root64 ${encodeCommandValue(state.rootDir)}`,
+      });
+      return;
+    }
+    if (selectedEntry.entryType !== "file") {
+      await this.#replyEphemeral(interaction, "Preview is only available for files.");
+      return;
+    }
+    state.selectedPath = selectedEntry.path;
+    const view = this.#buildFilePickerView(state);
+    state.embeds = [view.embed];
+    state.components = view.components;
+    state.valueMap = view.valueMap;
+    await interaction.update({
+      content: state.content || "",
+      embeds: [view.embed],
+      components: view.components,
+    });
+  }
+
   #messageContext(message, text) {
     const channel = message.channel;
     const threadId = isThreadChannel(channel) ? String(channel.id || "") : String(channel.id || "");
@@ -1086,6 +1271,12 @@ export class DiscordAdapter extends BaseAdapter {
     }
     if (nativeUi.kind === "questionPrompt") {
       return this.#renderQuestionUi(nativeUi, { fallbackText });
+    }
+    if (nativeUi.kind === "cwdBrowser") {
+      return this.#renderCwdBrowserUi(nativeUi, { fallbackText });
+    }
+    if (nativeUi.kind === "filePicker") {
+      return this.#renderFilePickerUi(nativeUi, { fallbackText });
     }
     if (nativeUi.kind === "threadList" || nativeUi.kind === "modelPicker") {
       return this.#renderCommandControlsUi(nativeUi, { fallbackText });
@@ -1192,6 +1383,215 @@ export class DiscordAdapter extends BaseAdapter {
         questionByControlId,
         selections: {},
         expiresAt: nowMs() + VIEW_TTL_MS,
+      },
+    };
+  }
+
+  #buildCwdBrowserView({
+    viewId,
+    title = "Browse Workspace",
+    description = "",
+    entries = [],
+    selectedPath = "",
+  } = {}) {
+    const valueMap = {};
+    const components = [];
+    if (entries.length) {
+      const options = entries.slice(0, 25).map((entry, index) => {
+        const valueKey = `o${index}`;
+        valueMap[valueKey] = entry.path;
+        return selectOption({
+          label: entry.label,
+          value: valueKey,
+          description: entry.description || "",
+          defaultValue: entry.path === selectedPath,
+        });
+      });
+      components.push(row([
+        stringSelect({
+          customId: `reco:${viewId}:pick`,
+          placeholder: "Select a subdirectory",
+          options,
+        }),
+      ]));
+    }
+    components.push(row([
+      button({
+        customId: `reco:${viewId}:confirm`,
+        label: "Confirm",
+        style: 3,
+        disabled: !selectedPath,
+      }),
+      button({
+        customId: `reco:${viewId}:cancel`,
+        label: "Cancel",
+        style: 4,
+      }),
+    ]));
+    const embed = plainEmbed({
+      title,
+      description: [
+        description || "Choose a subdirectory, then confirm to jump there.",
+        selectedPath ? `Selected: ${selectedPath}` : "",
+      ].filter(Boolean).join("\n"),
+      color: 0x3ba55d,
+    });
+    return {
+      embed,
+      components,
+      valueMap,
+    };
+  }
+
+  #renderCwdBrowserUi(nativeUi, { fallbackText = "" } = {}) {
+    const viewId = shortId();
+    const entries = ((Array.isArray(nativeUi.components?.selects) ? nativeUi.components.selects[0]?.options : []) || [])
+      .map((entry) => ({
+        label: String(entry?.label || "").slice(0, 100),
+        description: String(entry?.description || "").slice(0, 100),
+        path: String(entry?.path || "").trim(),
+      }))
+      .filter((entry) => entry.label && entry.path)
+      .slice(0, 25);
+    const title = nativeUi.title || "Browse Workspace";
+    const description = nativeUi.description || fallbackText || "Choose a subdirectory, then confirm to jump there.";
+    const built = this.#buildCwdBrowserView({
+      viewId,
+      title,
+      description,
+      entries,
+      selectedPath: "",
+    });
+    return {
+      embed: built.embed,
+      components: built.components,
+      state: {
+        kind: "cwdBrowser",
+        viewId,
+        title,
+        description,
+        entries,
+        selectedPath: "",
+        valueMap: built.valueMap,
+        content: fallbackText,
+        embeds: [built.embed],
+        components: built.components,
+        expiresAt: nowMs() + VIEW_TTL_MS,
+      },
+    };
+  }
+
+  #buildFilePickerView({
+    viewId,
+    title = "Browse Files",
+    description = "",
+    mode = "browser",
+    rootDir = "",
+    currentDir = "",
+    query = "",
+    entries = [],
+    selectedPath = "",
+    canGoUp = false,
+  } = {}) {
+    const valueMap = {};
+    const components = [];
+    if (entries.length) {
+      const options = entries.slice(0, 25).map((entry, index) => {
+        const valueKey = `o${index}`;
+        valueMap[valueKey] = {
+          path: entry.path,
+          entryType: entry.entryType,
+        };
+        return selectOption({
+          label: entry.label,
+          value: valueKey,
+          description: entry.description || "",
+          defaultValue: entry.path === selectedPath,
+        });
+      });
+      components.push(row([
+        stringSelect({
+          customId: `reco:${viewId}:pick`,
+          placeholder: mode === "search" ? "Select a file result" : "Select a directory or file",
+          options,
+        }),
+      ]));
+    }
+    const buttonRow = [];
+    if (mode === "browser") {
+      buttonRow.push(button({
+        customId: `reco:${viewId}:up`,
+        label: "Up",
+        style: 1,
+        disabled: !canGoUp,
+      }));
+    }
+    buttonRow.push(button({
+      customId: `reco:${viewId}:preview`,
+      label: "Preview",
+      style: 3,
+      disabled: !selectedPath,
+    }));
+    buttonRow.push(button({
+      customId: `reco:${viewId}:cancel`,
+      label: "Cancel",
+      style: 4,
+    }));
+    components.push(row(buttonRow));
+
+    const embed = plainEmbed({
+      title,
+      description: [
+        description,
+        mode === "search" ? `Query: ${query || "(empty)"}` : `Current directory: ${currentDir || rootDir || "unknown"}`,
+        selectedPath ? `Selected file: ${selectedPath}` : "",
+      ].filter(Boolean).join("\n"),
+      color: 0x3ba55d,
+    });
+    return {
+      embed,
+      components,
+      valueMap,
+    };
+  }
+
+  #renderFilePickerUi(nativeUi, { fallbackText = "" } = {}) {
+    const viewId = shortId();
+    const mode = nativeUi.mode === "search" ? "search" : "browser";
+    const entries = ((Array.isArray(nativeUi.components?.selects) ? nativeUi.components.selects[0]?.options : []) || [])
+      .map((entry) => ({
+        label: String(entry?.label || "").slice(0, 100),
+        description: String(entry?.description || "").slice(0, 100),
+        path: String(entry?.path || "").trim(),
+        entryType: String(entry?.entryType || "file"),
+      }))
+      .filter((entry) => entry.label && entry.path)
+      .slice(0, 25);
+    const state = {
+      kind: "filePicker",
+      viewId,
+      title: nativeUi.title || (mode === "search" ? "Search Files" : "Browse Files"),
+      description: nativeUi.description || fallbackText || "Select a directory or file.",
+      mode,
+      rootDir: String(nativeUi.rootDir || "").trim(),
+      currentDir: String(nativeUi.currentDir || "").trim(),
+      query: String(nativeUi.query || "").trim(),
+      entries,
+      selectedPath: "",
+      canGoUp: Boolean(nativeUi.canGoUp),
+      parentDir: String(nativeUi.parentDir || "").trim(),
+      content: fallbackText,
+      expiresAt: nowMs() + VIEW_TTL_MS,
+    };
+    const built = this.#buildFilePickerView(state);
+    return {
+      embed: built.embed,
+      components: built.components,
+      state: {
+        ...state,
+        valueMap: built.valueMap,
+        embeds: [built.embed],
+        components: built.components,
       },
     };
   }
@@ -1390,6 +1790,12 @@ export class DiscordAdapter extends BaseAdapter {
     }
     if (command === "cwd") {
       return `/cwd ${String(options?.getString?.("path") || "").trim()}`.trim();
+    }
+    if (command === "files") {
+      return "/files";
+    }
+    if (command === "search") {
+      return `/search ${String(options?.getString?.("query") || "").trim()}`.trim();
     }
     if (command === "help") {
       const topic = String(options?.getString?.("topic") || "").trim();

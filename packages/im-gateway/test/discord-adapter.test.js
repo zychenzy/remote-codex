@@ -430,6 +430,10 @@ test("discord adapter syncs native slash commands on startup and degrades on syn
   await adapter.stop();
   assert.equal(client.__commandSets.length, 1);
   assert.equal(client.__commandSets[0].some((entry) => entry.name === "model"), true);
+  const cwdCommand = client.__commandSets[0].find((entry) => entry.name === "cwd");
+  assert.equal(cwdCommand.options[0].required, false);
+  const searchCommand = client.__commandSets[0].find((entry) => entry.name === "search");
+  assert.equal(searchCommand.options[0].required, true);
 
   const failingClient = createFakeClient();
   failingClient.__channels.set("123", channel);
@@ -468,11 +472,17 @@ test("discord adapter normalizes native slash commands into canonical text comma
     options: createOptions({ subcommand: "set", values: { value: "gpt-5.4" } }),
     channel,
   }));
+  client.emit("interactionCreate", createSlashInteraction({
+    commandName: "search",
+    options: createOptions({ values: { query: "daemon-app" } }),
+    channel,
+  }));
   await new Promise((resolve) => setTimeout(resolve, 0));
   await adapter.stop();
 
-  assert.equal(seen.length, 1);
+  assert.equal(seen.length, 2);
   assert.equal(seen[0].text, "/model set gpt-5.4");
+  assert.equal(seen[1].text, "/search daemon-app");
   assert.equal(seen[0].discordMeta.kind, "slash");
 });
 
@@ -669,6 +679,201 @@ test("discord adapter renders generic command controls and maps select/button ac
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     assert.deepEqual(seen.map((entry) => entry.text), ["/resume thread-1", "/thread more"]);
+  } finally {
+    await adapter.stop();
+  }
+});
+
+test("discord adapter renders cwd browser controls and confirms selected directory", async () => {
+  const client = createFakeClient();
+  const channel = createFakeChannel({ id: "123" });
+  client.__channels.set("123", channel);
+  const adapter = createAdapter({
+    client,
+    allowedChannels: ["123"],
+    authorizeInteraction: async () => true,
+  });
+  const seen = [];
+  adapter.registerInboundHandler((context) => seen.push(context));
+
+  try {
+    await adapter.sendMessageRich(
+      { channel: "discord", chatId: "123", threadId: "123" },
+      {
+        text: "/Users/czy/auto",
+        nativeUi: {
+          kind: "cwdBrowser",
+          title: "Browse Workspace",
+          description: "Current workspace: /Users/czy/auto",
+          components: {
+            selects: [{
+              placeholder: "Select a subdirectory",
+              options: [{ label: "packages", description: "/Users/czy/auto/packages", path: "/Users/czy/auto/packages" }],
+            }],
+            buttons: [
+              { label: "Confirm", style: 3 },
+              { label: "Cancel", style: 4 },
+            ],
+          },
+        },
+      }
+    );
+
+    const message = channel.sent[0];
+    const selectId = message.components[0].components[0].custom_id;
+    const confirmId = message.components[1].components[0].custom_id;
+
+    const selectInteraction = createComponentInteraction({
+      kind: "select",
+      customId: selectId,
+      values: ["o0"],
+      channel,
+      message,
+    });
+    client.emit("interactionCreate", selectInteraction);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const confirmInteraction = createComponentInteraction({
+      kind: "button",
+      customId: confirmId,
+      channel,
+      message,
+    });
+    client.emit("interactionCreate", confirmInteraction);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    assert.equal(selectInteraction.updates.length, 1);
+    assert.equal(String(selectInteraction.updates[0].embeds[0].description || "").includes("Selected: /Users/czy/auto/packages"), true);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].text, "/cwd /Users/czy/auto/packages");
+    assert.equal(confirmInteraction.updates.length, 1);
+  } finally {
+    await adapter.stop();
+  }
+});
+
+test("discord adapter updates component response in place and channel-sends after deferred component interaction", async () => {
+  const client = createFakeClient();
+  const channel = createFakeChannel({ id: "123" });
+  client.__channels.set("123", channel);
+  const adapter = createAdapter({ client, allowedChannels: ["123"] });
+  const message = await channel.send({ content: "before" });
+  const component = createComponentInteraction({
+    kind: "select",
+    customId: "reco:test:s0",
+    channel,
+    message,
+  });
+
+  await adapter.sendMessageRich(
+    {
+      channel: "discord",
+      chatId: "123",
+      threadId: "123",
+      raw: component,
+      discordMeta: { kind: "select", responded: false },
+    },
+    { text: "updated in place" }
+  );
+
+  assert.equal(component.updates.length, 1);
+  assert.equal(message.content, "updated in place");
+
+  const deferred = createComponentInteraction({
+    kind: "button",
+    customId: "reco:test:b0",
+    channel,
+    message,
+  });
+  await deferred.deferUpdate();
+  await adapter.sendMessageRich(
+    {
+      channel: "discord",
+      chatId: "123",
+      threadId: "123",
+      raw: deferred,
+      discordMeta: { kind: "button", responded: false },
+    },
+    { text: "preview output" }
+  );
+
+  assert.equal(channel.sent.some((item) => item.content === "preview output"), true);
+});
+
+test("discord adapter renders file picker controls for browse and preview flow", async () => {
+  const client = createFakeClient();
+  const channel = createFakeChannel({ id: "123" });
+  client.__channels.set("123", channel);
+  const adapter = createAdapter({
+    client,
+    allowedChannels: ["123"],
+    authorizeInteraction: async () => true,
+  });
+  const seen = [];
+  adapter.registerInboundHandler((context) => seen.push(context));
+
+  try {
+    await adapter.sendMessageRich(
+      { channel: "discord", chatId: "123", threadId: "123" },
+      {
+        text: "Files",
+        nativeUi: {
+          kind: "filePicker",
+          mode: "browser",
+          rootDir: "/Users/czy/auto",
+          currentDir: "/Users/czy/auto",
+          parentDir: "/Users/czy",
+          canGoUp: false,
+          components: {
+            selects: [{
+              options: [
+                { label: "packages/", description: "dir", path: "/Users/czy/auto/packages", entryType: "dir" },
+                { label: "README.md", description: "file", path: "/Users/czy/auto/README.md", entryType: "file" },
+              ],
+            }],
+          },
+        },
+      }
+    );
+
+    const message = channel.sent[0];
+    const selectId = message.components[0].components[0].custom_id;
+    const buttonRow = message.components[1].components;
+    const previewId = buttonRow.find((entry) => entry.label === "Preview").custom_id;
+
+    client.emit("interactionCreate", createComponentInteraction({
+      kind: "select",
+      customId: selectId,
+      values: ["o0"],
+      channel,
+      message,
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].text.startsWith("/files --dir64 "), true);
+
+    const fileSelection = createComponentInteraction({
+      kind: "select",
+      customId: selectId,
+      values: ["o1"],
+      channel,
+      message,
+    });
+    client.emit("interactionCreate", fileSelection);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(fileSelection.updates.length, 1);
+    assert.equal(String(fileSelection.updates[0].embeds[0].description || "").includes("Selected file: /Users/czy/auto/README.md"), true);
+
+    const previewInteraction = createComponentInteraction({
+      kind: "button",
+      customId: previewId,
+      channel,
+      message,
+    });
+    client.emit("interactionCreate", previewInteraction);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(previewInteraction.__deferred, true);
+    assert.equal(seen.some((entry) => entry.text.includes("--preview64")), true);
   } finally {
     await adapter.stop();
   }

@@ -87,6 +87,24 @@ test("parser handles cwd command", () => {
   assert.equal(result.path, "~/projects/demo");
 });
 
+test("parser handles bare cwd command", () => {
+  const result = parseIncomingCommand("/cwd");
+  assert.equal(result.type, "cwd");
+  assert.equal(result.path, "");
+});
+
+test("parser handles files command", () => {
+  const result = parseIncomingCommand("/files");
+  assert.equal(result.type, "files");
+  assert.deepEqual(result.args, []);
+});
+
+test("parser handles search command", () => {
+  const result = parseIncomingCommand("/search daemon app");
+  assert.equal(result.type, "search");
+  assert.equal(result.pattern, "daemon app");
+});
+
 test("parser handles help command", () => {
   const result = parseIncomingCommand("/help approve");
   assert.equal(result.type, "help");

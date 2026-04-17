@@ -432,6 +432,362 @@ function buildDiscordModelPickerNativeUi({
   };
 }
 
+function listWorkspaceSubdirectories(currentDir) {
+  const normalized = String(currentDir || "").trim();
+  if (!normalized) {
+    return {
+      error: "Workspace is not set for this binding.",
+      currentDir: "",
+      directories: [],
+    };
+  }
+
+  try {
+    const stat = fs.statSync(normalized);
+    if (!stat.isDirectory()) {
+      return {
+        error: `Workspace is not a directory: ${normalized}`,
+        currentDir: normalized,
+        directories: [],
+      };
+    }
+  } catch {
+    return {
+      error: `Workspace directory does not exist: ${normalized}`,
+      currentDir: normalized,
+      directories: [],
+    };
+  }
+
+  const directories = [];
+  for (const entry of fs.readdirSync(normalized, { withFileTypes: true })) {
+    const fullPath = path.join(normalized, entry.name);
+    if (entry.isDirectory()) {
+      directories.push(fullPath);
+      continue;
+    }
+    if (entry.isSymbolicLink()) {
+      try {
+        if (fs.statSync(fullPath).isDirectory()) {
+          directories.push(fullPath);
+        }
+      } catch {
+        // Ignore broken links while listing candidates.
+      }
+    }
+  }
+
+  directories.sort((left, right) => hiddenNameLastCompare(path.basename(left), path.basename(right)));
+  return {
+    currentDir: normalized,
+    directories: directories.map((dirPath) => ({
+      path: dirPath,
+      label: path.basename(dirPath) || dirPath,
+    })),
+  };
+}
+
+function buildDiscordCwdBrowserNativeUi({ currentDir = "", directories = [] } = {}) {
+  const options = directories.slice(0, 25).map((entry) => ({
+    label: String(entry?.label || "").slice(0, 100),
+    description: String(entry?.path || "").slice(0, 100),
+    path: String(entry?.path || ""),
+  }));
+  const hasMore = directories.length > options.length;
+  return {
+    kind: "cwdBrowser",
+    title: "Browse Workspace",
+    description: [
+      `Current workspace: ${currentDir || "unknown"}`,
+      options.length
+        ? "Choose a subdirectory, then confirm to jump there."
+        : "No subdirectories found in the current workspace.",
+      hasMore ? `Showing first ${options.length} of ${directories.length} subdirectories.` : "",
+    ].filter(Boolean).join("\n"),
+    currentDir,
+    components: {
+      selects: options.length ? [{
+        placeholder: "Select a subdirectory",
+        options,
+      }] : [],
+      buttons: [
+        { label: "Confirm", style: 3, action: "confirm", disabled: options.length === 0 },
+        { label: "Cancel", style: 4, action: "cancel" },
+      ],
+    },
+  };
+}
+
+function hiddenNameLastCompare(leftName, rightName) {
+  const left = String(leftName || "");
+  const right = String(rightName || "");
+  const leftHidden = left.startsWith(".");
+  const rightHidden = right.startsWith(".");
+  if (leftHidden !== rightHidden) {
+    return leftHidden ? 1 : -1;
+  }
+  return left.localeCompare(right, undefined, { sensitivity: "base" });
+}
+
+function decodeCommandValue(value = "") {
+  const normalized = String(value || "").trim();
+  if (!normalized) {
+    return "";
+  }
+  try {
+    return Buffer.from(normalized, "base64url").toString("utf8");
+  } catch {
+    return "";
+  }
+}
+
+function isPathInsideRoot(candidatePath, rootPath) {
+  const candidate = path.resolve(String(candidatePath || "").trim());
+  const root = path.resolve(String(rootPath || "").trim());
+  if (!candidate || !root) {
+    return false;
+  }
+  return candidate === root || candidate.startsWith(`${root}${path.sep}`);
+}
+
+function validateDirectoryWithinRoot(rootDir, targetDir) {
+  const root = path.resolve(String(rootDir || "").trim());
+  const candidate = path.resolve(String(targetDir || "").trim());
+  if (!root || !candidate) {
+    return { error: "Workspace directory is not set." };
+  }
+  if (!isPathInsideRoot(candidate, root)) {
+    return { error: `Directory is outside workspace root: ${candidate}` };
+  }
+  try {
+    const stat = fs.statSync(candidate);
+    if (!stat.isDirectory()) {
+      return { error: `Not a directory: ${candidate}` };
+    }
+  } catch {
+    return { error: `Directory does not exist: ${candidate}` };
+  }
+  return { rootDir: root, currentDir: candidate };
+}
+
+function listWorkspaceEntries(rootDir, currentDir) {
+  const validated = validateDirectoryWithinRoot(rootDir, currentDir);
+  if (validated.error) {
+    return { error: validated.error, rootDir, currentDir, entries: [] };
+  }
+
+  const entries = [];
+  for (const entry of fs.readdirSync(validated.currentDir, { withFileTypes: true })) {
+    const fullPath = path.join(validated.currentDir, entry.name);
+    if (entry.isDirectory()) {
+      entries.push({
+        path: fullPath,
+        entryType: "dir",
+        label: `${entry.name}/`,
+        description: `dir | ${path.relative(validated.rootDir, fullPath) || entry.name}`.slice(0, 100),
+      });
+      continue;
+    }
+    if (entry.isFile()) {
+      entries.push({
+        path: fullPath,
+        entryType: "file",
+        label: entry.name,
+        description: `file | ${path.relative(validated.rootDir, fullPath) || entry.name}`.slice(0, 100),
+      });
+    }
+  }
+
+  entries.sort((left, right) => {
+    if (left.entryType !== right.entryType) {
+      return left.entryType === "dir" ? -1 : 1;
+    }
+    return hiddenNameLastCompare(left.label, right.label);
+  });
+
+  return {
+    rootDir: validated.rootDir,
+    currentDir: validated.currentDir,
+    entries,
+    canGoUp: validated.currentDir !== validated.rootDir,
+  };
+}
+
+function buildDiscordFilePickerNativeUi({
+  mode = "browser",
+  rootDir = "",
+  currentDir = "",
+  query = "",
+  entries = [],
+  canGoUp = false,
+} = {}) {
+  const limitedEntries = entries.slice(0, 25).map((entry) => ({
+    path: String(entry?.path || ""),
+    entryType: String(entry?.entryType || "file"),
+    label: String(entry?.label || "").slice(0, 100),
+    description: String(entry?.description || "").slice(0, 100),
+  }));
+  const hasMore = entries.length > limitedEntries.length;
+  const searching = mode === "search";
+  return {
+    kind: "filePicker",
+    mode,
+    title: searching ? "Search Files" : "Browse Files",
+    description: [
+      `Workspace root: ${rootDir || "unknown"}`,
+      searching ? `Query: ${query || "(empty)"}` : `Current directory: ${currentDir || "unknown"}`,
+      limitedEntries.length
+        ? (searching ? "Choose a file, then preview it." : "Select a directory to enter it, or select a file to preview.")
+        : (searching ? "No matching files found." : "This directory is empty."),
+      hasMore ? `Showing first ${limitedEntries.length} of ${entries.length} entries.` : "",
+    ].filter(Boolean).join("\n"),
+    rootDir,
+    currentDir,
+    parentDir: canGoUp ? path.dirname(currentDir) : rootDir,
+    query,
+    canGoUp,
+    components: {
+      selects: limitedEntries.length ? [{
+        placeholder: searching ? "Select a file result" : "Select a directory or file",
+        options: limitedEntries,
+      }] : [],
+    },
+  };
+}
+
+function formatFileListText({ mode = "browser", currentDir = "", query = "", entries = [] } = {}) {
+  const heading = mode === "search"
+    ? `Search results for "${query}" (${entries.length})`
+    : `Files in ${currentDir}`;
+  const lines = entries.slice(0, 25).map((entry, index) => {
+    const marker = entry.entryType === "dir" ? "[D]" : "[F]";
+    return `${index + 1}. ${marker} ${entry.label}`;
+  });
+  return [heading, ...lines].join("\n");
+}
+
+function searchWorkspaceFiles(rootDir, query, { limit = 100 } = {}) {
+  const root = path.resolve(String(rootDir || "").trim());
+  const needle = String(query || "").trim().toLowerCase();
+  if (!root || !needle) {
+    return [];
+  }
+
+  const results = [];
+  const stack = [root];
+  while (stack.length && results.length < limit) {
+    const currentDir = stack.pop();
+    let dirents = [];
+    try {
+      dirents = fs.readdirSync(currentDir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    dirents.sort((left, right) => hiddenNameLastCompare(left.name, right.name));
+    for (const entry of dirents) {
+      const fullPath = path.join(currentDir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === ".git") {
+          continue;
+        }
+        stack.push(fullPath);
+        continue;
+      }
+      if (!entry.isFile()) {
+        continue;
+      }
+      const relativePath = path.relative(root, fullPath) || entry.name;
+      if (!relativePath.toLowerCase().includes(needle)) {
+        continue;
+      }
+      results.push({
+        path: fullPath,
+        entryType: "file",
+        label: entry.name,
+        description: relativePath.slice(0, 100),
+      });
+      if (results.length >= limit) {
+        break;
+      }
+    }
+  }
+
+  results.sort((left, right) => left.description.localeCompare(right.description, undefined, { sensitivity: "base" }));
+  return results;
+}
+
+function looksBinary(buffer) {
+  for (const byte of buffer) {
+    if (byte === 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function fenceInfoForFile(filePath) {
+  const ext = path.extname(filePath).replace(/^\./, "").trim().toLowerCase();
+  return /^[a-z0-9_+-]{1,20}$/.test(ext) ? ext : "txt";
+}
+
+function escapeFenceContent(text = "") {
+  return String(text || "").replace(/```/g, "``\\`");
+}
+
+function buildFilePreview(filePath, rootDir) {
+  const resolvedFile = path.resolve(String(filePath || "").trim());
+  const resolvedRoot = path.resolve(String(rootDir || "").trim());
+  if (!resolvedFile || !resolvedRoot) {
+    return { error: "Preview target is missing." };
+  }
+  if (!isPathInsideRoot(resolvedFile, resolvedRoot)) {
+    return { error: `Preview target is outside workspace root: ${resolvedFile}` };
+  }
+
+  let stat;
+  try {
+    stat = fs.statSync(resolvedFile);
+  } catch {
+    return { error: `File does not exist: ${resolvedFile}` };
+  }
+  if (!stat.isFile()) {
+    return { error: `Not a file: ${resolvedFile}` };
+  }
+
+  const previewBytes = Math.min(stat.size, 8192);
+  const buffer = Buffer.alloc(previewBytes);
+  const fd = fs.openSync(resolvedFile, "r");
+  try {
+    fs.readSync(fd, buffer, 0, previewBytes, 0);
+  } finally {
+    fs.closeSync(fd);
+  }
+
+  const relativePath = path.relative(resolvedRoot, resolvedFile) || path.basename(resolvedFile);
+  if (looksBinary(buffer)) {
+    return {
+      text: [
+        `Preview unavailable for binary file: ${relativePath}`,
+        `Path: ${resolvedFile}`,
+        `Size: ${stat.size} bytes`,
+      ].join("\n"),
+    };
+  }
+
+  const previewText = escapeFenceContent(buffer.toString("utf8").replace(/\r/g, ""));
+  const truncated = stat.size > previewBytes;
+  return {
+    text: [
+      `Preview: ${relativePath}`,
+      `Path: ${resolvedFile}`,
+      truncated ? `Showing first ${previewBytes} bytes of ${stat.size}.` : `Size: ${stat.size} bytes`,
+      `\`\`\`${fenceInfoForFile(resolvedFile)}`,
+      previewText,
+      "```",
+    ].join("\n"),
+  };
+}
+
 function formatRuntimeError(error) {
   const message = String(error?.message || "unknown error");
   const lower = message.toLowerCase();
@@ -714,7 +1070,7 @@ function planItemText(item) {
       return "";
     })
     .filter(Boolean);
-  return parts.join("\n").trim();
+  return parts.join("").trim();
 }
 
 function trimToLimit(text, maxLen = 120_000) {
@@ -895,6 +1251,7 @@ export class DaemonApp {
       bindingKeyFn: bindingKey,
       isThreadNotFoundError,
       extractThreadCwd,
+      resumeThread: (threadId) => this.runtime.resumeThread(threadId),
     });
     this.store.appendAudit({
       type: "runtime_state_rehydrated",
@@ -1084,7 +1441,9 @@ export class DaemonApp {
         approvalMode: this.config.defaults?.approvalMode || "on-request",
         allowlist: this.#channelAllowlist(context.channel),
         autoApprove: false,
+        collaborationMode: "default",
         threadAutoApproveByThreadId: {},
+        threadPlanModeByThreadId: {},
       },
     });
 
@@ -1128,6 +1487,87 @@ export class DaemonApp {
 
   #getAdapter(channel) {
     return this.adapters.find((adapter) => adapter.channel === channel) || null;
+  }
+
+  #threadPlanModeMap(binding) {
+    const raw = binding?.policyProfile?.threadPlanModeByThreadId;
+    if (!raw || typeof raw !== "object") {
+      return {};
+    }
+    const out = {};
+    for (const [threadId, enabled] of Object.entries(raw)) {
+      const id = String(threadId || "").trim();
+      if (!id) {
+        continue;
+      }
+      out[id] = Boolean(enabled);
+    }
+    return out;
+  }
+
+  #threadPlanEnabled(binding, threadId) {
+    const id = String(threadId || "").trim();
+    if (!id) {
+      return false;
+    }
+    return Boolean(this.#threadPlanModeMap(binding)[id]);
+  }
+
+  #setThreadPlanMode(binding, threadId, enabled) {
+    const id = String(threadId || "").trim();
+    if (!id) {
+      return binding;
+    }
+    const nextMap = this.#threadPlanModeMap(binding);
+    if (enabled) {
+      nextMap[id] = true;
+    } else {
+      delete nextMap[id];
+    }
+    return this.store.upsertBinding({
+      ...binding,
+      policyProfile: {
+        ...binding.policyProfile,
+        collaborationMode: "default",
+        threadPlanModeByThreadId: nextMap,
+      },
+    });
+  }
+
+  #clearThreadPlanModeForThread(binding, threadId) {
+    if (!binding) {
+      return null;
+    }
+    const id = String(threadId || "").trim();
+    if (!id) {
+      return binding;
+    }
+    const nextMap = this.#threadPlanModeMap(binding);
+    if (!nextMap[id]) {
+      return binding;
+    }
+    delete nextMap[id];
+    return this.store.upsertBinding({
+      ...binding,
+      policyProfile: {
+        ...binding.policyProfile,
+        threadPlanModeByThreadId: nextMap,
+      },
+    });
+  }
+
+  #effectiveCollaborationMode(binding, threadId, override = undefined) {
+    if (override !== undefined) {
+      return override;
+    }
+    if (this.#threadPlanEnabled(binding, threadId)) {
+      return "plan";
+    }
+    const sticky = String(binding?.policyProfile?.collaborationMode || "").trim().toLowerCase();
+    if (!sticky || sticky === "default" || sticky === "plan") {
+      return "default";
+    }
+    return binding.policyProfile.collaborationMode;
   }
 
   #threadAutoApproveMap(binding) {
@@ -1996,7 +2436,11 @@ export class DaemonApp {
       cwd,
       model: overrides.model ?? binding.policyProfile.model ?? null,
       effort: overrides.effort ?? binding.policyProfile.reasoningEffort ?? null,
-      collaborationMode: overrides.collaborationMode ?? binding.policyProfile.collaborationMode ?? null,
+      collaborationMode: this.#effectiveCollaborationMode(
+        binding,
+        threadId,
+        overrides.collaborationMode
+      ),
     };
 
     return startTurnWithRecovery({
@@ -2341,16 +2785,12 @@ export class DaemonApp {
     if (!bKey) {
       return;
     }
-    const [channel, chatId] = bKey.split(":");
+    const [channel] = bKey.split(":");
     const adapter = this.#getAdapter(channel);
     if (!adapter || adapter.channel !== "discord" || !this.#discordTurnState(turnId)?.presentationEnabled) {
       return;
     }
-    const text = planItemText(params?.item || { content: [{ type: "text", text: detectDelta(params) || "" }] });
-    if (!text) {
-      return;
-    }
-    await this.#sendDiscordPlanUpdate(adapter, channel, chatId, threadId, turnId, text);
+    return;
   }
 
   async #handleTurnPlanUpdated(params) {
@@ -2412,6 +2852,7 @@ export class DaemonApp {
         const [channel, chatId] = bKey.split(":");
         const binding = this.store.getBinding(channel, chatId);
         this.#clearThreadAutoApproveForThread(binding, threadId);
+        this.#clearThreadPlanModeForThread(binding, threadId);
       }
     }
     this.store.appendAudit({ type: "thread_closed", threadId: threadId || null });
@@ -2428,7 +2869,7 @@ export class DaemonApp {
         const [channel, chatId] = bKey.split(":");
         const binding = this.store.getBinding(channel, chatId);
         const updated = this.#clearThreadAutoApproveForThread(binding, threadId);
-        const effective = updated || binding;
+        const effective = this.#clearThreadPlanModeForThread(updated || binding, threadId) || updated || binding;
         if (effective?.threadId === threadId) {
           this.store.upsertBinding({
             ...effective,
@@ -2455,6 +2896,9 @@ export class DaemonApp {
       const [channel, chatId] = bKey.split(":");
       const adapter = this.#getAdapter(channel);
       if (!adapter) {
+        return;
+      }
+      if (adapter.channel === "discord" && this.#discordTurnState(turnId)?.presentationEnabled && this.outputPolicy.discord.useLiveEdits) {
         return;
       }
       const text = planItemText(item);
@@ -3427,33 +3871,31 @@ export class DaemonApp {
 
     if (command.type === "plan") {
       const action = String(command.action || "show").toLowerCase();
+      const currentThreadId = String(binding.threadId || "").trim();
       if (["show", "status"].includes(action)) {
-        const enabled = String(binding.policyProfile?.collaborationMode || "").toLowerCase() === "plan";
-        await this.#sendMessage(adapter, context, `Plan mode is ${enabled ? "ON" : "OFF"} for this binding.`);
+        const enabled = this.#threadPlanEnabled(binding, currentThreadId);
+        const label = currentThreadId || "(no active thread)";
+        await this.#sendMessage(adapter, context, `Plan mode is ${enabled ? "ON" : "OFF"} for ${currentThreadId ? label : "the current chat (no active thread selected)"}.`);
         return;
       }
       if (["on", "enable", "enabled"].includes(action)) {
-        const updated = this.store.upsertBinding({
-          ...binding,
-          policyProfile: {
-            ...binding.policyProfile,
-            collaborationMode: "plan",
-          },
-        });
+        if (!currentThreadId) {
+          await this.#sendMessage(adapter, context, "No active thread selected. Resume or start a thread first, then run /plan on.");
+          return;
+        }
+        const updated = this.#setThreadPlanMode(binding, currentThreadId, true);
         Object.assign(binding, updated);
-        await this.#sendMessage(adapter, context, "Plan mode enabled. New turns will run with mode: plan.");
+        await this.#sendMessage(adapter, context, `Plan mode enabled for ${currentThreadId}. New turns on this thread will run with mode: plan.`);
         return;
       }
       if (["off", "disable", "disabled"].includes(action)) {
-        const updated = this.store.upsertBinding({
-          ...binding,
-          policyProfile: {
-            ...binding.policyProfile,
-            collaborationMode: "default",
-          },
-        });
+        if (!currentThreadId) {
+          await this.#sendMessage(adapter, context, "No active thread selected. Resume or start a thread first, then run /plan off.");
+          return;
+        }
+        const updated = this.#setThreadPlanMode(binding, currentThreadId, false);
         Object.assign(binding, updated);
-        await this.#sendMessage(adapter, context, "Plan mode disabled. New turns will run with mode: default.");
+        await this.#sendMessage(adapter, context, `Plan mode disabled for ${currentThreadId}. New turns on this thread will run with mode: default.`);
         return;
       }
       await this.#sendMessage(adapter, context, "Usage: /plan <on|off|show>");
@@ -3689,6 +4131,27 @@ export class DaemonApp {
     }
 
     if (command.type === "cwd") {
+      if (!String(command.path || "").trim()) {
+        if (adapter.channel === "discord") {
+          const listed = listWorkspaceSubdirectories(binding.workingDir);
+          if (listed.error) {
+            await this.#sendMessage(adapter, context, listed.error);
+            return;
+          }
+          await this.#sendRichMessage(adapter, context, {
+            text: listed.currentDir,
+            nativeUi: buildDiscordCwdBrowserNativeUi({
+              currentDir: listed.currentDir,
+              directories: listed.directories,
+            }),
+          });
+          return;
+        }
+
+        await this.#sendMessage(adapter, context, `Workspace: ${binding.workingDir}`);
+        return;
+      }
+
       const resolved = resolveWorkspacePath(command.path, binding.workingDir);
       if (resolved.error) {
         await this.#sendMessage(adapter, context, resolved.error);
@@ -3704,6 +4167,106 @@ export class DaemonApp {
         context,
         `Workspace set to: ${updated.workingDir}`
       );
+      return;
+    }
+
+    if (command.type === "files") {
+      const { options } = parseArgsAndOptions(command.args);
+      const rootDir = decodeCommandValue(options.root64) || binding.workingDir;
+      const currentDir = decodeCommandValue(options.dir64) || binding.workingDir;
+      const previewPath = decodeCommandValue(options.preview64);
+
+      if (previewPath) {
+        const preview = buildFilePreview(previewPath, rootDir);
+        if (preview.error) {
+          await this.#sendMessage(adapter, context, preview.error);
+          return;
+        }
+        await this.#sendLongMessage(adapter, context, preview.text, {
+          maxLen: this.outputPolicy.discord.finalMessageMaxLen,
+          delayMs: this.outputPolicy.discord.finalMessageDelayMs,
+        });
+        return;
+      }
+
+      const listed = listWorkspaceEntries(rootDir, currentDir);
+      if (listed.error) {
+        await this.#sendMessage(adapter, context, listed.error);
+        return;
+      }
+
+      if (adapter.channel === "discord") {
+        await this.#sendRichMessage(adapter, context, {
+          text: "",
+          nativeUi: buildDiscordFilePickerNativeUi({
+            mode: "browser",
+            rootDir: listed.rootDir,
+            currentDir: listed.currentDir,
+            entries: listed.entries,
+            canGoUp: listed.canGoUp,
+          }),
+        });
+        return;
+      }
+
+      await this.#sendMessage(adapter, context, formatFileListText({
+        mode: "browser",
+        currentDir: listed.currentDir,
+        entries: listed.entries,
+      }));
+      return;
+    }
+
+    if (command.type === "search") {
+      const { options } = parseArgsAndOptions(command.args);
+      const rootDir = decodeCommandValue(options.root64) || binding.workingDir;
+      const previewPath = decodeCommandValue(options.preview64);
+      const queryFromOption = decodeCommandValue(options.query64);
+      const query = queryFromOption || String(command.pattern || "").trim();
+
+      if (previewPath) {
+        const preview = buildFilePreview(previewPath, rootDir);
+        if (preview.error) {
+          await this.#sendMessage(adapter, context, preview.error);
+          return;
+        }
+        await this.#sendLongMessage(adapter, context, preview.text, {
+          maxLen: this.outputPolicy.discord.finalMessageMaxLen,
+          delayMs: this.outputPolicy.discord.finalMessageDelayMs,
+        });
+        return;
+      }
+
+      if (!query) {
+        await this.#sendMessage(adapter, context, "Usage: /search <file-name-fragment>");
+        return;
+      }
+
+      const matches = searchWorkspaceFiles(rootDir, query);
+      if (adapter.channel === "discord") {
+        await this.#sendRichMessage(adapter, context, {
+          text: formatFileListText({
+            mode: "search",
+            query,
+            entries: matches,
+          }),
+          nativeUi: buildDiscordFilePickerNativeUi({
+            mode: "search",
+            rootDir,
+            currentDir: rootDir,
+            query,
+            entries: matches,
+            canGoUp: false,
+          }),
+        });
+        return;
+      }
+
+      await this.#sendMessage(adapter, context, formatFileListText({
+        mode: "search",
+        query,
+        entries: matches,
+      }));
       return;
     }
 

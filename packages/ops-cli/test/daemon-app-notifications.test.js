@@ -21,15 +21,20 @@ class FakeRuntime {
     listThreadsResponse = { data: [], nextCursor: null },
     modelsResponse = { data: [] },
     collaborationModesResponse = { data: [] },
+    startTurnImpl = null,
+    resumeThreadImpl = null,
   } = {}) {
     this.loadedThreadIds = loadedThreadIds;
     this.threadReads = new Map(Object.entries(threadReads));
     this.handlers = new Map();
     this.serverResponses = [];
     this.startTurnCalls = [];
+    this.resumeThreadCalls = [];
     this.listThreadsResponse = listThreadsResponse;
     this.modelsResponse = modelsResponse;
     this.collaborationModesResponse = collaborationModesResponse;
+    this.startTurnImpl = startTurnImpl;
+    this.resumeThreadImpl = resumeThreadImpl;
   }
 
   on(event, handler) {
@@ -84,6 +89,10 @@ class FakeRuntime {
   }
 
   async resumeThread(threadId) {
+    this.resumeThreadCalls.push(threadId);
+    if (typeof this.resumeThreadImpl === "function") {
+      return this.resumeThreadImpl(threadId);
+    }
     const existing = this.threadReads.get(threadId);
     if (existing?.thread) {
       return {
@@ -98,6 +107,9 @@ class FakeRuntime {
 
   async startTurn(params) {
     this.startTurnCalls.push(params);
+    if (typeof this.startTurnImpl === "function") {
+      return this.startTurnImpl(params, this.startTurnCalls.length);
+    }
     const turnId = "turn-start-" + this.startTurnCalls.length;
     return { turn: { id: turnId, status: "inProgress" } };
   }
@@ -215,6 +227,52 @@ test("daemon sends lightweight restored thread context on startup without transc
   }
 });
 
+test("daemon eagerly resumes restored threads at startup so the first follow-up command works without recovery announcements", async () => {
+  let attempts = 0;
+  const { app, adapter, runtime } = await setupDaemonHarness({
+    clearStartupMessages: false,
+    runtimeOptions: {
+      loadedThreadIds: [],
+      startTurnImpl: async (_params) => {
+        attempts += 1;
+        if (runtime.resumeThreadCalls.length === 0) {
+          throw new Error("thread not found: thread-1");
+        }
+        return { turn: { id: `turn-start-${attempts}`, status: "inProgress" } };
+      },
+    },
+  });
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      messageId: "user-msg-cwd-after-restart",
+      text: "/cwd /tmp",
+    });
+    await sleep(80);
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      messageId: "user-msg-ask-after-cwd",
+      text: "/ask hello after restart",
+    });
+    await sleep(80);
+  } finally {
+    await app.stop();
+  }
+
+  const restored = adapter.messages.filter((item) => item.text.includes("Restored thread context: thread-1"));
+  assert.equal(restored.length, 1);
+  assert.deepEqual(runtime.resumeThreadCalls, ["thread-1"]);
+  assert.equal(runtime.startTurnCalls.length, 1);
+  assert.equal(attempts, 1);
+  assert.equal(adapter.messages.some((item) => item.text === "Workspace set to: /tmp"), true);
+  assert.equal(adapter.messages.some((item) => item.text === "Working on it..."), true);
+});
+
 test("daemon creates direct live status message and reply-anchors final assistant output", async () => {
   const { app, runtime, adapter } = await setupDaemonHarness();
   app.outputPolicy.discord.statusEditIntervalMs = 0;
@@ -312,8 +370,8 @@ test("daemon surfaces discord plan updates as separate messages", async () => {
       channel: "discord",
       chatId: "chat-1",
       userId: "user-1",
-      text: "/ask plan something",
-      messageId: "user-msg-plan",
+      messageId: "user-msg-plan-1",
+      text: "/ask inspect repo",
     });
     await sleep(40);
 
@@ -329,18 +387,82 @@ test("daemon surfaces discord plan updates as separate messages", async () => {
         explanation: "Working through the repo",
         plan: [
           { step: "Inspect files", status: "completed" },
-          { step: "Draft response", status: "inProgress" },
+          { step: "Summarize findings", status: "pending" },
         ],
       },
     });
-    await sleep(30);
+    await sleep(40);
   } finally {
     await app.stop();
   }
 
   assert.equal(adapter.messages.some((item) => item.text.includes("Plan update")), true);
-  assert.equal(adapter.messages.some((item) => item.text.includes("Inspect files")), true);
-  assert.equal(adapter.messages.some((item) => item.text.includes("Plan update") && item.replyToMessageId), false);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Working through the repo")), true);
+});
+
+test("daemon does not emit tokenized plan delta fragments as separate discord messages during live presentation", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      messageId: "user-msg-plan-delta-fragments-1",
+      text: "/ask benchmark this model again",
+    });
+    await sleep(40);
+
+    runtime.emit("notification", {
+      method: "item/plan/delta",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-start-1",
+        outputDelta: "98",
+      },
+    });
+    runtime.emit("notification", {
+      method: "item/plan/delta",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-start-1",
+        outputDelta: "K",
+      },
+    });
+    runtime.emit("notification", {
+      method: "item/plan/delta",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-start-1",
+        outputDelta: "settings",
+      },
+    });
+    await sleep(40);
+
+    runtime.emit("notification", {
+      method: "turn/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-start-1",
+        turn: {
+          status: "completed",
+          items: [
+            {
+              type: "agentMessage",
+              content: [{ type: "text", text: "98K settings summary" }],
+            },
+          ],
+        },
+      },
+    });
+    await sleep(80);
+  } finally {
+    await app.stop();
+  }
+
+  const tokenSpam = adapter.messages.filter((item) => ["98", "K", "settings"].includes(item.text));
+  assert.equal(tokenSpam.length, 0);
+  assert.equal(adapter.messages.some((item) => item.text.includes("98K settings summary")), true);
 });
 
 test("daemon ignores live terminal output deltas on discord", async () => {
@@ -994,6 +1116,48 @@ test("daemon delivers completed plan item text", async () => {
   assert.equal(adapter.messages.some((item) => item.text.includes("- step 1")), true);
 });
 
+test("daemon preserves inline plan text fragments without inserting line breaks", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+  try {
+    runtime.emit("notification", {
+      method: "turn/started",
+      params: { threadId: "thread-1", turnId: "turn-plan-fragments-1" },
+    });
+    await sleep(20);
+    runtime.emit("notification", {
+      method: "item/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-plan-fragments-1",
+        item: {
+          id: "plan-item-fragments-1",
+          type: "plan",
+          content: [
+            { type: "text", text: "## " },
+            { type: "text", text: "98K " },
+            { type: "text", text: "Smoke " },
+            { type: "text", text: "Test " },
+            { type: "text", text: "For " },
+            { type: "text", text: "`Qwen 3.6-35B-A3B-UD`" },
+          ],
+        },
+      },
+    });
+    await sleep(40);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(
+    adapter.messages.some((item) => item.text.includes("## 98K Smoke Test For `Qwen 3.6-35B-A3B-UD`")),
+    true
+  );
+  assert.equal(
+    adapter.messages.some((item) => item.text.includes("## \n98K \nSmoke \nTest \nFor \n`Qwen 3.6-35B-A3B-UD`")),
+    false
+  );
+});
+
 test("daemon /resume sends thread history blocks through integrated command flow", async () => {
   const baseDir = tempDir();
   const app = new DaemonApp({ baseDir });
@@ -1118,13 +1282,76 @@ test("daemon /resume includes plan item text in thread history", async () => {
       userId: "user-1",
       text: "/resume thread-plan-history",
     });
-    await sleep(450);
+    await sleep(900);
   } finally {
     await app.stop();
   }
 
-  assert.equal(adapter.messages.some((item) => item.text.includes("Resumed thread: thread-plan-history")), true);
   assert.equal(adapter.messages.some((item) => item.text.includes("# Plan from thread history")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("- one")), true);
+});
+
+test("daemon /resume preserves inline fragmented user text without inserting line breaks", async () => {
+  const baseDir = tempDir();
+  const app = new DaemonApp({ baseDir });
+  const runtime = new FakeRuntime({
+    loadedThreadIds: ["thread-fragment-history"],
+    threadReads: {
+      "thread-fragment-history": {
+        thread: {
+          id: "thread-fragment-history",
+          cwd: "/Users/czy/auto",
+          turns: [
+            {
+              items: [
+                {
+                  type: "userMessage",
+                  content: [
+                    { type: "text", text: "## " },
+                    { type: "text", text: "98K " },
+                    { type: "text", text: "Smoke " },
+                    { type: "text", text: "Test" },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      },
+    },
+  });
+  const adapter = new StubDiscordAdapter();
+
+  app.runtime = runtime;
+  app.adapters.push(adapter);
+  app.store.upsertBinding({
+    channel: "discord",
+    chatId: "chat-1",
+    userId: "user-1",
+    threadId: "thread-1",
+    workingDir: "/Users/czy/auto",
+    policyProfile: {
+      approvalMode: "on-request",
+      allowlist: ["user-1"],
+      autoApprove: false,
+    },
+  });
+
+  try {
+    await app.start();
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/resume thread-fragment-history",
+    });
+    await sleep(900);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(adapter.messages.some((item) => item.text.includes("User:\n> ## 98K Smoke Test")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("> ## \n> 98K \n> Smoke \n> Test")), false);
 });
 
 test("daemon supports /cwd absolute, ~, and /workspace alias with resolved errors", async () => {
@@ -1172,6 +1399,116 @@ test("daemon supports /cwd absolute, ~, and /workspace alias with resolved error
   assert.equal(adapter.messages.some((item) => item.text.includes("Workspace set to: /tmp")), true);
   assert.equal(adapter.messages.some((item) => item.text.includes(`Directory does not exist: ${missing}`)), true);
   assert.equal(adapter.messages.some((item) => item.text.includes("(resolved: ")), true);
+});
+
+test("daemon bare /cwd on discord emits a cwd browser for current subdirectories", async () => {
+  const { app, adapter } = await setupDaemonHarness();
+  const workspace = tempDir();
+  fs.mkdirSync(path.join(workspace, "alpha"));
+  fs.mkdirSync(path.join(workspace, "beta"));
+  fs.mkdirSync(path.join(workspace, ".cache"));
+  app.store.upsertBinding({
+    ...app.store.getBinding("discord", "chat-1"),
+    workingDir: workspace,
+  });
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/cwd",
+    });
+    await sleep(60);
+  } finally {
+    await app.stop();
+  }
+
+  const message = adapter.messages.find((item) => item.nativeUi?.kind === "cwdBrowser");
+  assert.ok(message);
+  assert.equal(message.nativeUi.title, "Browse Workspace");
+  assert.deepEqual(
+    message.nativeUi.components.selects[0].options.map((option) => option.path),
+    [path.join(workspace, "alpha"), path.join(workspace, "beta"), path.join(workspace, ".cache")]
+  );
+  assert.deepEqual(
+    message.nativeUi.components.buttons.map((button) => button.action),
+    ["confirm", "cancel"]
+  );
+});
+
+test("daemon /files on discord emits a file picker for current workspace", async () => {
+  const { app, adapter } = await setupDaemonHarness();
+  const workspace = tempDir();
+  fs.mkdirSync(path.join(workspace, "src"));
+  fs.mkdirSync(path.join(workspace, ".git"));
+  fs.writeFileSync(path.join(workspace, "README.md"), "# hi\n");
+  fs.writeFileSync(path.join(workspace, ".env"), "A=1\n");
+  app.store.upsertBinding({
+    ...app.store.getBinding("discord", "chat-1"),
+    workingDir: workspace,
+  });
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/files",
+    });
+    await sleep(60);
+  } finally {
+    await app.stop();
+  }
+
+  const message = adapter.messages.find((item) => item.nativeUi?.kind === "filePicker");
+  assert.ok(message);
+  assert.equal(message.nativeUi.mode, "browser");
+  assert.equal(message.text, "");
+  assert.deepEqual(
+    message.nativeUi.components.selects[0].options.map((option) => [option.label, option.entryType]),
+    [["src/", "dir"], [".git/", "dir"], ["README.md", "file"], [".env", "file"]]
+  );
+});
+
+test("daemon /search recursively finds files in current workspace and preview command returns contents", async () => {
+  const { app, adapter } = await setupDaemonHarness();
+  const workspace = tempDir();
+  fs.mkdirSync(path.join(workspace, "nested"), { recursive: true });
+  const targetFile = path.join(workspace, "nested", "daemon-app-notes.md");
+  fs.writeFileSync(targetFile, "line 1\nline 2\n");
+  app.store.upsertBinding({
+    ...app.store.getBinding("discord", "chat-1"),
+    workingDir: workspace,
+  });
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/search daemon-app",
+    });
+    await sleep(60);
+
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: `/search --preview64 ${Buffer.from(targetFile, "utf8").toString("base64url")} --root64 ${Buffer.from(workspace, "utf8").toString("base64url")}`,
+    });
+    await sleep(60);
+  } finally {
+    await app.stop();
+  }
+
+  const searchMessage = adapter.messages.find((item) => item.nativeUi?.kind === "filePicker" && item.nativeUi?.mode === "search");
+  assert.ok(searchMessage);
+  assert.deepEqual(
+    searchMessage.nativeUi.components.selects[0].options.map((option) => option.path),
+    [targetFile]
+  );
+  assert.equal(adapter.messages.some((item) => item.text.includes("Preview: nested/daemon-app-notes.md")), true);
 });
 
 test("daemon /status includes auth inheritance note", async () => {
@@ -1338,9 +1675,16 @@ test("daemon clears thread auto-approve toggle when thread is archived or closed
   assert.equal(Boolean(map["thread-2"]), false);
 });
 
-test("daemon supports /plan on|off|show alias", async () => {
+test("daemon scopes /plan on|off|show to the current thread and keeps plan mode off by default", async () => {
   const { app, adapter } = await setupDaemonHarness();
   try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/plan show",
+    });
+    await sleep(40);
     adapter.emitInbound({
       channel: "discord",
       chatId: "chat-1",
@@ -1348,6 +1692,41 @@ test("daemon supports /plan on|off|show alias", async () => {
       text: "/plan on",
     });
     await sleep(60);
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/plan show",
+    });
+    await sleep(40);
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/resume thread-2",
+    });
+    await sleep(80);
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/plan show",
+    });
+    await sleep(40);
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/plan on",
+    });
+    await sleep(60);
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/resume thread-1",
+    });
+    await sleep(80);
     adapter.emitInbound({
       channel: "discord",
       chatId: "chat-1",
@@ -1374,11 +1753,14 @@ test("daemon supports /plan on|off|show alias", async () => {
   }
 
   const binding = app.store.getBinding("discord", "chat-1");
-  assert.equal(binding?.policyProfile?.collaborationMode ?? null, "default");
-  assert.equal(adapter.messages.some((item) => item.text.includes("Plan mode enabled")), true);
-  assert.equal(adapter.messages.some((item) => item.text.includes("Plan mode is ON")), true);
-  assert.equal(adapter.messages.some((item) => item.text.includes("Plan mode disabled")), true);
-  assert.equal(adapter.messages.some((item) => item.text.includes("Plan mode is OFF")), true);
+  assert.equal(binding?.policyProfile?.collaborationMode ?? "default", "default");
+  assert.deepEqual(binding?.policyProfile?.threadPlanModeByThreadId || {}, { "thread-2": true });
+  assert.equal(adapter.messages.some((item) => item.text.includes("Plan mode is OFF for thread-1")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Plan mode enabled for thread-1")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Plan mode is ON for thread-1")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Plan mode is OFF for thread-2")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Plan mode enabled for thread-2")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Plan mode disabled for thread-1")), true);
 });
 
 test("daemon /thread list on discord emits native thread controls alongside text fallback", async () => {

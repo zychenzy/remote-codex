@@ -177,5 +177,22 @@ export function parseIncomingCommand(text = "") {
     return { type: "cwd", path: trimmed.slice(parts[0].length).trim() };
   }
 
+  if (cmd === "/files") {
+    return {
+      type: "files",
+      args: parts.slice(1),
+      raw: trimmed,
+    };
+  }
+
+  if (cmd === "/search") {
+    return {
+      type: "search",
+      pattern: trimmed.slice(parts[0].length).trim(),
+      args: parts.slice(1),
+      raw: trimmed,
+    };
+  }
+
   return { type: "unknown", raw: trimmed };
 }
