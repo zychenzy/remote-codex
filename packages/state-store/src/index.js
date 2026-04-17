@@ -108,6 +108,15 @@ function normalizeThreadAutoApproveByThreadId(raw = {}, { maxEntries = 500 } = {
   return Object.fromEntries(entries);
 }
 
+function normalizeThreadPlanModeByThreadId(raw = {}, { maxEntries = 500 } = {}) {
+  const source = raw && typeof raw === "object" ? raw : {};
+  const entries = Object.entries(source)
+    .map(([threadId, enabled]) => [String(threadId || "").trim(), Boolean(enabled)])
+    .filter(([threadId, enabled]) => threadId && enabled)
+    .slice(-maxEntries);
+  return Object.fromEntries(entries);
+}
+
 function normalizeStringList(raw = [], { maxEntries = 200 } = {}) {
   const values = Array.isArray(raw) ? raw : [];
   return [...new Set(
@@ -278,6 +287,11 @@ export class StateStore {
         policy.threadAutoApproveByThreadId = normalizedThreadAutoApprove;
         changed = true;
       }
+      const normalizedThreadPlanMode = normalizeThreadPlanModeByThreadId(policy.threadPlanModeByThreadId);
+      if (JSON.stringify(policy.threadPlanModeByThreadId || {}) !== JSON.stringify(normalizedThreadPlanMode)) {
+        policy.threadPlanModeByThreadId = normalizedThreadPlanMode;
+        changed = true;
+      }
       const normalizedAutopilot = normalizeAutopilotPolicy(policy.autopilot);
       if (JSON.stringify(policy.autopilot || {}) !== JSON.stringify(normalizedAutopilot)) {
         policy.autopilot = normalizedAutopilot;
@@ -346,6 +360,11 @@ export class StateStore {
         hasPolicyField("threadAutoApproveByThreadId")
           ? (incomingPolicy.threadAutoApproveByThreadId ?? {})
           : (existing.policyProfile?.threadAutoApproveByThreadId ?? {})
+      ),
+      threadPlanModeByThreadId: normalizeThreadPlanModeByThreadId(
+        hasPolicyField("threadPlanModeByThreadId")
+          ? (incomingPolicy.threadPlanModeByThreadId ?? {})
+          : (existing.policyProfile?.threadPlanModeByThreadId ?? {})
       ),
     };
 
