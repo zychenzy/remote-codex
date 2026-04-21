@@ -86,8 +86,9 @@ export function commandManual(topic = "") {
       "/cwd [path]  (alias: /workspace <path>)",
       "Updates this binding workspace directory.",
       "On Discord, bare /cwd opens a subdirectory picker for the current workspace.",
+      "Use /cwd browse <dir> to open the same picker at a specific directory without changing the workspace yet.",
       "Supports absolute path, relative path, and ~.",
-      "Examples: /cwd ~/auto, /cwd /Users/czy/auto",
+      "Examples: /cwd ~/auto, /cwd /Users/czy/auto, /cwd browse ~/auto/packages",
     ].join("\n");
   }
 

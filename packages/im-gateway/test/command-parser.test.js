@@ -93,6 +93,12 @@ test("parser handles bare cwd command", () => {
   assert.equal(result.path, "");
 });
 
+test("parser handles cwd browse command", () => {
+  const result = parseIncomingCommand("/cwd browse ~/auto/packages");
+  assert.equal(result.type, "cwd");
+  assert.equal(result.path, "browse ~/auto/packages");
+});
+
 test("parser handles files command", () => {
   const result = parseIncomingCommand("/files");
   assert.equal(result.type, "files");

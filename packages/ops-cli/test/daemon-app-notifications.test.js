@@ -1437,6 +1437,42 @@ test("daemon bare /cwd on discord emits a cwd browser for current subdirectories
   );
 });
 
+test("daemon /cwd browse <dir> on discord emits a cwd browser rooted at the requested directory without rebinding", async () => {
+  const { app, adapter } = await setupDaemonHarness();
+  const workspace = tempDir();
+  const nested = path.join(workspace, "nested");
+  fs.mkdirSync(path.join(workspace, "root-a"));
+  fs.mkdirSync(nested);
+  fs.mkdirSync(path.join(nested, "child-a"));
+  fs.mkdirSync(path.join(nested, ".child-hidden"));
+  app.store.upsertBinding({
+    ...app.store.getBinding("discord", "chat-1"),
+    workingDir: workspace,
+  });
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: `/cwd browse ${nested}`,
+    });
+    await sleep(60);
+  } finally {
+    await app.stop();
+  }
+
+  const message = adapter.messages.find((item) => item.nativeUi?.kind === "cwdBrowser");
+  assert.ok(message);
+  assert.equal(message.text, nested);
+  assert.deepEqual(
+    message.nativeUi.components.selects[0].options.map((option) => option.path),
+    [path.join(nested, "child-a"), path.join(nested, ".child-hidden")]
+  );
+  const binding = app.store.getBinding("discord", "chat-1");
+  assert.equal(binding?.workingDir, workspace);
+});
+
 test("daemon /files on discord emits a file picker for current workspace", async () => {
   const { app, adapter } = await setupDaemonHarness();
   const workspace = tempDir();

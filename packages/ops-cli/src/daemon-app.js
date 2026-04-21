@@ -518,6 +518,15 @@ function buildDiscordCwdBrowserNativeUi({ currentDir = "", directories = [] } = 
   };
 }
 
+function parseCwdBrowseTarget(rawPath = "") {
+  const trimmed = String(rawPath || "").trim();
+  const match = /^browse(?:\s+(.*))?$/i.exec(trimmed);
+  if (!match) {
+    return null;
+  }
+  return String(match[1] || "").trim();
+}
+
 function hiddenNameLastCompare(leftName, rightName) {
   const left = String(leftName || "");
   const right = String(rightName || "");
@@ -4131,9 +4140,18 @@ export class DaemonApp {
     }
 
     if (command.type === "cwd") {
-      if (!String(command.path || "").trim()) {
+      const pathInput = String(command.path || "").trim();
+      const browseTargetInput = parseCwdBrowseTarget(pathInput);
+      if (!pathInput || browseTargetInput != null) {
+        const browseTarget = browseTargetInput != null
+          ? resolveWorkspacePath(browseTargetInput, binding.workingDir)
+          : { value: binding.workingDir };
+        if (browseTarget.error) {
+          await this.#sendMessage(adapter, context, browseTarget.error);
+          return;
+        }
         if (adapter.channel === "discord") {
-          const listed = listWorkspaceSubdirectories(binding.workingDir);
+          const listed = listWorkspaceSubdirectories(browseTarget.value);
           if (listed.error) {
             await this.#sendMessage(adapter, context, listed.error);
             return;
@@ -4148,11 +4166,11 @@ export class DaemonApp {
           return;
         }
 
-        await this.#sendMessage(adapter, context, `Workspace: ${binding.workingDir}`);
+        await this.#sendMessage(adapter, context, `Workspace: ${browseTarget.value}`);
         return;
       }
 
-      const resolved = resolveWorkspacePath(command.path, binding.workingDir);
+      const resolved = resolveWorkspacePath(pathInput, binding.workingDir);
       if (resolved.error) {
         await this.#sendMessage(adapter, context, resolved.error);
         return;
