@@ -527,6 +527,15 @@ function parseCwdBrowseTarget(rawPath = "") {
   return String(match[1] || "").trim();
 }
 
+function parseCwdCreateTarget(rawPath = "") {
+  const trimmed = String(rawPath || "").trim();
+  const match = /^create(?:\s+(.*))?$/i.exec(trimmed);
+  if (!match) {
+    return null;
+  }
+  return String(match[1] || "").trim();
+}
+
 function hiddenNameLastCompare(leftName, rightName) {
   const left = String(leftName || "");
   const right = String(rightName || "");
@@ -4142,6 +4151,40 @@ export class DaemonApp {
     if (command.type === "cwd") {
       const pathInput = String(command.path || "").trim();
       const browseTargetInput = parseCwdBrowseTarget(pathInput);
+      const createTargetInput = command.command === "workspace" ? parseCwdCreateTarget(pathInput) : null;
+      if (createTargetInput != null) {
+        if (!createTargetInput) {
+          await this.#sendMessage(adapter, context, "Usage: /workspace create <path>");
+          return;
+        }
+        const resolved = resolveWorkspacePath(createTargetInput, binding.workingDir);
+        if (resolved.error && !resolved.error.startsWith("Directory does not exist:")) {
+          await this.#sendMessage(adapter, context, resolved.error);
+          return;
+        }
+        const targetDir = resolved.value || resolved.resolved;
+        try {
+          fs.mkdirSync(targetDir, { recursive: true });
+        } catch (error) {
+          await this.#sendMessage(
+            adapter,
+            context,
+            `Unable to create directory: ${targetDir} (${error?.message || String(error)})`
+          );
+          return;
+        }
+
+        const updated = this.store.upsertBinding({
+          ...binding,
+          workingDir: targetDir,
+        });
+        await this.#sendMessage(
+          adapter,
+          context,
+          `Workspace created and set to: ${updated.workingDir}`
+        );
+        return;
+      }
       if (!pathInput || browseTargetInput != null) {
         const browseTarget = browseTargetInput != null
           ? resolveWorkspacePath(browseTargetInput, binding.workingDir)

@@ -13,7 +13,7 @@ export function commandManual(topic = "") {
       "/resume <threadId> - attach to an existing thread.",
       "/ask <prompt> - start a turn with prompt text.",
       "plain text message - same as /ask <text>.",
-      "/cwd [path] or /workspace <path> - set workspace directory.",
+      "/cwd [path] or /workspace <path> - set or create workspace directory.",
       "/files - browse directories and preview files in the current workspace.",
       "/search <pattern> - recursively search current workspace for files.",
       "/thread ... - thread operations (list/read/fork/archive/unarchive/rollback/compact).",
@@ -87,8 +87,9 @@ export function commandManual(topic = "") {
       "Updates this binding workspace directory.",
       "On Discord, bare /cwd opens a subdirectory picker for the current workspace.",
       "Use /cwd browse <dir> to open the same picker at a specific directory without changing the workspace yet.",
+      "Use /workspace create <dir> to create a directory and switch to it.",
       "Supports absolute path, relative path, and ~.",
-      "Examples: /cwd ~/auto, /cwd /Users/czy/auto, /cwd browse ~/auto/packages",
+      "Examples: /cwd ~/auto, /cwd /Users/czy/auto, /cwd browse ~/auto/packages, /workspace create ./new-project",
     ].join("\n");
   }
 

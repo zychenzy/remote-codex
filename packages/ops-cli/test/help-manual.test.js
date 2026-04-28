@@ -21,6 +21,12 @@ test("commandManual normalizes topic with slash prefix", () => {
   assert.equal(text.includes("/help [command]"), true);
 });
 
+test("commandManual documents workspace create", () => {
+  const text = commandManual("/cwd");
+  assert.equal(text.includes("/workspace create <dir>"), true);
+  assert.equal(text.includes("/workspace create ./new-project"), true);
+});
+
 test("commandManual returns unknown topic guidance", () => {
   const text = commandManual("nonexistent-command");
   assert.equal(text.includes("Unknown help topic"), true);

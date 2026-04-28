@@ -1401,6 +1401,117 @@ test("daemon supports /cwd absolute, ~, and /workspace alias with resolved error
   assert.equal(adapter.messages.some((item) => item.text.includes("(resolved: ")), true);
 });
 
+test("daemon /workspace create makes a directory and switches workspace", async () => {
+  const { app, adapter } = await setupDaemonHarness();
+  const workspace = tempDir();
+  const created = path.join(workspace, "nested", "created");
+  app.store.upsertBinding({
+    ...app.store.getBinding("discord", "chat-1"),
+    workingDir: workspace,
+  });
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/workspace create nested/created",
+    });
+    await sleep(60);
+  } finally {
+    await app.stop();
+  }
+
+  const binding = app.store.getBinding("discord", "chat-1");
+  assert.equal(fs.statSync(created).isDirectory(), true);
+  assert.equal(binding.workingDir, created);
+  assert.equal(
+    adapter.messages.some((item) => item.text.includes(`Workspace created and set to: ${created}`)),
+    true
+  );
+});
+
+test("daemon /workspace create requires a target path", async () => {
+  const { app, adapter } = await setupDaemonHarness();
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/workspace create",
+    });
+    await sleep(60);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(
+    adapter.messages.some((item) => item.text.includes("Usage: /workspace create <path>")),
+    true
+  );
+});
+
+test("daemon /cwd create remains a normal missing path", async () => {
+  const { app, adapter } = await setupDaemonHarness();
+  const workspace = tempDir();
+  const unintended = path.join(workspace, "nested", "created");
+  app.store.upsertBinding({
+    ...app.store.getBinding("discord", "chat-1"),
+    workingDir: workspace,
+  });
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/cwd create nested/created",
+    });
+    await sleep(60);
+  } finally {
+    await app.stop();
+  }
+
+  const binding = app.store.getBinding("discord", "chat-1");
+  assert.equal(fs.existsSync(unintended), false);
+  assert.equal(binding.workingDir, workspace);
+  assert.equal(
+    adapter.messages.some((item) => item.text.includes("Directory does not exist: create nested/created")),
+    true
+  );
+});
+
+test("daemon /workspace mkdir is not a create alias", async () => {
+  const { app, adapter } = await setupDaemonHarness();
+  const workspace = tempDir();
+  const unintended = path.join(workspace, "nested", "created");
+  app.store.upsertBinding({
+    ...app.store.getBinding("discord", "chat-1"),
+    workingDir: workspace,
+  });
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/workspace mkdir nested/created",
+    });
+    await sleep(60);
+  } finally {
+    await app.stop();
+  }
+
+  const binding = app.store.getBinding("discord", "chat-1");
+  assert.equal(fs.existsSync(unintended), false);
+  assert.equal(binding.workingDir, workspace);
+  assert.equal(
+    adapter.messages.some((item) => item.text.includes("Directory does not exist: mkdir nested/created")),
+    true
+  );
+});
+
 test("daemon bare /cwd on discord emits a cwd browser for current subdirectories", async () => {
   const { app, adapter } = await setupDaemonHarness();
   const workspace = tempDir();

@@ -84,6 +84,7 @@ test("parser handles answer numeric shorthand without request id", () => {
 test("parser handles cwd command", () => {
   const result = parseIncomingCommand("/cwd ~/projects/demo");
   assert.equal(result.type, "cwd");
+  assert.equal(result.command, "cwd");
   assert.equal(result.path, "~/projects/demo");
 });
 
@@ -97,6 +98,13 @@ test("parser handles cwd browse command", () => {
   const result = parseIncomingCommand("/cwd browse ~/auto/packages");
   assert.equal(result.type, "cwd");
   assert.equal(result.path, "browse ~/auto/packages");
+});
+
+test("parser handles workspace create command", () => {
+  const result = parseIncomingCommand("/workspace create ~/auto/new-project");
+  assert.equal(result.type, "cwd");
+  assert.equal(result.command, "workspace");
+  assert.equal(result.path, "create ~/auto/new-project");
 });
 
 test("parser handles files command", () => {
