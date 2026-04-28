@@ -1401,7 +1401,7 @@ test("daemon supports /cwd absolute, ~, and /workspace alias with resolved error
   assert.equal(adapter.messages.some((item) => item.text.includes("(resolved: ")), true);
 });
 
-test("daemon /workspace create makes a directory and switches workspace", async () => {
+test("daemon /cwd new makes a directory and switches workspace", async () => {
   const { app, adapter } = await setupDaemonHarness();
   const workspace = tempDir();
   const created = path.join(workspace, "nested", "created");
@@ -1415,7 +1415,7 @@ test("daemon /workspace create makes a directory and switches workspace", async 
       channel: "discord",
       chatId: "chat-1",
       userId: "user-1",
-      text: "/workspace create nested/created",
+      text: "/cwd new nested/created",
     });
     await sleep(60);
   } finally {
@@ -1431,7 +1431,33 @@ test("daemon /workspace create makes a directory and switches workspace", async 
   );
 });
 
-test("daemon /workspace create requires a target path", async () => {
+test("daemon /workspace new also makes a directory and switches workspace", async () => {
+  const { app, adapter } = await setupDaemonHarness();
+  const workspace = tempDir();
+  const created = path.join(workspace, "from-workspace");
+  app.store.upsertBinding({
+    ...app.store.getBinding("discord", "chat-1"),
+    workingDir: workspace,
+  });
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/workspace new from-workspace",
+    });
+    await sleep(60);
+  } finally {
+    await app.stop();
+  }
+
+  const binding = app.store.getBinding("discord", "chat-1");
+  assert.equal(fs.statSync(created).isDirectory(), true);
+  assert.equal(binding.workingDir, created);
+});
+
+test("daemon /cwd new requires a target path", async () => {
   const { app, adapter } = await setupDaemonHarness();
 
   try {
@@ -1439,7 +1465,7 @@ test("daemon /workspace create requires a target path", async () => {
       channel: "discord",
       chatId: "chat-1",
       userId: "user-1",
-      text: "/workspace create",
+      text: "/cwd new",
     });
     await sleep(60);
   } finally {
@@ -1447,12 +1473,12 @@ test("daemon /workspace create requires a target path", async () => {
   }
 
   assert.equal(
-    adapter.messages.some((item) => item.text.includes("Usage: /workspace create <path>")),
+    adapter.messages.some((item) => item.text.includes("Usage: /cwd new <path>")),
     true
   );
 });
 
-test("daemon /cwd create remains a normal missing path", async () => {
+test("daemon /cwd create is not a new alias", async () => {
   const { app, adapter } = await setupDaemonHarness();
   const workspace = tempDir();
   const unintended = path.join(workspace, "nested", "created");
@@ -1467,6 +1493,36 @@ test("daemon /cwd create remains a normal missing path", async () => {
       chatId: "chat-1",
       userId: "user-1",
       text: "/cwd create nested/created",
+    });
+    await sleep(60);
+  } finally {
+    await app.stop();
+  }
+
+  const binding = app.store.getBinding("discord", "chat-1");
+  assert.equal(fs.existsSync(unintended), false);
+  assert.equal(binding.workingDir, workspace);
+  assert.equal(
+    adapter.messages.some((item) => item.text.includes("Directory does not exist: create nested/created")),
+    true
+  );
+});
+
+test("daemon /workspace create is not a new alias", async () => {
+  const { app, adapter } = await setupDaemonHarness();
+  const workspace = tempDir();
+  const unintended = path.join(workspace, "nested", "created");
+  app.store.upsertBinding({
+    ...app.store.getBinding("discord", "chat-1"),
+    workingDir: workspace,
+  });
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/workspace create nested/created",
     });
     await sleep(60);
   } finally {

@@ -527,9 +527,9 @@ function parseCwdBrowseTarget(rawPath = "") {
   return String(match[1] || "").trim();
 }
 
-function parseCwdCreateTarget(rawPath = "") {
+function parseCwdNewTarget(rawPath = "") {
   const trimmed = String(rawPath || "").trim();
-  const match = /^create(?:\s+(.*))?$/i.exec(trimmed);
+  const match = /^new(?:\s+(.*))?$/i.exec(trimmed);
   if (!match) {
     return null;
   }
@@ -4151,13 +4151,13 @@ export class DaemonApp {
     if (command.type === "cwd") {
       const pathInput = String(command.path || "").trim();
       const browseTargetInput = parseCwdBrowseTarget(pathInput);
-      const createTargetInput = command.command === "workspace" ? parseCwdCreateTarget(pathInput) : null;
-      if (createTargetInput != null) {
-        if (!createTargetInput) {
-          await this.#sendMessage(adapter, context, "Usage: /workspace create <path>");
+      const newTargetInput = parseCwdNewTarget(pathInput);
+      if (newTargetInput != null) {
+        if (!newTargetInput) {
+          await this.#sendMessage(adapter, context, `Usage: /${command.command || "cwd"} new <path>`);
           return;
         }
-        const resolved = resolveWorkspacePath(createTargetInput, binding.workingDir);
+        const resolved = resolveWorkspacePath(newTargetInput, binding.workingDir);
         if (resolved.error && !resolved.error.startsWith("Directory does not exist:")) {
           await this.#sendMessage(adapter, context, resolved.error);
           return;

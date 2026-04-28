@@ -21,10 +21,10 @@ test("commandManual normalizes topic with slash prefix", () => {
   assert.equal(text.includes("/help [command]"), true);
 });
 
-test("commandManual documents workspace create", () => {
+test("commandManual documents cwd new", () => {
   const text = commandManual("/cwd");
-  assert.equal(text.includes("/workspace create <dir>"), true);
-  assert.equal(text.includes("/workspace create ./new-project"), true);
+  assert.equal(text.includes("/cwd new <dir>"), true);
+  assert.equal(text.includes("/cwd new ./new-project"), true);
 });
 
 test("commandManual returns unknown topic guidance", () => {

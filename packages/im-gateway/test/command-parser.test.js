@@ -100,11 +100,18 @@ test("parser handles cwd browse command", () => {
   assert.equal(result.path, "browse ~/auto/packages");
 });
 
-test("parser handles workspace create command", () => {
-  const result = parseIncomingCommand("/workspace create ~/auto/new-project");
+test("parser handles cwd new command", () => {
+  const result = parseIncomingCommand("/cwd new ~/auto/new-project");
+  assert.equal(result.type, "cwd");
+  assert.equal(result.command, "cwd");
+  assert.equal(result.path, "new ~/auto/new-project");
+});
+
+test("parser handles workspace new command", () => {
+  const result = parseIncomingCommand("/workspace new ~/auto/new-project");
   assert.equal(result.type, "cwd");
   assert.equal(result.command, "workspace");
-  assert.equal(result.path, "create ~/auto/new-project");
+  assert.equal(result.path, "new ~/auto/new-project");
 });
 
 test("parser handles files command", () => {
