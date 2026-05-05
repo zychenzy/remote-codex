@@ -67,7 +67,10 @@ export function parseIncomingCommand(text = "") {
 
   if (cmd === "/model") {
     const action = (parts[1] || "").toLowerCase();
-    if (["show", "list", "set", "effort", "mode"].includes(action)) {
+    if (action === "list") {
+      return { type: "model", value: "" };
+    }
+    if (["show", "set", "effort", "mode"].includes(action)) {
       return {
         type: "modelNs",
         action,

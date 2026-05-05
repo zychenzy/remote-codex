@@ -52,3 +52,12 @@ Examples:
 
 - Do not add external relay/mobile flows to v1 core.
 - Keep allowlist and approval gating on by default for command/file-change actions.
+
+
+<claude-mem-context>
+# Memory Context
+
+# [auto] recent context, 2026-04-22 9:31pm GMT+8
+
+No previous sessions found.
+</claude-mem-context>

@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import process from "node:process";
+import { execFileSync } from "node:child_process";
 
 function sleep(ms, { setTimeoutFn = globalThis.setTimeout } = {}) {
   return new Promise((resolve) => setTimeoutFn(resolve, ms));
@@ -97,6 +98,72 @@ export async function restartDaemon(existingPid, startFn, {
     });
   }
   return startFn();
+}
+
+export function parseDaemonRunPids(psOutput, {
+  scriptPath,
+  currentPid = process.pid,
+} = {}) {
+  const scriptNeedle = String(scriptPath || "").trim();
+  if (!scriptNeedle) {
+    return [];
+  }
+  const current = Number(currentPid) || 0;
+  const pids = [];
+  for (const line of String(psOutput || "").split("\n")) {
+    const match = /^\s*(\d+)\s+(.+)$/.exec(line);
+    if (!match) {
+      continue;
+    }
+    const pid = Number(match[1]) || 0;
+    const command = match[2] || "";
+    if (!pid || pid === current) {
+      continue;
+    }
+    if (!command.includes(scriptNeedle) || !/\bdaemon-run\b/.test(command)) {
+      continue;
+    }
+    pids.push(pid);
+  }
+  return [...new Set(pids)];
+}
+
+export function listDaemonRunPids({
+  scriptPath,
+  currentPid = process.pid,
+  execFileSyncFn = execFileSync,
+  throwOnError = false,
+} = {}) {
+  try {
+    const output = execFileSyncFn("ps", ["-axo", "pid=,command="], { encoding: "utf8" });
+    return parseDaemonRunPids(output, { scriptPath, currentPid });
+  } catch (error) {
+    if (throwOnError) {
+      throw error;
+    }
+    return [];
+  }
+}
+
+export async function stopDaemonRunPids(pids, {
+  timeoutMs = 10_000,
+  pollIntervalMs = 100,
+  killFn = process.kill,
+  sleepFn = sleep,
+} = {}) {
+  const stopped = [];
+  for (const pid of [...new Set((pids || []).map((value) => Number(value) || 0).filter(Boolean))]) {
+    const didStop = await stopExistingDaemon(pid, {
+      timeoutMs,
+      pollIntervalMs,
+      killFn,
+      sleepFn,
+    });
+    if (didStop) {
+      stopped.push(pid);
+    }
+  }
+  return stopped;
 }
 
 export async function claimDaemonLock({

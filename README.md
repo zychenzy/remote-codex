@@ -208,7 +208,7 @@ Namespaced commands:
 
 - `/thread start|resume|list|more|read|fork|loaded|unsubscribe|archive|unarchive|compact|rollback`
 - `/turn ask|steer|interrupt|review`
-- `/model show|list|set|effort|mode`
+- `/model show|set|effort|mode`
 - `/skills list|use|enable|disable|reload`
 
 Shortcuts/aliases:

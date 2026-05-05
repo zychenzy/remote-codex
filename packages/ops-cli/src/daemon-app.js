@@ -31,6 +31,24 @@ function bindingKey(channel, chatId) {
   return `${channel}:${chatId}`;
 }
 
+function inboundDedupeKey(context = {}) {
+  const channel = String(context.channel || "").trim();
+  const chatId = String(context.chatId || "").trim();
+  const interactionId = String(context.discordMeta?.interactionId || "").trim();
+  if (channel && chatId && interactionId) {
+    return `inbound:${channel}:${chatId}:interaction:${interactionId}`;
+  }
+
+  const messageId = String(context.messageId || "").trim();
+  if (channel && chatId && messageId) {
+    return `inbound:${channel}:${chatId}:message:${messageId}`;
+  }
+
+  return "";
+}
+
+const CONTROL_COMMAND_DEDUPE_TTL_MS = 5_000;
+
 function threadIdFromResponse(response) {
   return response?.thread?.id || response?.threadId || response?.thread_id || null;
 }
@@ -360,27 +378,42 @@ function buildDiscordModelPickerNativeUi({
   models = [],
   modes = [],
 } = {}) {
-  const normalizedModels = models
-    .map((item) => {
-      const id = String(item?.model || item?.id || "").trim();
-      if (!id) {
-        return null;
-      }
-      const efforts = (item?.supportedReasoningEfforts || [])
-        .map((entry) => (typeof entry === "string" ? entry : entry?.reasoningEffort))
-        .filter(Boolean)
-        .join(",");
-      return {
-        id,
-        description: `${item?.isDefault ? "default | " : ""}${efforts ? `efforts:${efforts}` : "model"}`.slice(0, 100),
-      };
-    })
-    .filter(Boolean)
-    .slice(0, 25);
-  const normalizedModes = modes
-    .map((item) => String(item?.mode || item?.name || "").trim())
-    .filter(Boolean)
-    .slice(0, 25);
+  const modelById = new Map();
+  for (const item of Array.isArray(models) ? models : []) {
+    const id = String(item?.model || item?.id || "").trim();
+    if (!id || modelById.has(id)) {
+      continue;
+    }
+    const efforts = (item?.supportedReasoningEfforts || [])
+      .map((entry) => (typeof entry === "string" ? entry : entry?.reasoningEffort))
+      .filter(Boolean)
+      .join(",");
+    modelById.set(id, {
+      id,
+      description: `${item?.isDefault ? "default | " : ""}${efforts ? `efforts:${efforts}` : "model"}`.slice(0, 100),
+    });
+    if (modelById.size >= 25) {
+      break;
+    }
+  }
+  const normalizedModels = Array.from(modelById.values());
+  const modeByKey = new Map();
+  for (const item of Array.isArray(modes) ? modes : []) {
+    const mode = String(item?.mode || item?.name || "").trim();
+    if (!mode) {
+      continue;
+    }
+    const key = mode.toLowerCase();
+    if (key === "default" || modeByKey.has(key)) {
+      continue;
+    }
+    modeByKey.set(key, mode);
+    if (modeByKey.size >= 24) {
+      break;
+    }
+  }
+  const normalizedModes = Array.from(modeByKey.values());
+  const currentModeKey = String(currentMode || "").trim().toLowerCase();
 
   return {
     kind: "modelPicker",
@@ -414,19 +447,19 @@ function buildDiscordModelPickerNativeUi({
         {
           placeholder: "Set collaboration mode",
           options: [
-            { label: "default", description: "Use runtime default mode", commandText: "/model mode set default", defaultValue: !currentMode || currentMode === "default" },
+            { label: "default", description: "Use runtime default mode", commandText: "/model mode set default", defaultValue: !currentModeKey || currentModeKey === "default" },
             ...normalizedModes.map((mode) => ({
               label: mode,
               description: "Available collaboration mode",
               commandText: `/model mode set ${mode}`,
-              defaultValue: currentMode === mode,
+              defaultValue: currentModeKey === mode.toLowerCase(),
             })),
           ].slice(0, 25),
         },
       ],
       buttons: [
         { label: "Show Profile", style: 2, commandText: "/model show" },
-        { label: "Refresh Models", style: 2, commandText: "/model list" },
+        { label: "Refresh Models", style: 2, commandText: "/model" },
       ],
     },
   };
@@ -1189,6 +1222,7 @@ export class DaemonApp {
     this.deliveredTurnDiffByKey = new Set();
     this.threadListStateByBinding = new Map();
     this.skillsCacheByCwd = new Map();
+    this.recentControlCommandByKey = new Map();
 
     this.running = false;
   }
@@ -2645,6 +2679,34 @@ export class DaemonApp {
     }
   }
 
+  #markControlCommandOnce(key, ttlMs = CONTROL_COMMAND_DEDUPE_TTL_MS) {
+    const dedupeKey = String(key || "").trim();
+    if (!dedupeKey) {
+      return true;
+    }
+    const now = Date.now();
+    const existingExpiresAt = this.recentControlCommandByKey.get(dedupeKey) || 0;
+    if (existingExpiresAt > now) {
+      return false;
+    }
+    this.recentControlCommandByKey.set(dedupeKey, now + ttlMs);
+    if (this.recentControlCommandByKey.size > 200) {
+      for (const [entryKey, expiresAt] of this.recentControlCommandByKey) {
+        if (expiresAt <= now || this.recentControlCommandByKey.size > 200) {
+          this.recentControlCommandByKey.delete(entryKey);
+        }
+      }
+    }
+    return true;
+  }
+
+  #clearControlCommandMark(key) {
+    const dedupeKey = String(key || "").trim();
+    if (dedupeKey) {
+      this.recentControlCommandByKey.delete(dedupeKey);
+    }
+  }
+
   async #handleAgentDelta(params) {
     const threadId = detectThreadId(params);
     const turnId = detectTurnId(params);
@@ -3293,6 +3355,11 @@ export class DaemonApp {
 
   async #handleInboundSafe(context) {
     try {
+      const dedupeKey = inboundDedupeKey(context);
+      if (dedupeKey && !this.#markDeliveryOnce(dedupeKey)) {
+        this.logger.warn(`duplicate inbound ignored: ${dedupeKey}`);
+        return;
+      }
       await this.#handleInbound(context);
     } catch (error) {
       const adapter = this.#getAdapter(context.channel);
@@ -3462,8 +3529,18 @@ export class DaemonApp {
     };
 
     if (command.type === "new") {
-      const threadId = await this.#startFreshThreadForBinding(binding, bKey);
-      await this.#sendMessage(adapter, context, `Started thread: ${threadId || "unknown"}`);
+      const controlKey = `control:new:${bKey}`;
+      if (!this.#markControlCommandOnce(controlKey)) {
+        this.logger.warn(`duplicate control command ignored: ${controlKey}`);
+        return;
+      }
+      try {
+        const threadId = await this.#startFreshThreadForBinding(binding, bKey);
+        await this.#sendMessage(adapter, context, `Started thread: ${threadId || "unknown"}`);
+      } catch (error) {
+        this.#clearControlCommandMark(controlKey);
+        throw error;
+      }
       return;
     }
 

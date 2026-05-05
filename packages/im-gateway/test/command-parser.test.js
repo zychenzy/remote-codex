@@ -211,10 +211,10 @@ test("parser handles namespaced turn command", () => {
   assert.deepEqual(result.args, ["continue", "with", "tests"]);
 });
 
-test("parser handles namespaced model command", () => {
+test("parser maps legacy /model list to /model picker behavior", () => {
   const result = parseIncomingCommand("/model list");
-  assert.equal(result.type, "modelNs");
-  assert.equal(result.action, "list");
+  assert.equal(result.type, "model");
+  assert.equal(result.value, "");
 });
 
 test("parser handles namespaced model effort command", () => {

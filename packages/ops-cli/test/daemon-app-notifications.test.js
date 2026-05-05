@@ -28,6 +28,7 @@ class FakeRuntime {
     this.threadReads = new Map(Object.entries(threadReads));
     this.handlers = new Map();
     this.serverResponses = [];
+    this.startThreadCalls = [];
     this.startTurnCalls = [];
     this.resumeThreadCalls = [];
     this.listThreadsResponse = listThreadsResponse;
@@ -112,6 +113,13 @@ class FakeRuntime {
     }
     const turnId = "turn-start-" + this.startTurnCalls.length;
     return { turn: { id: turnId, status: "inProgress" } };
+  }
+
+  async startThread(params) {
+    this.startThreadCalls.push(params);
+    const threadId = "thread-start-" + this.startThreadCalls.length;
+    this.loadedThreadIds.push(threadId);
+    return { thread: { id: threadId, cwd: params?.cwd || "/Users/czy/auto" } };
   }
 
   async respondServerRequest(requestId, result) {
@@ -2025,6 +2033,63 @@ test("daemon /model mode set default stores explicit default mode", async () => 
   assert.equal(adapter.messages.some((item) => item.text.includes("Mode set to: default")), true);
 });
 
+test("daemon /model set rejects unknown model ids", async () => {
+  const { app, adapter } = await setupDaemonHarness({
+    runtimeOptions: {
+      modelsResponse: {
+        data: [
+          { model: "gpt-5", isDefault: true },
+          { model: "gpt-5-mini" },
+        ],
+      },
+    },
+  });
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/model set nope",
+    });
+    await sleep(60);
+  } finally {
+    await app.stop();
+  }
+
+  const binding = app.store.getBinding("discord", "chat-1");
+  assert.equal(binding?.policyProfile?.model ?? null, null);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Unknown model: nope")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Selectable models: gpt-5, gpt-5-mini")), true);
+});
+
+test("daemon legacy /model rejects non-selectable model ids", async () => {
+  const { app, adapter } = await setupDaemonHarness({
+    runtimeOptions: {
+      modelsResponse: {
+        data: [
+          { model: "gpt-5", isDefault: true, hidden: false },
+          { model: "gpt-internal", hidden: true },
+        ],
+      },
+    },
+  });
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/model gpt-internal",
+    });
+    await sleep(60);
+  } finally {
+    await app.stop();
+  }
+
+  const binding = app.store.getBinding("discord", "chat-1");
+  assert.equal(binding?.policyProfile?.model ?? null, null);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Model is not selectable: gpt-internal")), true);
+});
+
 test("daemon /model show on discord emits native model controls alongside text fallback", async () => {
   const { app, adapter } = await setupDaemonHarness({
     runtimeOptions: {
@@ -2077,8 +2142,56 @@ test("daemon /model show on discord emits native model controls alongside text f
   );
   assert.deepEqual(
     message.nativeUi.components.buttons.map((button) => button.commandText),
-    ["/model show", "/model list"]
+    ["/model show", "/model"]
   );
+});
+
+test("daemon /model on discord keeps a single default mode option", async () => {
+  const { app, adapter } = await setupDaemonHarness({
+    runtimeOptions: {
+      modelsResponse: {
+        data: [
+          {
+            model: "gpt-5",
+            isDefault: true,
+            supportedReasoningEfforts: ["low", "medium", "high"],
+          },
+        ],
+      },
+      collaborationModesResponse: {
+        data: [{ mode: "default" }, { mode: "plan" }, { mode: "PLAN" }, { mode: "default" }],
+      },
+    },
+  });
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/model mode set default",
+    });
+    await sleep(60);
+
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/model",
+    });
+    await sleep(80);
+  } finally {
+    await app.stop();
+  }
+
+  const message = [...adapter.messages].reverse().find((item) => item.nativeUi?.kind === "modelPicker");
+  assert.ok(message);
+  const modeOptions = message.nativeUi.components.selects[2].options;
+  assert.deepEqual(
+    modeOptions.map((option) => option.commandText),
+    ["/model mode set default", "/model mode set plan"]
+  );
+  assert.equal(modeOptions.filter((option) => option.defaultValue).length, 1);
 });
 
 test("daemon sends explicit collaboration mode default after /plan off", async () => {
@@ -2426,4 +2539,55 @@ test("daemon rebinds a resumed thread from channel binding to DM binding", async
   assert.equal(app.store.getBinding("discord", "dm-1")?.threadId, "thread-1");
   assert.equal(app.store.getBinding("discord", "channel-1")?.threadId, null);
   assert.equal(adapter.messages.some((item) => item.context.chatId === "dm-1" && item.text.includes("Resumed thread: thread-1")), true);
+});
+
+test("daemon ignores duplicate discord inbound message ids before command side effects", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+
+  try {
+    const context = {
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/new",
+      messageId: "dup-message-1",
+    };
+    adapter.emitInbound(context);
+    adapter.emitInbound({ ...context });
+    await sleep(80);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(runtime.startThreadCalls.length, 1);
+  assert.equal(adapter.messages.filter((item) => item.text.startsWith("Started thread:")).length, 1);
+  assert.equal(app.store.getBinding("discord", "chat-1")?.threadId, "thread-start-1");
+});
+
+test("daemon ignores near-simultaneous duplicate /new controls with different discord ids", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/new",
+      messageId: "dup-new-1",
+    });
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/new",
+      messageId: "dup-new-2",
+    });
+    await sleep(80);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(runtime.startThreadCalls.length, 1);
+  assert.equal(adapter.messages.filter((item) => item.text.startsWith("Started thread:")).length, 1);
+  assert.equal(app.store.getBinding("discord", "chat-1")?.threadId, "thread-start-1");
 });

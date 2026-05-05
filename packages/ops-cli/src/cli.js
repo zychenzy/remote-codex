@@ -9,7 +9,14 @@ import readline from "node:readline/promises";
 import { StateStore } from "../../state-store/src/index.js";
 import { AppServerRuntime } from "../../core-runtime/src/index.js";
 import { DaemonApp } from "./daemon-app.js";
-import { claimDaemonLock, isPidRunning, readPidFile, restartDaemon } from "./daemon-instance.js";
+import {
+  claimDaemonLock,
+  isPidRunning,
+  listDaemonRunPids,
+  readPidFile,
+  restartDaemon,
+  stopDaemonRunPids,
+} from "./daemon-instance.js";
 import { runDoctor } from "./doctor.js";
 import {
   getArgValue,
@@ -39,6 +46,7 @@ const store = new StateStore({ baseDir: BASE_DIR });
 
 const PID_FILE = path.join(store.runtimeDir, "daemon.pid");
 const LOCK_FILE = path.join(store.runtimeDir, "daemon.lock");
+const CLI_SCRIPT = path.resolve("./packages/ops-cli/src/cli.js");
 const STATUS_FILE = path.join(store.runtimeDir, "status.json");
 const DISCORD_API = "https://discord.com/api/v10";
 
@@ -265,7 +273,15 @@ async function cmdStart() {
     return;
   }
 
-  const child = spawn(process.execPath, [path.resolve("./packages/ops-cli/src/cli.js"), "daemon-run"], {
+  const orphanPids = listDaemonRunPids({ scriptPath: CLI_SCRIPT, throwOnError: true }).filter((candidate) => candidate !== pid);
+  if (orphanPids.length) {
+    const stopped = await stopDaemonRunPids(orphanPids);
+    if (stopped.length) {
+      console.log(`Stopped orphan daemon pid(s): ${stopped.join(", ")}`);
+    }
+  }
+
+  const child = spawn(process.execPath, [CLI_SCRIPT, "daemon-run"], {
     detached: true,
     stdio: "ignore",
     env: { ...process.env, IM_CODEX_HOME: BASE_DIR },
@@ -362,6 +378,13 @@ async function cmdStop() {
 
 async function cmdRestart() {
   const existingPid = readPid();
+  const orphanPids = listDaemonRunPids({ scriptPath: CLI_SCRIPT, throwOnError: true }).filter((pid) => pid !== existingPid);
+  if (orphanPids.length) {
+    const stopped = await stopDaemonRunPids(orphanPids);
+    if (stopped.length) {
+      console.log(`Stopped orphan daemon pid(s): ${stopped.join(", ")}`);
+    }
+  }
   await restartDaemon(existingPid, async () => cmdStart());
 }
 

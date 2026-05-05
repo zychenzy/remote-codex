@@ -163,11 +163,10 @@ export function commandManual(topic = "") {
 
   if (t === "model") {
     return [
-      "/model <show|list|set|effort|mode> (legacy: /model <modelId>)",
+      "/model <show|set|effort|mode> (legacy: /model <modelId>)",
       "Manage sticky model profile and query model/collaboration catalogs.",
       "Examples:",
       "/model show",
-      "/model list",
       "/model set gpt-5.4",
       "/model effort set high",
       "/model mode set default",

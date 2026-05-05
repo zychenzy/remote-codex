@@ -7,6 +7,8 @@ import { BaseAdapter } from "./base-adapter.js";
 const DISCORD_MAX_CONTENT = 1900;
 const VIEW_TTL_MS = 15 * 60 * 1000;
 const DEFAULT_MIN_SEND_INTERVAL_MS = 450;
+const INBOUND_DEDUP_TTL_MS = 5 * 60 * 1000;
+const INBOUND_DEDUP_MAX = 1000;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -204,8 +206,63 @@ export class DiscordAdapter extends BaseAdapter {
     this.started = false;
     this.readyPromise = null;
     this.viewState = new Map();
+    this.seenInboundKeys = new Map();
     this.clientHandlersInstalled = false;
     this.#ensureClientHandlers();
+  }
+
+  emitInbound(context) {
+    if (!this.#markInboundOnce(context)) {
+      this.logger.debug?.("[discord] dropped duplicate inbound event");
+      return;
+    }
+    super.emitInbound(context);
+  }
+
+  #markInboundOnce(context) {
+    const key = this.#inboundDedupKey(context);
+    if (!key) {
+      return true;
+    }
+    const now = Date.now();
+    const expiresAt = this.seenInboundKeys.get(key) || 0;
+    if (expiresAt > now) {
+      return false;
+    }
+    this.seenInboundKeys.set(key, now + INBOUND_DEDUP_TTL_MS);
+    this.#pruneInboundDedup(now);
+    return true;
+  }
+
+  #inboundDedupKey(context) {
+    const meta = context?.discordMeta || {};
+    const interactionId = String(meta.interactionId || "").trim();
+    const messageId = String(context?.messageId || "").trim();
+    const id = interactionId ? `interaction:${interactionId}` : (messageId ? `message:${messageId}` : "");
+    if (!id) {
+      return "";
+    }
+    return [
+      id,
+      String(meta.kind || ""),
+      String(context?.chatId || ""),
+      String(context?.userId || ""),
+      String(context?.text || "").trim(),
+    ].join("|");
+  }
+
+  #pruneInboundDedup(now = Date.now()) {
+    if (this.seenInboundKeys.size <= INBOUND_DEDUP_MAX) {
+      return;
+    }
+    for (const [key, expiresAt] of this.seenInboundKeys) {
+      if (expiresAt <= now || this.seenInboundKeys.size > INBOUND_DEDUP_MAX) {
+        this.seenInboundKeys.delete(key);
+      }
+      if (this.seenInboundKeys.size <= INBOUND_DEDUP_MAX) {
+        break;
+      }
+    }
   }
 
   #createClient() {

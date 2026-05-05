@@ -51,47 +51,40 @@ export async function handleModelAndSkillsCommand({
       ].join("\n"));
       return true;
     }
-    if (command.action === "list") {
-      const [response, modesResponse] = await Promise.all([
-        runtime.listModels({ includeHidden: false, limit: 30 }),
-        runtime.listCollaborationModes().catch(() => ({ data: [] })),
-      ]);
-      const models = modelListFromResponse(response);
-      if (!models.length) {
-        await sendMessage(adapter, context, "No models returned by runtime.");
-        return true;
-      }
-      const lines = models.map((item) => {
-        const efforts = (item.supportedReasoningEfforts || [])
-          .map((entry) => (typeof entry === "string" ? entry : entry?.reasoningEffort))
-          .filter(Boolean)
-          .join(",");
-        const hidden = Boolean(item.hidden ?? item.isHidden);
-        return `${item.model || item.id}${item.isDefault ? " (default)" : ""}${hidden ? " (hidden)" : ""}${efforts ? ` | efforts:${efforts}` : ""}`;
-      });
-      if (adapter?.channel === "discord" && typeof sendRichMessage === "function" && typeof buildDiscordModelPickerNativeUi === "function") {
-        await sendRichMessage(adapter, context, {
-          text: `Models:\n${lines.join("\n")}`,
-          nativeUi: buildDiscordModelPickerNativeUi({
-            currentModel: binding.policyProfile?.model || "",
-            currentEffort: binding.policyProfile?.reasoningEffort || "",
-            currentMode: binding.policyProfile?.collaborationMode || "",
-            models,
-            modes: collaborationModesFromResponse(modesResponse),
-          }),
-        });
-        return true;
-      }
-      await sendMessage(adapter, context, `Models:\n${lines.join("\n")}`);
-      return true;
-    }
     if (command.action === "set") {
       const nextModelRaw = String(positional[0] || "").trim();
       if (!nextModelRaw) {
         await sendMessage(adapter, context, "Usage: /model set <modelId|default>");
         return true;
       }
-      const nextModel = ["default", "auto"].includes(nextModelRaw.toLowerCase()) ? null : nextModelRaw;
+      let nextModel = ["default", "auto"].includes(nextModelRaw.toLowerCase()) ? null : nextModelRaw;
+      if (nextModel) {
+        try {
+          const resolved = await resolveSelectableModelId({
+            runtime,
+            modelListFromResponse,
+            requestedModel: nextModel,
+          });
+          if (!resolved.modelId) {
+            const listHint = resolved.selectableModelIds.length
+              ? `Selectable models: ${resolved.selectableModelIds.slice(0, 20).join(", ")}`
+              : "No selectable models returned by runtime.";
+            await sendMessage(
+              adapter,
+              context,
+              resolved.foundHidden
+                ? `Model is not selectable: ${nextModel}. ${listHint}`
+                : `Unknown model: ${nextModel}. ${listHint}`
+            );
+            return true;
+          }
+          nextModel = resolved.modelId;
+        } catch (error) {
+          const detail = error?.message ? ` (${error.message})` : "";
+          await sendMessage(adapter, context, `Failed to validate model selection${detail}`);
+          return true;
+        }
+      }
       const updated = store.upsertBinding({
         ...binding,
         policyProfile: {
@@ -156,7 +149,7 @@ export async function handleModelAndSkillsCommand({
       await sendMessage(adapter, context, `Mode set to: ${updated.policyProfile?.collaborationMode || "runtime default"}`);
       return true;
     }
-    await sendMessage(adapter, context, "Usage: /model <show|list|set|effort|mode>");
+    await sendMessage(adapter, context, "Usage: /model <show|set|effort|mode>");
     return true;
   }
 
@@ -262,7 +255,34 @@ export async function handleModelAndSkillsCommand({
       return true;
     }
 
-    const nextModel = ["default", "auto"].includes(nextModelRaw.toLowerCase()) ? null : nextModelRaw;
+    let nextModel = ["default", "auto"].includes(nextModelRaw.toLowerCase()) ? null : nextModelRaw;
+    if (nextModel) {
+      try {
+        const resolved = await resolveSelectableModelId({
+          runtime,
+          modelListFromResponse,
+          requestedModel: nextModel,
+        });
+        if (!resolved.modelId) {
+          const listHint = resolved.selectableModelIds.length
+            ? `Selectable models: ${resolved.selectableModelIds.slice(0, 20).join(", ")}`
+            : "No selectable models returned by runtime.";
+          await sendMessage(
+            adapter,
+            context,
+            resolved.foundHidden
+              ? `Model is not selectable: ${nextModel}. ${listHint}`
+              : `Unknown model: ${nextModel}. ${listHint}`
+          );
+          return true;
+        }
+        nextModel = resolved.modelId;
+      } catch (error) {
+        const detail = error?.message ? ` (${error.message})` : "";
+        await sendMessage(adapter, context, `Failed to validate model selection${detail}`);
+        return true;
+      }
+    }
     const updated = store.upsertBinding({
       ...binding,
       policyProfile: {
@@ -275,4 +295,49 @@ export async function handleModelAndSkillsCommand({
   }
 
   return false;
+}
+
+function normalizeRuntimeModels(models = []) {
+  const out = [];
+  for (const item of Array.isArray(models) ? models : []) {
+    const id = String(item?.model || item?.id || "").trim();
+    if (!id) {
+      continue;
+    }
+    const hidden = Boolean(item?.hidden ?? item?.isHidden);
+    out.push({ id, hidden });
+  }
+  return out;
+}
+
+async function resolveSelectableModelId({
+  runtime,
+  modelListFromResponse,
+  requestedModel,
+} = {}) {
+  const response = await runtime.listModels({ includeHidden: false, limit: 200 });
+  const models = normalizeRuntimeModels(modelListFromResponse(response));
+  const selectableModelIds = [];
+  let foundHidden = false;
+
+  for (const entry of models) {
+    if (!entry.hidden) {
+      selectableModelIds.push(entry.id);
+    }
+    if (entry.id === requestedModel && entry.hidden) {
+      foundHidden = true;
+    }
+    if (entry.id === requestedModel && !entry.hidden) {
+      return {
+        modelId: entry.id,
+        selectableModelIds,
+      };
+    }
+  }
+
+  return {
+    modelId: null,
+    selectableModelIds,
+    foundHidden,
+  };
 }

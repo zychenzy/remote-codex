@@ -486,6 +486,33 @@ test("discord adapter normalizes native slash commands into canonical text comma
   assert.equal(seen[0].discordMeta.kind, "slash");
 });
 
+test("discord adapter drops duplicate retried slash interactions", async () => {
+  const client = createFakeClient();
+  const channel = createFakeChannel({ id: "123" });
+  client.__channels.set("123", channel);
+  const adapter = createAdapter({
+    client,
+    allowedChannels: ["123"],
+    authorizeInteraction: async () => true,
+  });
+  const seen = [];
+  adapter.registerInboundHandler((context) => seen.push(context));
+  const interaction = createSlashInteraction({
+    commandName: "new",
+    options: createOptions(),
+    channel,
+  });
+
+  await adapter.start();
+  client.emit("interactionCreate", interaction);
+  client.emit("interactionCreate", interaction);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await adapter.stop();
+
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].text, "/new");
+});
+
 test("discord adapter uses interaction reply for the first slash-command response", async () => {
   const client = createFakeClient();
   const channel = createFakeChannel({ id: "123" });
