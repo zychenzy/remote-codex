@@ -12,10 +12,8 @@ import { DaemonApp } from "./daemon-app.js";
 import {
   claimDaemonLock,
   isPidRunning,
-  listDaemonRunPids,
   readPidFile,
   restartDaemon,
-  stopDaemonRunPids,
 } from "./daemon-instance.js";
 import { runDoctor } from "./doctor.js";
 import {
@@ -46,9 +44,22 @@ const store = new StateStore({ baseDir: BASE_DIR });
 
 const PID_FILE = path.join(store.runtimeDir, "daemon.pid");
 const LOCK_FILE = path.join(store.runtimeDir, "daemon.lock");
-const CLI_SCRIPT = path.resolve("./packages/ops-cli/src/cli.js");
 const STATUS_FILE = path.join(store.runtimeDir, "status.json");
 const DISCORD_API = "https://discord.com/api/v10";
+const GLOBAL_RUNTIME_DIR = resolveGlobalRuntimeDir();
+const GLOBAL_PID_FILE = path.join(GLOBAL_RUNTIME_DIR, "daemon.pid");
+const GLOBAL_LOCK_FILE = path.join(GLOBAL_RUNTIME_DIR, "daemon.lock");
+
+function resolveGlobalRuntimeDir() {
+  const preferred = path.join(os.homedir(), ".im-codex-tool", "runtime");
+  try {
+    fs.mkdirSync(preferred, { recursive: true });
+    fs.accessSync(preferred, fs.constants.W_OK);
+    return preferred;
+  } catch {
+    return store.runtimeDir;
+  }
+}
 
 const HELP_TOPICS = {
   setup: {
@@ -227,6 +238,10 @@ function readPid() {
   return readPidFile(PID_FILE);
 }
 
+function readGlobalPid() {
+  return readPidFile(GLOBAL_PID_FILE);
+}
+
 async function cmdSetup() {
   const existing = store.readConfig();
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -267,21 +282,19 @@ async function cmdSetup() {
 }
 
 async function cmdStart() {
+  const globalPid = readGlobalPid();
+  if (isPidRunning(globalPid)) {
+    console.log(`Daemon already running (pid=${globalPid})`);
+    return;
+  }
+
   const pid = readPid();
   if (isPidRunning(pid)) {
     console.log(`Daemon already running (pid=${pid})`);
     return;
   }
 
-  const orphanPids = listDaemonRunPids({ scriptPath: CLI_SCRIPT, throwOnError: true }).filter((candidate) => candidate !== pid);
-  if (orphanPids.length) {
-    const stopped = await stopDaemonRunPids(orphanPids);
-    if (stopped.length) {
-      console.log(`Stopped orphan daemon pid(s): ${stopped.join(", ")}`);
-    }
-  }
-
-  const child = spawn(process.execPath, [CLI_SCRIPT, "daemon-run"], {
+  const child = spawn(process.execPath, [path.resolve("./packages/ops-cli/src/cli.js"), "daemon-run"], {
     detached: true,
     stdio: "ignore",
     env: { ...process.env, IM_CODEX_HOME: BASE_DIR },
@@ -292,6 +305,11 @@ async function cmdStart() {
 }
 
 async function cmdDaemonRun() {
+  const globalDaemonLock = await claimDaemonLock({
+    pidFile: GLOBAL_PID_FILE,
+    lockFile: GLOBAL_LOCK_FILE,
+    currentPid: process.pid,
+  });
   const daemonLock = await claimDaemonLock({
     pidFile: PID_FILE,
     lockFile: LOCK_FILE,
@@ -307,8 +325,10 @@ async function cmdDaemonRun() {
     }
     released = true;
     daemonLock.release();
+    globalDaemonLock.release();
   };
 
+  fs.writeFileSync(GLOBAL_PID_FILE, String(process.pid));
   fs.writeFileSync(PID_FILE, String(process.pid));
   writeStatus({ running: true, pid: process.pid, startedAt: new Date().toISOString() });
 
@@ -316,6 +336,7 @@ async function cmdDaemonRun() {
     writeStatus({ running: false, pid: process.pid, stoppedAt: new Date().toISOString(), reason });
     try {
       fs.rmSync(PID_FILE, { force: true });
+      fs.rmSync(GLOBAL_PID_FILE, { force: true });
     } catch {
       // ignore
     }
@@ -344,6 +365,7 @@ async function cmdDaemonRun() {
     releaseLock();
     clearInterval(keepAlive);
     fs.rmSync(PID_FILE, { force: true });
+    fs.rmSync(GLOBAL_PID_FILE, { force: true });
     process.exit(1);
   });
 
@@ -357,6 +379,7 @@ async function cmdDaemonRun() {
       reason: `startup_failed: ${error.message}`,
     });
     fs.rmSync(PID_FILE, { force: true });
+    fs.rmSync(GLOBAL_PID_FILE, { force: true });
     await app.stop();
     releaseLock();
     clearInterval(keepAlive);
@@ -365,9 +388,10 @@ async function cmdDaemonRun() {
 }
 
 async function cmdStop() {
-  const pid = readPid();
+  const pid = readGlobalPid() || readPid();
   if (!pid || !isPidRunning(pid)) {
     fs.rmSync(PID_FILE, { force: true });
+    fs.rmSync(GLOBAL_PID_FILE, { force: true });
     console.log("Daemon is not running");
     return;
   }
@@ -377,23 +401,21 @@ async function cmdStop() {
 }
 
 async function cmdRestart() {
-  const existingPid = readPid();
-  const orphanPids = listDaemonRunPids({ scriptPath: CLI_SCRIPT, throwOnError: true }).filter((pid) => pid !== existingPid);
-  if (orphanPids.length) {
-    const stopped = await stopDaemonRunPids(orphanPids);
-    if (stopped.length) {
-      console.log(`Stopped orphan daemon pid(s): ${stopped.join(", ")}`);
-    }
-  }
+  const existingPid = readGlobalPid() || readPid();
   await restartDaemon(existingPid, async () => cmdStart());
 }
 
 async function cmdStatus() {
   const status = readStatus();
-  const pid = readPid();
+  const globalPid = readGlobalPid();
+  const localPid = readPid();
+  const pid = globalPid || localPid;
   const running = Boolean(pid && isPidRunning(pid));
-  if (!running && pid) {
+  if (!running && localPid) {
     fs.rmSync(PID_FILE, { force: true });
+  }
+  if (!running && globalPid) {
+    fs.rmSync(GLOBAL_PID_FILE, { force: true });
   }
 
   console.log(JSON.stringify({
@@ -401,6 +423,7 @@ async function cmdStatus() {
     pid: running ? pid : 0,
     running,
     baseDir: BASE_DIR,
+    globalRuntimeDir: GLOBAL_RUNTIME_DIR,
   }, null, 2));
 }
 

@@ -6,10 +6,8 @@ import path from "node:path";
 
 import {
   claimDaemonLock,
-  parseDaemonRunPids,
   readPidFile,
   restartDaemon,
-  stopDaemonRunPids,
 } from "../src/daemon-instance.js";
 
 function tempDir() {
@@ -141,43 +139,4 @@ test("restartDaemon starts replacement after the existing daemon exits", async (
 
   assert.deepEqual(signals, [[111, "SIGTERM"]]);
   assert.equal(started, 1);
-});
-
-test("parseDaemonRunPids finds repo daemon-run processes and ignores other node commands", () => {
-  const scriptPath = "/Users/czy/auto/packages/ops-cli/src/cli.js";
-  const output = [
-    " 111 /opt/homebrew/bin/node /Users/czy/auto/packages/ops-cli/src/cli.js daemon-run",
-    " 112 /opt/homebrew/bin/node /Users/czy/auto/packages/ops-cli/src/cli.js start",
-    " 113 node /opt/homebrew/bin/codex app-server --listen stdio://",
-    " 114 /opt/homebrew/bin/node /Users/czy/other/packages/ops-cli/src/cli.js daemon-run",
-    " 115 /opt/homebrew/bin/node /Users/czy/auto/packages/ops-cli/src/cli.js daemon-run",
-  ].join("\n");
-
-  assert.deepEqual(parseDaemonRunPids(output, { scriptPath, currentPid: 115 }), [111]);
-});
-
-test("stopDaemonRunPids terminates unique daemon pids", async () => {
-  const running = new Set([111, 222]);
-  const signals = [];
-
-  const stopped = await stopDaemonRunPids([111, 111, 222], {
-    timeoutMs: 50,
-    pollIntervalMs: 1,
-    killFn(pid, signal = 0) {
-      if (signal === 0) {
-        if (!running.has(pid)) {
-          const error = new Error("no such process");
-          error.code = "ESRCH";
-          throw error;
-        }
-        return;
-      }
-      signals.push([pid, signal]);
-      running.delete(pid);
-    },
-    sleepFn: async () => {},
-  });
-
-  assert.deepEqual(stopped, [111, 222]);
-  assert.deepEqual(signals, [[111, "SIGTERM"], [222, "SIGTERM"]]);
 });
