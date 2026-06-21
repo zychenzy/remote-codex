@@ -583,6 +583,21 @@ export class DiscordAdapter extends BaseAdapter {
         options: [{ type: STRING, name: "action", description: "on, off, or show", required: false }],
       },
       {
+        name: "fast",
+        description: "Toggle fast mode.",
+        options: [{ type: STRING, name: "action", description: "on, off, or show", required: false }],
+      },
+      {
+        name: "goal",
+        description: "Show or update the current thread goal.",
+        options: [
+          { type: STRING, name: "action", description: "show, set, or clear", required: false },
+          { type: STRING, name: "value", description: "Goal text for set.", required: false },
+        ],
+      },
+      { name: "usage", description: "Show ChatGPT quota windows." },
+      { name: "requirements", description: "Show app-server policy requirements." },
+      {
         name: "autopilot",
         description: "Autopilot controls.",
         options: [
@@ -640,6 +655,12 @@ export class DiscordAdapter extends BaseAdapter {
               { type: STRING, name: "thread_id", description: "Thread id.", required: false },
               { type: BOOLEAN, name: "turns", description: "Include turns.", required: false },
             ],
+          },
+          {
+            type: SUB,
+            name: "name",
+            description: "Set the thread display name.",
+            options: [{ type: STRING, name: "value", description: "Thread display name.", required: true }],
           },
           {
             type: SUB,
@@ -1865,6 +1886,21 @@ export class DiscordAdapter extends BaseAdapter {
       const action = String(options?.getString?.("action") || "").trim();
       return action ? `/plan ${action}` : "/plan";
     }
+    if (command === "fast") {
+      const action = String(options?.getString?.("action") || "").trim();
+      return action ? `/fast ${action}` : "/fast";
+    }
+    if (command === "goal") {
+      const action = String(options?.getString?.("action") || "").trim();
+      const value = String(options?.getString?.("value") || "").trim();
+      return ["/goal", action, value].filter(Boolean).join(" ").trim();
+    }
+    if (command === "usage") {
+      return "/usage";
+    }
+    if (command === "requirements") {
+      return "/requirements";
+    }
     if (command === "autopilot") {
       const subcommand = options?.getSubcommand?.(false) || "";
       if (subcommand === "continue") {
@@ -1894,6 +1930,11 @@ export class DiscordAdapter extends BaseAdapter {
         const limit = options?.getInteger?.("limit");
         if (Number.isFinite(limit)) {
           parts.push(String(limit));
+        }
+      } else if (subcommand === "name") {
+        const value = String(options?.getString?.("value") || "").trim();
+        if (value) {
+          parts.push(value);
         }
       } else if (["resume", "read", "fork", "unsubscribe", "archive", "unarchive", "compact", "rollback"].includes(subcommand)) {
         const threadId = String(options?.getString?.("thread_id") || "").trim();

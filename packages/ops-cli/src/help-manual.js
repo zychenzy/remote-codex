@@ -28,6 +28,10 @@ export function commandManual(topic = "") {
       "/answer [requestId] <questionId>=<answer>[;<questionId>=<answer>] - reply to tool user-input prompts.",
       "/autopilot <on|off|status|continue on|continue off|mode ...> - unattended helper.",
       "/plan <on|off|show> - quick collaboration mode toggle (plan/default).",
+      "/fast <on|off|show> - quick effort toggle (on uses low effort).",
+      "/goal [goal text] - set the current app-server thread goal; show/clear manage it.",
+      "/usage - show ChatGPT quota windows reported by app-server.",
+      "/requirements - show app-server policy requirements.",
       "/status - show binding/thread/runtime status.",
       "/help [command] - show this help or details for one command.",
       "",
@@ -50,6 +54,10 @@ export function commandManual(topic = "") {
       "/autopilot continue on",
       "/autopilot mode aggressive",
       "/plan on",
+      "/fast on",
+      "/goal finish the release checklist",
+      "/usage",
+      "/requirements",
       "/answer req-123 mode=fast",
       "/answer rec",
       "/help approve",
@@ -130,12 +138,13 @@ export function commandManual(topic = "") {
 
   if (t === "thread") {
     return [
-      "/thread <start|resume|list|more|read|fork|loaded|unsubscribe|archive|unarchive|compact|rollback>",
+      "/thread <start|resume|list|more|read|name|fork|loaded|unsubscribe|archive|unarchive|compact|rollback>",
       "Native thread controls mapped to app-server thread methods.",
       "Examples:",
       "/thread list 20",
       "/thread list all 50",
       "/thread read <id> --turns true",
+      "/thread name release checklist",
       "/thread fork <id> --ephemeral true",
       "/thread archive <id> --confirm",
     ].join("\n");
@@ -217,6 +226,41 @@ export function commandManual(topic = "") {
     ].join("\n");
   }
 
+  if (t === "fast") {
+    return [
+      "/fast <on|off|show>",
+      "Convenience toggle for lower-latency turns.",
+      "on => set sticky reasoning effort to low, off => restore runtime default effort.",
+      "Examples: /fast on, /fast show, /fast off",
+    ].join("\n");
+  }
+
+  if (t === "goal") {
+    return [
+      "/goal <show|set <goal text>|clear>",
+      "Sets or manages the app-server goal for the current loaded thread.",
+      "Use /goal <goal text> as the normal set-and-go form.",
+      "Requires an active thread selected with /new or /resume.",
+      "Examples: /goal ship the daemon MVP, /goal show, /goal clear",
+    ].join("\n");
+  }
+
+  if (t === "usage") {
+    return [
+      "/usage",
+      "Shows ChatGPT rate-limit quota windows from app-server account/rateLimits/read.",
+      "Includes primary and secondary windows when the backend returns them.",
+    ].join("\n");
+  }
+
+  if (t === "requirements") {
+    return [
+      "/requirements",
+      "Shows app-server policy requirements from configRequirements/read.",
+      "Useful for diagnosing enforced approval policies, sandbox modes, network limits, and feature gates.",
+    ].join("\n");
+  }
+
   if (t === "autopilot") {
     return [
       "/autopilot <on|off|status|continue on|continue off|mode conservative|mode aggressive>",
@@ -232,7 +276,7 @@ export function commandManual(topic = "") {
   if (t === "status") {
     return [
       "/status",
-      "Shows binding key, current thread id, workspace path, active turn id, and pending approvals.",
+      "Shows binding key, current thread id, workspace path, active turn id, fast mode, and pending approvals.",
       "Also shows daemon auth mode (inherited from current Codex login state).",
     ].join("\n");
   }

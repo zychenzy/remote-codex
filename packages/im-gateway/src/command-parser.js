@@ -85,6 +85,29 @@ export function parseIncomingCommand(text = "") {
     return { type: "plan", action: (parts[1] || "show").toLowerCase() };
   }
 
+  if (cmd === "/fast") {
+    return { type: "fast", action: (parts[1] || "show").toLowerCase() };
+  }
+
+  if (cmd === "/goal") {
+    const action = (parts[1] || "show").toLowerCase();
+    const managementActions = new Set(["show", "status", "get", "set", "create", "update", "clear", "unset", "off", "delete"]);
+    return {
+      type: "goal",
+      action: managementActions.has(action) ? action : "set",
+      value: managementActions.has(action) ? parts.slice(2).join(" ").trim() : parts.slice(1).join(" ").trim(),
+      raw: trimmed,
+    };
+  }
+
+  if (cmd === "/usage") {
+    return { type: "usage" };
+  }
+
+  if (cmd === "/requirements") {
+    return { type: "requirements" };
+  }
+
   if (cmd === "/answer") {
     const first = parts[1] || "";
     const firstLower = first.toLowerCase();

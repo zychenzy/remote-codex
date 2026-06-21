@@ -167,6 +167,54 @@ rl.on("line", (line) => {
     return;
   }
 
+  if (method === "thread/name/set") {
+    const id = msg.params?.threadId;
+    if (!threads.has(id)) {
+      send({ id: msg.id, error: { code: -32600, message: "thread not found" } });
+      return;
+    }
+    const name = msg.params?.name || null;
+    threads.get(id).name = name;
+    send({ id: msg.id, result: { thread: { id, name } } });
+    send({ method: "thread/name/updated", params: { threadId: id, name } });
+    return;
+  }
+
+  if (method === "thread/goal/get") {
+    const id = msg.params?.threadId;
+    if (!threads.has(id)) {
+      send({ id: msg.id, error: { code: -32600, message: "thread not found" } });
+      return;
+    }
+    send({ id: msg.id, result: { goal: threads.get(id).goal || null } });
+    return;
+  }
+
+  if (method === "thread/goal/set") {
+    const id = msg.params?.threadId;
+    if (!threads.has(id)) {
+      send({ id: msg.id, error: { code: -32600, message: "thread not found" } });
+      return;
+    }
+    const goal = msg.params?.goal || null;
+    threads.get(id).goal = goal;
+    send({ id: msg.id, result: { goal } });
+    send({ method: "thread/goal/updated", params: { threadId: id, goal } });
+    return;
+  }
+
+  if (method === "thread/goal/clear") {
+    const id = msg.params?.threadId;
+    if (!threads.has(id)) {
+      send({ id: msg.id, error: { code: -32600, message: "thread not found" } });
+      return;
+    }
+    threads.get(id).goal = null;
+    send({ id: msg.id, result: {} });
+    send({ method: "thread/goal/cleared", params: { threadId: id } });
+    return;
+  }
+
   if (method === "turn/start") {
     const threadId = msg.params?.threadId;
     if (typeof msg.params?.collaborationMode === "string") {
@@ -297,6 +345,38 @@ rl.on("line", (line) => {
   if (method === "skills/config/write") {
     send({ id: msg.id, result: { ok: true, path: msg.params?.path, enabled: msg.params?.enabled } });
     send({ method: "skills/changed", params: {} });
+    return;
+  }
+
+  if (method === "account/rateLimits/read") {
+    send({
+      id: msg.id,
+      result: {
+        rateLimits: {
+          limitId: "codex",
+          limitName: null,
+          primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 1730947200 },
+          secondary: { usedPercent: 50, windowDurationMins: 10080, resetsAt: 1731547200 },
+          rateLimitReachedType: null,
+          planType: "plus",
+        },
+      },
+    });
+    return;
+  }
+
+  if (method === "configRequirements/read") {
+    send({
+      id: msg.id,
+      result: {
+        requirements: {
+          allowedApprovalPolicies: ["onRequest", "unlessTrusted"],
+          allowedSandboxModes: ["readOnly", "workspaceWrite"],
+          featureRequirements: { unified_exec: true },
+          network: { enabled: false, allowedDomains: ["api.openai.com"] },
+        },
+      },
+    });
     return;
   }
 

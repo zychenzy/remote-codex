@@ -93,6 +93,18 @@ test("runtime exposes extended thread, review, model, and skills wrappers", asyn
   const rolledBack = await runtime.rollbackThread({ threadId, numTurns: 1 });
   assert.equal(rolledBack.thread.id, threadId);
 
+  const named = await runtime.setThreadName({ threadId, name: "Release checklist" });
+  assert.equal(named.thread.name, "Release checklist");
+
+  const setGoal = await runtime.setThreadGoal({ threadId, goal: "Ship the daemon" });
+  assert.equal(setGoal.goal, "Ship the daemon");
+
+  const goal = await runtime.getThreadGoal(threadId);
+  assert.equal(goal.goal, "Ship the daemon");
+
+  const clearedGoal = await runtime.clearThreadGoal(threadId);
+  assert.deepEqual(clearedGoal, {});
+
   const turn = await runtime.startTurn({ threadId, input: [{ type: "text", text: "hello again" }] });
   const steer = await runtime.steerTurn({
     threadId,
@@ -128,6 +140,12 @@ test("runtime exposes extended thread, review, model, and skills wrappers", asyn
     enabled: false,
   });
   assert.equal(skillWrite.ok, true);
+
+  const rateLimits = await runtime.readAccountRateLimits();
+  assert.equal(rateLimits.rateLimits.limitId, "codex");
+
+  const requirements = await runtime.readConfigRequirements();
+  assert.deepEqual(requirements.requirements.allowedSandboxModes, ["readOnly", "workspaceWrite"]);
 
   await runtime.archiveThread(threadId);
   const unarchived = await runtime.unarchiveThread(threadId);

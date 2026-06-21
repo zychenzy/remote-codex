@@ -246,6 +246,36 @@ export class AppServerRuntime {
     return this.rpc.request("thread/rollback", { threadId, numTurns });
   }
 
+  async setThreadName({ threadId, name } = {}) {
+    await this.initialize();
+    return this.rpc.request("thread/name/set", { threadId, name });
+  }
+
+  async getThreadGoal(threadId) {
+    await this.initialize();
+    return this.rpc.request("thread/goal/get", { threadId });
+  }
+
+  async setThreadGoal({ threadId, goal } = {}) {
+    await this.initialize();
+    return this.rpc.request("thread/goal/set", { threadId, goal });
+  }
+
+  async clearThreadGoal(threadId) {
+    await this.initialize();
+    return this.rpc.request("thread/goal/clear", { threadId });
+  }
+
+  async readAccountRateLimits() {
+    await this.initialize();
+    return this.rpc.request("account/rateLimits/read", {});
+  }
+
+  async readConfigRequirements() {
+    await this.initialize();
+    return this.rpc.request("configRequirements/read", {});
+  }
+
   async startReview({
     threadId,
     delivery = "inline",

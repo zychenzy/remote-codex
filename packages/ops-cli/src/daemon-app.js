@@ -319,6 +319,154 @@ function toInt(value, fallback = 10, min = 1, max = 200) {
   return Math.min(Math.max(Math.floor(n), min), max);
 }
 
+function formatUnixReset(seconds) {
+  const n = Number(seconds);
+  if (!Number.isFinite(n) || n <= 0) {
+    return "unknown";
+  }
+  const date = new Date(n * 1000);
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(date);
+}
+
+function formatReset(window = {}) {
+  const time = formatUnixReset(window?.resetsAt);
+  const n = Number(window?.resetsAt);
+  const minutes = Number(window?.windowDurationMins);
+  if (!Number.isFinite(n) || !Number.isFinite(minutes) || minutes < 24 * 60) {
+    return time;
+  }
+  const date = new Date(n * 1000);
+  const monthDay = new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+  }).format(date).replace(",", "");
+  return `${time} on ${monthDay}`;
+}
+
+function quotaLabel(window = {}, fallback = "Limit") {
+  const minutes = Number(window?.windowDurationMins);
+  if (minutes === 300) {
+    return "5h limit";
+  }
+  if (minutes === 10080) {
+    return "Weekly limit";
+  }
+  if (Number.isFinite(minutes) && minutes > 0) {
+    if (minutes % 1440 === 0) {
+      return `${minutes / 1440}d limit`;
+    }
+    if (minutes % 60 === 0) {
+      return `${minutes / 60}h limit`;
+    }
+    return `${minutes}m limit`;
+  }
+  return fallback;
+}
+
+function usageBar(percentLeft, width = 20) {
+  if (!Number.isFinite(percentLeft)) {
+    return `[${"?".repeat(width)}]`;
+  }
+  const filled = Math.min(Math.max(Math.round((percentLeft / 100) * width), 0), width);
+  return `[${"█".repeat(filled)}${"░".repeat(width - filled)}]`;
+}
+
+function formatUsageWindow(label, window = {}) {
+  const labelText = String(label || "").replace(/:\s*$/, "");
+  const used = Number(window?.usedPercent);
+  if (!Number.isFinite(used)) {
+    return `${labelText.padEnd(14)} ${usageBar(null)} usage unknown`;
+  }
+  const left = Math.min(Math.max(100 - used, 0), 100);
+  const roundedLeft = Math.round(left);
+  const leftText = `${roundedLeft}% left`.padEnd(8);
+  return `${labelText.padEnd(14)} ${usageBar(left)} ${leftText} resets ${formatReset(window)}`;
+}
+
+function rateLimitEntriesFromResponse(response = {}) {
+  if (response?.rateLimitsByLimitId && typeof response.rateLimitsByLimitId === "object") {
+    return Object.values(response.rateLimitsByLimitId).filter(Boolean);
+  }
+  return response?.rateLimits ? [response.rateLimits] : [];
+}
+
+function formatRateLimits(response = {}) {
+  const entries = rateLimitEntriesFromResponse(response);
+  if (!entries.length) {
+    return "No ChatGPT usage data returned by app-server.";
+  }
+  const windows = [];
+  const notices = [];
+  for (const entry of entries) {
+    if (entry.primary) {
+      windows.push({ label: quotaLabel(entry.primary, "Primary limit"), window: entry.primary });
+    }
+    if (entry.secondary) {
+      windows.push({ label: quotaLabel(entry.secondary, "Secondary limit"), window: entry.secondary });
+    }
+    if (entry.rateLimitReachedType) {
+      notices.push(`Limit state: ${entry.rateLimitReachedType}`);
+    }
+  }
+  const lines = windows.map(({ label, window }) => formatUsageWindow(label, window));
+  for (const notice of notices) {
+    lines.push(notice);
+  }
+  if (!lines.length) {
+    return "No ChatGPT usage windows returned by app-server.";
+  }
+  return ["```", ...lines, "```"].join("\n");
+}
+
+function formatConfigRequirements(response = {}) {
+  const requirements = response?.requirements;
+  if (!requirements) {
+    return "No app-server policy requirements are configured.";
+  }
+  const lines = ["App-server requirements:"];
+  if (Array.isArray(requirements.allowedApprovalPolicies)) {
+    lines.push(`Approval policies: ${requirements.allowedApprovalPolicies.join(", ") || "none"}`);
+  }
+  if (Array.isArray(requirements.allowedSandboxModes)) {
+    lines.push(`Sandbox modes: ${requirements.allowedSandboxModes.join(", ") || "none"}`);
+  }
+  if (requirements.network && typeof requirements.network === "object") {
+    const network = requirements.network;
+    lines.push(`Network: ${network.enabled ? "enabled" : "restricted"}`);
+    if (Array.isArray(network.allowedDomains) && network.allowedDomains.length) {
+      lines.push(`Allowed domains: ${network.allowedDomains.join(", ")}`);
+    }
+  }
+  const features = requirements.featureRequirements;
+  if (features && typeof features === "object") {
+    const entries = Object.entries(features).map(([key, value]) => `${key}=${value}`);
+    if (entries.length) {
+      lines.push(`Features: ${entries.join(", ")}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function goalFromResponse(response = {}) {
+  if (typeof response?.goal === "string") {
+    return response.goal;
+  }
+  if (response?.goal && typeof response.goal === "object") {
+    return response.goal.text || response.goal.description || JSON.stringify(response.goal);
+  }
+  if (typeof response?.thread?.goal === "string") {
+    return response.thread.goal;
+  }
+  if (response?.thread?.goal && typeof response.thread.goal === "object") {
+    return response.thread.goal.text || response.thread.goal.description || JSON.stringify(response.thread.goal);
+  }
+  return "";
+}
+
 function nextCursorFromResponse(response) {
   return response?.nextCursor || response?.next_cursor || response?.cursor || null;
 }
@@ -3409,6 +3557,7 @@ export class DaemonApp {
         `Workspace: ${binding.workingDir}`,
         `Model: ${binding.policyProfile?.model || "runtime default"}`,
         `Effort: ${binding.policyProfile?.reasoningEffort || "runtime default"}`,
+        `Fast mode: ${binding.policyProfile?.reasoningEffort === "low" ? "on" : "off"}`,
         `Mode: ${binding.policyProfile?.collaborationMode || "runtime default"}`,
         `Autopilot: ${autopilot.enabled ? "on" : "off"} (${autopilot.mode || "rules"})`,
         `Autopilot continue: ${autopilot.continueOnTurnComplete ? "on" : "off"}`,
@@ -3812,6 +3961,23 @@ export class DaemonApp {
         return;
       }
 
+      if (action === "name") {
+        const threadId = binding.threadId;
+        if (!threadId) {
+          await this.#sendMessage(adapter, context, "No active thread selected. Resume or start a thread first, then run /thread name <name>.");
+          return;
+        }
+        const name = positional.join(" ").trim();
+        if (!name) {
+          await this.#sendMessage(adapter, context, "Usage: /thread name <display name>");
+          return;
+        }
+        const response = await this.runtime.setThreadName({ threadId, name });
+        const nextName = response?.thread?.name || name;
+        await this.#sendMessage(adapter, context, `Thread name set: ${nextName}`);
+        return;
+      }
+
       if (action === "fork") {
         const sourceThreadId = positional[0] || binding.threadId;
         if (!sourceThreadId) {
@@ -3904,7 +4070,7 @@ export class DaemonApp {
       await this.#sendMessage(
         adapter,
         context,
-        "Usage: /thread <start|resume|list|more|read|fork|loaded|unsubscribe|archive|unarchive|compact|rollback>"
+        "Usage: /thread <start|resume|list|more|read|name|fork|loaded|unsubscribe|archive|unarchive|compact|rollback>"
       );
       return;
     }
@@ -3961,6 +4127,89 @@ export class DaemonApp {
       clearSkillCache: (cwd) => this.skillsCacheByCwd.delete(cwd),
     });
     if (modelOrSkillsHandled) {
+      return;
+    }
+
+    if (command.type === "usage") {
+      const rateLimits = await this.runtime.readAccountRateLimits();
+      await this.#sendMessage(adapter, context, formatRateLimits(rateLimits));
+      return;
+    }
+
+    if (command.type === "requirements") {
+      const requirements = await this.runtime.readConfigRequirements();
+      await this.#sendMessage(adapter, context, formatConfigRequirements(requirements));
+      return;
+    }
+
+    if (command.type === "fast") {
+      const action = String(command.action || "show").toLowerCase();
+      if (["show", "status"].includes(action)) {
+        const enabled = binding.policyProfile?.reasoningEffort === "low";
+        await this.#sendMessage(
+          adapter,
+          context,
+          `Fast mode is ${enabled ? "ON" : "OFF"} for this chat. Effort: ${binding.policyProfile?.reasoningEffort || "runtime default"}.`
+        );
+        return;
+      }
+      if (["on", "enable", "enabled"].includes(action)) {
+        const updated = this.store.upsertBinding({
+          ...binding,
+          policyProfile: {
+            ...binding.policyProfile,
+            reasoningEffort: "low",
+          },
+        });
+        Object.assign(binding, updated);
+        await this.#sendMessage(adapter, context, "Fast mode enabled. New turns will use reasoning effort: low.");
+        return;
+      }
+      if (["off", "disable", "disabled"].includes(action)) {
+        const updated = this.store.upsertBinding({
+          ...binding,
+          policyProfile: {
+            ...binding.policyProfile,
+            reasoningEffort: null,
+          },
+        });
+        Object.assign(binding, updated);
+        await this.#sendMessage(adapter, context, "Fast mode disabled. New turns will use the runtime default effort.");
+        return;
+      }
+      await this.#sendMessage(adapter, context, "Usage: /fast <on|off|show>");
+      return;
+    }
+
+    if (command.type === "goal") {
+      const action = String(command.action || "show").toLowerCase();
+      const currentThreadId = String(binding.threadId || "").trim();
+      if (!currentThreadId) {
+        await this.#sendMessage(adapter, context, "No active thread selected. Resume or start a thread first, then run /goal.");
+        return;
+      }
+      if (["show", "status", "get"].includes(action)) {
+        const response = await this.runtime.getThreadGoal(currentThreadId);
+        const goal = goalFromResponse(response);
+        await this.#sendMessage(adapter, context, goal ? `Goal:\n${goal}` : "No goal is set for this thread.");
+        return;
+      }
+      if (action === "set") {
+        const goal = String(command.value || "").trim();
+        if (!goal) {
+          await this.#sendMessage(adapter, context, "Usage: /goal <goal text>");
+          return;
+        }
+        const response = await this.runtime.setThreadGoal({ threadId: currentThreadId, goal });
+        await this.#sendMessage(adapter, context, `Goal set:\n${goalFromResponse(response) || goal}`);
+        return;
+      }
+      if (["clear", "unset", "off", "delete"].includes(action)) {
+        await this.runtime.clearThreadGoal(currentThreadId);
+        await this.#sendMessage(adapter, context, "Goal cleared for this thread.");
+        return;
+      }
+      await this.#sendMessage(adapter, context, "Usage: /goal <show|set <goal text>|clear>");
       return;
     }
 

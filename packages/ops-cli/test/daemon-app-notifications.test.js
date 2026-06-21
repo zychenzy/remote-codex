@@ -31,6 +31,7 @@ class FakeRuntime {
     this.startThreadCalls = [];
     this.startTurnCalls = [];
     this.resumeThreadCalls = [];
+    this.goals = new Map();
     this.listThreadsResponse = listThreadsResponse;
     this.modelsResponse = modelsResponse;
     this.collaborationModesResponse = collaborationModesResponse;
@@ -120,6 +121,55 @@ class FakeRuntime {
     const threadId = "thread-start-" + this.startThreadCalls.length;
     this.loadedThreadIds.push(threadId);
     return { thread: { id: threadId, cwd: params?.cwd || "/Users/czy/auto" } };
+  }
+
+  async setThreadName({ threadId, name }) {
+    const existing = this.threadReads.get(threadId) || { thread: { id: threadId, cwd: "/Users/czy/auto" } };
+    const next = {
+      ...existing,
+      thread: {
+        ...existing.thread,
+        id: threadId,
+        name,
+      },
+    };
+    this.threadReads.set(threadId, next);
+    return { thread: next.thread };
+  }
+
+  async getThreadGoal(threadId) {
+    return { goal: this.goals.get(threadId) || null };
+  }
+
+  async setThreadGoal({ threadId, goal }) {
+    this.goals.set(threadId, goal);
+    return { goal };
+  }
+
+  async clearThreadGoal(threadId) {
+    this.goals.delete(threadId);
+    return {};
+  }
+
+  async readAccountRateLimits() {
+    return {
+      rateLimits: {
+        limitId: "codex",
+        primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 1730947200 },
+        secondary: { usedPercent: 50, windowDurationMins: 10080, resetsAt: 1731547200 },
+      },
+    };
+  }
+
+  async readConfigRequirements() {
+    return {
+      requirements: {
+        allowedApprovalPolicies: ["onRequest"],
+        allowedSandboxModes: ["workspaceWrite"],
+        featureRequirements: { unified_exec: true },
+        network: { enabled: false, allowedDomains: ["api.openai.com"] },
+      },
+    };
   }
 
   async respondServerRequest(requestId, result) {
@@ -1737,6 +1787,100 @@ test("daemon /status includes auth inheritance note", async () => {
   }
 
   assert.equal(adapter.messages.some((item) => item.text.includes("Auth mode: inherited from current Codex login state")), true);
+});
+
+test("daemon /fast toggles low reasoning effort", async () => {
+  const { app, adapter } = await setupDaemonHarness();
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/fast on",
+    });
+    await sleep(50);
+
+    assert.equal(app.store.getBinding("discord", "chat-1").policyProfile.reasoningEffort, "low");
+
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/fast off",
+    });
+    await sleep(50);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(app.store.getBinding("discord", "chat-1").policyProfile.reasoningEffort, null);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Fast mode enabled")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Fast mode disabled")), true);
+});
+
+test("daemon /goal and /usage use app-server account and goal APIs", async () => {
+  const { app, adapter } = await setupDaemonHarness();
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/goal Ship the daemon",
+    });
+    await sleep(50);
+
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/goal show",
+    });
+    await sleep(50);
+
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/usage",
+    });
+    await sleep(50);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(adapter.messages.some((item) => item.text.includes("Goal set:\nShip the daemon")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Goal:\nShip the daemon")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("5h limit")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Weekly limit")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("75% left")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("```")), true);
+});
+
+test("daemon supports thread naming and requirements diagnostics", async () => {
+  const { app, adapter } = await setupDaemonHarness();
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/thread name Release checklist",
+    });
+    await sleep(50);
+
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/requirements",
+    });
+    await sleep(50);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(adapter.messages.some((item) => item.text.includes("Thread name set: Release checklist")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("App-server requirements:")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Sandbox modes: workspaceWrite")), true);
 });
 
 test("daemon thread auto-approve handles command/file only and keeps tool user-input manual", async () => {

@@ -171,6 +171,10 @@ Useful IM commands:
 - `/plan on`
 - `/plan off`
 - `/plan show`
+- `/fast on|off|show`
+- `/goal <goal text>|show|clear`
+- `/usage`
+- `/requirements`
 - `/autopilot status`
 - `/autopilot continue`
 
@@ -206,10 +210,14 @@ Thread admin:
 
 Namespaced commands:
 
-- `/thread start|resume|list|more|read|fork|loaded|unsubscribe|archive|unarchive|compact|rollback`
+- `/thread start|resume|list|more|read|name|fork|loaded|unsubscribe|archive|unarchive|compact|rollback`
 - `/turn ask|steer|interrupt|review`
 - `/model show|set|effort|mode`
 - `/skills list|use|enable|disable|reload`
+- `/goal <goal text>|show|clear`
+- `/fast on|off|show`
+- `/usage`
+- `/requirements`
 
 Shortcuts/aliases:
 

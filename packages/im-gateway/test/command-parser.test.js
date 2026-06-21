@@ -42,6 +42,34 @@ test("parser handles plan command", () => {
   assert.equal(result.action, "on");
 });
 
+test("parser handles fast command", () => {
+  const result = parseIncomingCommand("/fast off");
+  assert.equal(result.type, "fast");
+  assert.equal(result.action, "off");
+});
+
+test("parser handles goal command", () => {
+  const result = parseIncomingCommand("/goal Ship the daemon");
+  assert.equal(result.type, "goal");
+  assert.equal(result.action, "set");
+  assert.equal(result.value, "Ship the daemon");
+});
+
+test("parser handles explicit goal management command", () => {
+  const result = parseIncomingCommand("/goal set Ship the daemon");
+  assert.equal(result.type, "goal");
+  assert.equal(result.action, "set");
+  assert.equal(result.value, "Ship the daemon");
+});
+
+test("parser handles usage command", () => {
+  assert.equal(parseIncomingCommand("/usage").type, "usage");
+});
+
+test("parser handles requirements command", () => {
+  assert.equal(parseIncomingCommand("/requirements").type, "requirements");
+});
+
 test("parser handles answer command with explicit request id", () => {
   const result = parseIncomingCommand("/answer 917222ab-9d14-41fa-9afd-d692702d8824 q1=on;q2=off");
   assert.equal(result.type, "answer");
