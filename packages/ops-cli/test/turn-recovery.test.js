@@ -50,6 +50,7 @@ test("turn recovery falls back to fresh thread when resumed thread is still miss
   let attempts = 0;
   let retryMissingCalled = 0;
   let expiredCalled = 0;
+  let recoveredCalled = 0;
 
   const result = await startTurnWithRecovery({
     threadId: "thread-1",
@@ -64,6 +65,9 @@ test("turn recovery falls back to fresh thread when resumed thread is still miss
     resumeThread: async () => ({ thread: { id: "thread-1" } }),
     startFreshThread: async () => "thread-fresh",
     isThreadNotFoundError,
+    onRecovered: async () => {
+      recoveredCalled += 1;
+    },
     onRecoveredRetryMissing: async () => {
       retryMissingCalled += 1;
     },
@@ -76,4 +80,7 @@ test("turn recovery falls back to fresh thread when resumed thread is still miss
   assert.equal(result.turnResponse.turn.id, "turn-for-thread-fresh");
   assert.equal(retryMissingCalled, 1);
   assert.equal(expiredCalled, 1);
+  // Resume succeeded but the retry startTurn 404'd: the recovered threadId must
+  // NOT be persisted, so onRecovered is never invoked.
+  assert.equal(recoveredCalled, 0);
 });

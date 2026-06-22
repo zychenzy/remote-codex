@@ -21,6 +21,22 @@ function sanitizeAnswerValue(value) {
   return String(value || "").replace(/[;\n\r]/g, " ").replace(/\s+/g, " ").trim();
 }
 
+function isRecommendedOption(option) {
+  if (!option || typeof option !== "object") {
+    return false;
+  }
+  // Only honour explicit runtime markers; never infer "recommended" from position.
+  // ponytail: fixed marker-field allowlist; no schema negotiation with the runtime.
+  return Boolean(
+    option.recommended
+    || option.isRecommended
+    || option.isDefault
+    || option.default
+    || option.safe
+    || option.isSafe
+  );
+}
+
 function extractQuestions(params = {}) {
   const candidates = [
     params?.questions,
@@ -37,21 +53,29 @@ function extractQuestions(params = {}) {
       if (!entry || typeof entry !== "object") {
         continue;
       }
-      const options = safeList(entry.options)
-        .map((option) => {
-          if (typeof option === "string") {
-            return option.trim();
-          }
-          if (option && typeof option === "object") {
-            return String(option.label || option.value || option.id || "").trim();
-          }
-          return "";
-        })
-        .filter(Boolean);
+      let recommendedIndex = -1;
+      const options = [];
+      for (const option of safeList(entry.options)) {
+        let label = "";
+        if (typeof option === "string") {
+          label = option.trim();
+        } else if (option && typeof option === "object") {
+          label = String(option.label || option.value || option.id || "").trim();
+        }
+        if (!label) {
+          continue;
+        }
+        // Track the first option the runtime explicitly marks recommended/safe/default.
+        if (recommendedIndex < 0 && isRecommendedOption(option)) {
+          recommendedIndex = options.length;
+        }
+        options.push(label);
+      }
       out.push({
         id: String(entry.id || "").trim(),
         question: String(entry.question || entry.prompt || entry.text || "").trim(),
         options,
+        recommendedIndex,
       });
     }
     if (out.length) {
@@ -76,8 +100,9 @@ function allowedWriteRoots(binding) {
   if (configured.length) {
     return configured;
   }
-  const workingDir = String(binding?.workingDir || "").trim();
-  return workingDir ? [workingDir] : [];
+  // workspaceRoot is the enforced root; fall back to workingDir only when it is absent.
+  const defaultRoot = String(binding?.workspaceRoot ?? binding?.workingDir ?? "").trim();
+  return defaultRoot ? [defaultRoot] : [];
 }
 
 function isPathWithinRoot(candidatePath, root) {
@@ -236,15 +261,22 @@ export function decideToolInputRequest(serverRequest, binding) {
   if (!questions.length) {
     return action("pause", "tool input prompt is missing structured questions");
   }
-  const pairs = [];
+  const answers = {};
   for (let index = 0; index < questions.length; index += 1) {
-    const selected = sanitizeAnswerValue(questions[index]?.options?.[0] || "");
+    const question = questions[index];
+    const recommendedIndex = Number(question?.recommendedIndex);
+    // Only auto-answer when the runtime explicitly marks an option recommended/safe.
+    if (!Number.isInteger(recommendedIndex) || recommendedIndex < 0) {
+      return action("pause", "no recommended option marked for tool input question");
+    }
+    const selected = sanitizeAnswerValue(question?.options?.[recommendedIndex] || "");
     if (!selected) {
       return action("pause", "tool input options are ambiguous");
     }
-    pairs.push(`${questionKey(questions[index], index)}=${selected}`);
+    answers[questionKey(question, index)] = { answers: [selected] };
   }
-  return action("answer", "selected first recommended option for each question", pairs.join(";"));
+  // Emit the JSON form the approval broker parses; avoids key=value;... corruption.
+  return action("answer", "selected runtime-recommended option for each question", JSON.stringify({ answers }));
 }
 
 export function decideTurnContinuation(snapshot, binding, session = null) {

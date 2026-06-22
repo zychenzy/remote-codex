@@ -156,7 +156,7 @@ export async function handleModelAndSkillsCommand({
   if (command.type === "skills") {
     const action = command.action || "";
     const { positional, options } = parseArgsAndOptions(command.args);
-    const cwdResolved = options.cwd ? resolveWorkspacePath(options.cwd, binding.workingDir) : { value: binding.workingDir };
+    const cwdResolved = options.cwd ? resolveWorkspacePath(options.cwd, binding.workingDir, binding.workspaceRoot ?? binding.workingDir) : { value: binding.workingDir };
     if (cwdResolved.error) {
       await sendMessage(adapter, context, cwdResolved.error);
       return true;
@@ -290,6 +290,7 @@ export async function handleModelAndSkillsCommand({
         model: nextModel,
       },
     });
+    Object.assign(binding, updated);
     await sendMessage(adapter, context, `Model set to: ${updated.policyProfile?.model || "runtime default"}`);
     return true;
   }

@@ -80,7 +80,10 @@ export async function reconcileRuntimeState({
             clearedBindings += 1;
             continue;
           }
+          // Non-404 resume failure: the binding is not proven healthy, so do not
+          // count it verified or refresh its cwd. Leave it untouched for retry.
           logger.warn(`thread resume failed during runtime reconciliation (${threadId}): ${resumeError.message}`);
+          continue;
         }
       }
       verifiedThreads += 1;

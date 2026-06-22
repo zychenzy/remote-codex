@@ -1,5 +1,31 @@
+const MAX_COMMAND_LENGTH = 8000;
+
+const ANSWER_SHORTHANDS = new Set(["rec", "recommended"]);
+
+// A token is treated as a request id when it is not payload-shaped (=, ;, {),
+// not a bare number (numeric option shorthand like "1 2 1"), and not a known
+// shorthand keyword. This accepts real non-UUID ids (e.g. req-1) by arity.
+function looksLikeRequestId(token = "") {
+  const value = String(token || "");
+  if (!value) {
+    return false;
+  }
+  if (value.includes("=") || value.includes(";") || value.startsWith("{")) {
+    return false;
+  }
+  if (/^\d+$/.test(value)) {
+    return false;
+  }
+  return !ANSWER_SHORTHANDS.has(value.toLowerCase());
+}
+
 export function parseIncomingCommand(text = "") {
-  const trimmed = String(text || "").trim();
+  // Strip control bytes and bound length ONCE so every command path (including
+  // slice-based /cwd, /search, /ask) inherits sanitized, capped input.
+  const trimmed = String(text || "")
+    .trim()
+    .replace(/[\x00-\x1f\x7f]/g, "")
+    .slice(0, MAX_COMMAND_LENGTH);
   if (!trimmed) {
     return { type: "empty" };
   }
@@ -34,8 +60,10 @@ export function parseIncomingCommand(text = "") {
   if (cmd === "/threads" || cmd === "/sessions") {
     const args = parts.slice(1).map((value) => String(value || "").trim()).filter(Boolean);
     const all = args.some((value) => value.toLowerCase() === "all" || value === "--all");
-    const numericArg = args.find((value) => Number.isFinite(Number(value)) && Number(value) > 0);
-    const limit = Number.isFinite(Number(numericArg)) ? Number(numericArg) : 10;
+    // Only accept plain non-negative integers; reject 1.5/1e3/0x10 etc.
+    const numericArg = args.find((value) => /^\d+$/.test(value));
+    const parsed = numericArg != null ? Number.parseInt(numericArg, 10) : NaN;
+    const limit = Number.isInteger(parsed) && parsed > 0 ? parsed : 10;
     return {
       type: "threads",
       all,
@@ -111,8 +139,6 @@ export function parseIncomingCommand(text = "") {
   if (cmd === "/answer") {
     const first = parts[1] || "";
     const firstLower = first.toLowerCase();
-    const firstLooksLikePayload = first.includes("=") || first.includes(";") || first.startsWith("{");
-    const firstLooksLikeUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(first);
 
     if (!first) {
       return { type: "answer", decision: "allow", requestId: "", payload: "" };
@@ -120,8 +146,7 @@ export function parseIncomingCommand(text = "") {
 
     if (["allow", "deny"].includes(firstLower)) {
       const second = parts[2] || "";
-      const secondLooksLikePayload = second.includes("=") || second.includes(";") || second.startsWith("{");
-      const hasRequestId = Boolean(second) && !secondLooksLikePayload;
+      const hasRequestId = Boolean(second) && looksLikeRequestId(second);
       const payload = parts.slice(hasRequestId ? 3 : 2).join(" ").trim();
       return {
         type: "answer",
@@ -135,29 +160,25 @@ export function parseIncomingCommand(text = "") {
       return { type: "answer", decision: "deny", requestId: "", payload: "" };
     }
 
-    if (parts.length === 2 && firstLooksLikePayload) {
+    // Explicit arity, not UUID-shape inference: a leading id token (anything
+    // that is not payload-shaped, a bare number, or a known shorthand) followed
+    // by a payload routes as <id> <payload...>. Otherwise the whole tail is the
+    // payload with an empty requestId. This keeps real non-UUID ids from being
+    // mis-routed into the payload.
+    if (parts.length > 2 && looksLikeRequestId(first)) {
       return {
         type: "answer",
         decision: "allow",
-        requestId: "",
-        payload: first,
-      };
-    }
-
-    if (!firstLooksLikeUuid) {
-      return {
-        type: "answer",
-        decision: "allow",
-        requestId: "",
-        payload: parts.slice(1).join(" ").trim(),
+        requestId: first,
+        payload: parts.slice(2).join(" ").trim(),
       };
     }
 
     return {
       type: "answer",
       decision: "allow",
-      requestId: first,
-      payload: parts.slice(2).join(" ").trim(),
+      requestId: "",
+      payload: parts.slice(1).join(" ").trim(),
     };
   }
 

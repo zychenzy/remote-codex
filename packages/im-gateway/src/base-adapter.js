@@ -76,19 +76,38 @@ export class BaseAdapter extends EventEmitter {
     }
 
     buffer.timer = setTimeout(async () => {
+      const content = buffer.value;
+      this.streamingBuffers.delete(key);
       try {
-        const content = buffer.value;
-        this.streamingBuffers.delete(key);
         if (content.trim()) {
           await this.sendMessage(context, content);
         }
       } catch (error) {
         const message = error?.message || String(error);
         this.logger?.error?.(`[${this.channel || "adapter"}] failed to flush streaming delta: ${message}`);
+        // Re-buffer the dropped content so the next delta retries it instead of
+        // silently losing this stream chunk. Prepend ahead of anything that
+        // arrived while this flush was in flight.
+        this.#rebufferStreamingContent(key, content);
       }
     }, 900);
 
     this.streamingBuffers.set(key, buffer);
+  }
+
+  #rebufferStreamingContent(key, content) {
+    if (!content) {
+      return;
+    }
+    const existing = this.streamingBuffers.get(key);
+    if (existing) {
+      // Newer deltas may have arrived during the failed flush; keep ordering by
+      // putting the failed content first. Preserve any pending timer.
+      existing.value = `${content}${existing.value}`;
+      this.streamingBuffers.set(key, existing);
+      return;
+    }
+    this.streamingBuffers.set(key, { value: content, timer: null });
   }
 
   async sendApprovalPrompt(context, approvalRequest) {

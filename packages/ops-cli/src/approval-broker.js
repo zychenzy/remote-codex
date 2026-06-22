@@ -29,8 +29,12 @@ function parseToolInputPayload(payloadText) {
   return { answers };
 }
 
+function normalizeDecision(decision) {
+  return decision === "allow" ? "allow" : "deny";
+}
+
 function decisionForMethod(method, decision, payload) {
-  const normalized = decision === "allow" ? "allow" : "deny";
+  const normalized = normalizeDecision(decision);
 
   if (method === "item/commandExecution/requestApproval") {
     return {
@@ -60,7 +64,7 @@ export class ApprovalBroker extends EventEmitter {
     this.pending = new Map();
   }
 
-  create({ serverRequest, binding, autoApprove = false }) {
+  create({ serverRequest, binding, autoApprove = false, initiatorUserId = null }) {
     const localRequestId = crypto.randomUUID();
 
     const record = {
@@ -69,61 +73,74 @@ export class ApprovalBroker extends EventEmitter {
       method: serverRequest.method,
       params: serverRequest.params,
       binding,
+      initiatorUserId: initiatorUserId ?? null,
       status: "pending",
       createdAt: new Date().toISOString(),
     };
 
-    if (autoApprove) {
-      const resolution = {
-        localRequestId,
-        decision: "allow",
-        response: decisionForMethod(serverRequest.method, "allow", ""),
-        record,
-      };
-      this.emit("resolved", resolution);
-      return { record, autoResolved: true };
-    }
-
     const timer = setTimeout(() => {
-      this.pending.delete(localRequestId);
-      const resolution = {
-        localRequestId,
-        decision: "deny",
-        response: decisionForMethod(serverRequest.method, "deny", ""),
-        record,
-        timeout: true,
-      };
-      this.emit("resolved", resolution);
+      const entry = this.pending.get(localRequestId);
+      if (!entry || entry.resolved) {
+        return;
+      }
+      this.#finalize(entry, { decision: "deny", payload: "", actor: "system", timeout: true });
     }, this.timeoutMs);
 
-    this.pending.set(localRequestId, {
+    const entry = {
       record,
       timer,
       resolved: false,
-    });
+    };
+    this.pending.set(localRequestId, entry);
+
+    if (autoApprove) {
+      // Route auto-approve through the same pending + resolve path so a single
+      // code path enforces single-resolution. overrideOwnership: system actor.
+      this.resolve(localRequestId, { decision: "allow", actor: "system", overrideOwnership: true });
+      return { record, autoResolved: true };
+    }
 
     return { record, autoResolved: false };
   }
 
-  resolve(localRequestId, { decision, payload = "", actor = "user" } = {}) {
+  resolve(localRequestId, { decision, payload = "", actor = "user", overrideOwnership = false } = {}) {
     const entry = this.pending.get(localRequestId);
     if (!entry || entry.resolved) {
       return null;
     }
 
+    const initiatorUserId = entry.record.initiatorUserId ?? null;
+    if (
+      initiatorUserId != null
+      && actor != null
+      && actor !== initiatorUserId
+      && overrideOwnership !== true
+    ) {
+      return { notOwner: true };
+    }
+
+    return this.#finalize(entry, { decision, payload, actor });
+  }
+
+  #finalize(entry, { decision, payload = "", actor = "user", timeout = false }) {
     entry.resolved = true;
     clearTimeout(entry.timer);
-    this.pending.delete(localRequestId);
+    this.pending.delete(entry.record.localRequestId);
 
-    const response = decisionForMethod(entry.record.method, decision, payload);
+    const normalized = normalizeDecision(decision);
+    const response = decisionForMethod(entry.record.method, normalized, payload);
     const resolution = {
-      localRequestId,
-      decision,
+      localRequestId: entry.record.localRequestId,
+      decision: normalized,
       actor,
       payload,
       response,
       record: entry.record,
+      initiatorUserId: entry.record.initiatorUserId ?? null,
     };
+    if (timeout) {
+      resolution.timeout = true;
+    }
 
     this.emit("resolved", resolution);
     return resolution;

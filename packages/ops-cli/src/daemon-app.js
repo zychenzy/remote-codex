@@ -49,6 +49,10 @@ function inboundDedupeKey(context = {}) {
 
 const CONTROL_COMMAND_DEDUPE_TTL_MS = 5_000;
 
+// Synchronous in-flight marker stored in activeTurnByBinding before a turn id
+// exists, so two concurrent callers cannot both start a turn for one binding.
+const TURN_GUARD_PENDING = "__pending__";
+
 function threadIdFromResponse(response) {
   return response?.thread?.id || response?.threadId || response?.thread_id || null;
 }
@@ -190,9 +194,37 @@ function makeLaunchSpec(config) {
   return null;
 }
 
-function resolveWorkspacePath(inputPath, currentWorkingDir) {
+function realpathOrResolve(targetPath) {
+  const resolved = path.resolve(String(targetPath || "").trim());
+  try {
+    return fs.realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+function isWithinRoot(target, root) {
+  const resolvedRoot = realpathOrResolve(root);
+  const resolvedTarget = realpathOrResolve(target);
+  if (!resolvedRoot || !resolvedTarget) {
+    return false;
+  }
+  // Avoid a doubled separator when the root is a filesystem root like "/".
+  const rootPrefix = resolvedRoot.endsWith(path.sep) ? resolvedRoot : `${resolvedRoot}${path.sep}`;
+  return resolvedTarget === resolvedRoot || resolvedTarget.startsWith(rootPrefix);
+}
+
+function resolveWorkspacePath(inputPath, currentWorkingDir, workspaceRoot) {
   const trimmed = String(inputPath || "").trim();
+  const root = String(workspaceRoot || "").trim();
   if (!trimmed) {
+    if (root && !isWithinRoot(currentWorkingDir, root)) {
+      return {
+        error: `Outside workspace root: ${currentWorkingDir} (root: ${root})`,
+        input: "",
+        resolved: currentWorkingDir,
+      };
+    }
     return { value: currentWorkingDir, input: "", resolved: currentWorkingDir };
   }
 
@@ -205,6 +237,14 @@ function resolveWorkspacePath(inputPath, currentWorkingDir) {
     candidate = path.join(os.homedir(), candidate.slice(1).replace(/^[/\\]+/, ""));
   } else if (!path.isAbsolute(candidate)) {
     candidate = path.resolve(currentWorkingDir, candidate);
+  }
+
+  if (root && !isWithinRoot(candidate, root)) {
+    return {
+      error: `Outside workspace root: ${trimmed} (resolved: ${candidate}, root: ${root})`,
+      input: trimmed,
+      resolved: candidate,
+    };
   }
 
   try {
@@ -740,22 +780,13 @@ function decodeCommandValue(value = "") {
   }
 }
 
-function isPathInsideRoot(candidatePath, rootPath) {
-  const candidate = path.resolve(String(candidatePath || "").trim());
-  const root = path.resolve(String(rootPath || "").trim());
-  if (!candidate || !root) {
-    return false;
-  }
-  return candidate === root || candidate.startsWith(`${root}${path.sep}`);
-}
-
 function validateDirectoryWithinRoot(rootDir, targetDir) {
   const root = path.resolve(String(rootDir || "").trim());
   const candidate = path.resolve(String(targetDir || "").trim());
   if (!root || !candidate) {
     return { error: "Workspace directory is not set." };
   }
-  if (!isPathInsideRoot(candidate, root)) {
+  if (!isWithinRoot(candidate, root)) {
     return { error: `Directory is outside workspace root: ${candidate}` };
   }
   try {
@@ -939,7 +970,7 @@ function buildFilePreview(filePath, rootDir) {
   if (!resolvedFile || !resolvedRoot) {
     return { error: "Preview target is missing." };
   }
-  if (!isPathInsideRoot(resolvedFile, resolvedRoot)) {
+  if (!isWithinRoot(resolvedFile, resolvedRoot)) {
     return { error: `Preview target is outside workspace root: ${resolvedFile}` };
   }
 
@@ -1313,10 +1344,35 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// ponytail: bounded map/set, fixed-cap eviction. Insertion order = age, so the
+// oldest entries (front of the iterator) are dropped first until size <= maxSize.
+// Works for both Map (pass key+value) and Set (pass key only). The cap is the
+// only deletion trigger; do not also evict on unrelated predicates.
+function boundedCollectionAdd(collection, key, maxSize, value) {
+  collection.delete(key);
+  if (typeof collection.set === "function") {
+    collection.set(key, value);
+  } else {
+    collection.add(key);
+  }
+  while (collection.size > maxSize) {
+    const oldest = collection.keys().next().value;
+    if (oldest === undefined) {
+      break;
+    }
+    collection.delete(oldest);
+  }
+  return value;
+}
+
 export class DaemonApp {
+  // Serializes runtime "notification" handling so handlers never run concurrently.
+  #notifyChain = Promise.resolve();
+
   constructor({ baseDir } = {}) {
     this.store = new StateStore({ baseDir });
     this.config = this.store.readConfig();
+    this.#notifyChain = Promise.resolve();
 
     this.logger = createLogger({
       filePath: path.join(this.store.logsDir, "daemon.log"),
@@ -1347,6 +1403,7 @@ export class DaemonApp {
     this.chatHistoryBuffer = [];
     this.chatHistoryFlushTimer = null;
     this.chatHistoryFlushChain = Promise.resolve();
+    this.chatHistorySecured = false;
 
     this.runtime = new AppServerRuntime({
       launchSpec: makeLaunchSpec(this.config),
@@ -1412,9 +1469,9 @@ export class DaemonApp {
 
   #wireRuntimeEvents() {
     this.runtime.on("notification", (notification) => {
-      this.#handleRuntimeNotification(notification).catch((error) => {
-        this.logger.error("failed to handle runtime notification", error);
-      });
+      this.#notifyChain = this.#notifyChain
+        .then(() => this.#handleRuntimeNotification(notification))
+        .catch((error) => this.logger.error("notification handler failed", error));
     });
 
     this.runtime.on("serverRequest", (request) => {
@@ -1464,46 +1521,52 @@ export class DaemonApp {
   }
 
   #wireApprovalBroker() {
-    this.approvalBroker.on("resolved", async (resolution) => {
-      const { record } = resolution;
-      this.store.resolvePendingApproval(resolution.localRequestId, {
-        decision: resolution.decision,
-        actor: resolution.actor || "system",
+    this.approvalBroker.on("resolved", (resolution) => {
+      void this.#onApprovalResolved(resolution).catch((error) => {
+        this.logger.warn(`approval resolution handler failed: ${error.message}`);
       });
-
-      this.store.appendAudit({
-        type: "approval_resolved",
-        localRequestId: resolution.localRequestId,
-        decision: resolution.decision,
-        method: record.method,
-      });
-
-      await this.runtime.respondServerRequest(record.serverRequestId, resolution.response);
-
-      const turnId = detectTurnId(record.params);
-      const context = this.#runtimeContext(
-        record.binding.channel,
-        record.binding.chatId,
-        null,
-        turnId
-      );
-      const adapter = this.#getAdapter(record.binding.channel);
-      if (adapter) {
-        let text = resolution.timeout
-          ? `Approval timed out (${resolution.localRequestId}); defaulted to deny.`
-          : `Approval ${resolution.decision === "allow" ? "granted" : "denied"} (${resolution.localRequestId}).`;
-        if (!resolution.timeout && resolution.actor === "autopilot") {
-          if (record.method === "item/tool/requestUserInput" && resolution.decision === "allow") {
-            text = `Autopilot answered tool input (${resolution.localRequestId}).`;
-          } else {
-            text = `Autopilot ${resolution.decision === "allow" ? "approved" : "denied"} ${record.method} (${resolution.localRequestId}).`;
-          }
-        }
-        await this.#sendMessage(adapter, context, text);
-      }
-
-      this.store.deletePendingApproval(resolution.localRequestId);
     });
+  }
+
+  async #onApprovalResolved(resolution) {
+    const { record } = resolution;
+    this.store.resolvePendingApproval(resolution.localRequestId, {
+      decision: resolution.decision,
+      actor: resolution.actor || "system",
+    });
+
+    this.store.appendAudit({
+      type: "approval_resolved",
+      localRequestId: resolution.localRequestId,
+      decision: resolution.decision,
+      method: record.method,
+    });
+
+    await this.runtime.respondServerRequest(record.serverRequestId, resolution.response);
+
+    const turnId = detectTurnId(record.params);
+    const context = this.#runtimeContext(
+      record.binding.channel,
+      record.binding.chatId,
+      null,
+      turnId
+    );
+    const adapter = this.#getAdapter(record.binding.channel);
+    if (adapter) {
+      let text = resolution.timeout
+        ? `Approval timed out (${resolution.localRequestId}); defaulted to deny.`
+        : `Approval ${resolution.decision === "allow" ? "granted" : "denied"} (${resolution.localRequestId}).`;
+      if (!resolution.timeout && resolution.actor === "autopilot") {
+        if (record.method === "item/tool/requestUserInput" && resolution.decision === "allow") {
+          text = `Autopilot answered tool input (${resolution.localRequestId}).`;
+        } else {
+          text = `Autopilot ${resolution.decision === "allow" ? "approved" : "denied"} ${record.method} (${resolution.localRequestId}).`;
+        }
+      }
+      await this.#sendMessage(adapter, context, text);
+    }
+
+    this.store.deletePendingApproval(resolution.localRequestId);
   }
 
   #ensureAutopilotSupervisor() {
@@ -1581,8 +1644,6 @@ export class DaemonApp {
         token: channels.discord.botToken,
         allowedChannels: channels.discord.allowedChannels || [],
         dmUserIds: channels.discord.allowlist || [],
-        loadCursor: (chatId) => this.store.getChannelCursor("discord", chatId),
-        saveCursor: (chatId, cursor) => this.store.setChannelCursor("discord", chatId, cursor),
         authorizeInteraction: (context) => this.#isAuthorizedInteractiveContext(context),
         logger: this.logger,
       });
@@ -1625,10 +1686,30 @@ export class DaemonApp {
     return this.config.channels?.[channel]?.allowlist || [];
   }
 
+  // The enforced root for all path navigation on a binding. Defaults to the
+  // configured workspace root, else the bound project dir (workingDir).
+  #workspaceRootFor(binding) {
+    return String(
+      binding?.workspaceRoot
+      || this.config.defaults?.workspaceRoot
+      || binding?.workingDir
+      || ""
+    ).trim();
+  }
+
+  // Defaults binding.workspaceRoot in-memory when a binding is created/hydrated
+  // without one, so every later path check sees a stable jail root.
+  #ensureWorkspaceRoot(binding) {
+    if (binding && !binding.workspaceRoot) {
+      binding.workspaceRoot = this.#workspaceRootFor(binding);
+    }
+    return binding;
+  }
+
   #ensureBinding(context) {
     const existing = this.store.getBinding(context.channel, context.chatId);
     if (existing) {
-      return existing;
+      return this.#ensureWorkspaceRoot(existing);
     }
 
     const created = this.store.upsertBinding({
@@ -1637,6 +1718,7 @@ export class DaemonApp {
       userId: context.userId,
       threadId: null,
       workingDir: this.config.defaults?.workingDir || process.cwd(),
+      workspaceRoot: this.config.defaults?.workspaceRoot || this.config.defaults?.workingDir || process.cwd(),
       policyProfile: {
         approvalMode: this.config.defaults?.approvalMode || "on-request",
         allowlist: this.#channelAllowlist(context.channel),
@@ -1653,7 +1735,7 @@ export class DaemonApp {
       chatId: context.chatId,
     });
 
-    return created;
+    return this.#ensureWorkspaceRoot(created);
   }
 
   #contextFromBinding(binding) {
@@ -1946,6 +2028,26 @@ export class DaemonApp {
     }, this.outputPolicy.chatHistoryFlushIntervalMs);
   }
 
+  // Belt-and-suspenders: chat history may contain prompts/answers, so keep the
+  // file private (0o600) and the logs dir owner-only (0o700). Runs once per path.
+  #secureChatHistoryFile(filePath) {
+    if (this.chatHistorySecured || !filePath) {
+      return;
+    }
+    this.chatHistorySecured = true;
+    try {
+      fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
+      fs.chmodSync(path.dirname(filePath), 0o700);
+    } catch {
+      // ignore platform-specific mkdir/chmod failures
+    }
+    try {
+      fs.chmodSync(filePath, 0o600);
+    } catch {
+      // file may not exist yet; the appendFile mode will create it 0o600
+    }
+  }
+
   async #flushChatHistory({ force = false } = {}) {
     if (this.chatHistoryFlushTimer && force) {
       clearTimeout(this.chatHistoryFlushTimer);
@@ -1963,7 +2065,8 @@ export class DaemonApp {
     const filePath = String(this.chatHistoryPath || "");
     const writeTask = this.chatHistoryFlushChain
       .catch(() => {})
-      .then(() => fsp.appendFile(filePath, payload, { encoding: "utf8" }));
+      .then(() => fsp.appendFile(filePath, payload, { encoding: "utf8", mode: 0o600 }))
+      .then(() => this.#secureChatHistoryFile(filePath));
     this.chatHistoryFlushChain = writeTask.catch(() => {});
 
     try {
@@ -1971,7 +2074,8 @@ export class DaemonApp {
     } catch (error) {
       if (force) {
         try {
-          fs.appendFileSync(filePath, payload, { encoding: "utf8" });
+          fs.appendFileSync(filePath, payload, { encoding: "utf8", mode: 0o600 });
+          this.#secureChatHistoryFile(filePath);
           return;
         } catch (syncError) {
           this.logger?.warn?.(`failed to force-flush chat history: ${syncError.message}`);
@@ -2789,6 +2893,14 @@ export class DaemonApp {
     return { fullText, pendingText };
   }
 
+  // Clears the in-flight guard only when it is still the pending sentinel, so a
+  // real turn id assigned by a concurrent notification is never clobbered.
+  #releaseTurnGuard(bindingKeyValue) {
+    if (this.activeTurnByBinding.get(bindingKeyValue) === TURN_GUARD_PENDING) {
+      this.activeTurnByBinding.delete(bindingKeyValue);
+    }
+  }
+
   #turnOutputClearByBinding(bindingKeyValue) {
     if (!bindingKeyValue) {
       return;
@@ -2837,14 +2949,7 @@ export class DaemonApp {
     if (existingExpiresAt > now) {
       return false;
     }
-    this.recentControlCommandByKey.set(dedupeKey, now + ttlMs);
-    if (this.recentControlCommandByKey.size > 200) {
-      for (const [entryKey, expiresAt] of this.recentControlCommandByKey) {
-        if (expiresAt <= now || this.recentControlCommandByKey.size > 200) {
-          this.recentControlCommandByKey.delete(entryKey);
-        }
-      }
-    }
+    boundedCollectionAdd(this.recentControlCommandByKey, dedupeKey, 200, now + ttlMs);
     return true;
   }
 
@@ -2935,13 +3040,12 @@ export class DaemonApp {
       return;
     }
     const existing = String(this.fileChangeOutputByItemId.get(itemId) || "");
-    this.fileChangeOutputByItemId.set(itemId, trimToLimit(`${existing}${String(delta)}`));
-    if (this.fileChangeOutputByItemId.size > 2000) {
-      const oldest = this.fileChangeOutputByItemId.keys().next().value;
-      if (oldest) {
-        this.fileChangeOutputByItemId.delete(oldest);
-      }
-    }
+    boundedCollectionAdd(
+      this.fileChangeOutputByItemId,
+      itemId,
+      2000,
+      trimToLimit(`${existing}${String(delta)}`)
+    );
   }
 
   async #handleCommandExecutionOutputDelta(params) {
@@ -3054,13 +3158,7 @@ export class DaemonApp {
     if (!diff) {
       return;
     }
-    this.latestTurnDiffByKey.set(key, trimToLimit(diff));
-    if (this.latestTurnDiffByKey.size > 2000) {
-      const oldest = this.latestTurnDiffByKey.keys().next().value;
-      if (oldest) {
-        this.latestTurnDiffByKey.delete(oldest);
-      }
-    }
+    boundedCollectionAdd(this.latestTurnDiffByKey, key, 2000, trimToLimit(diff));
   }
 
   #handleThreadClosed(params) {
@@ -3193,13 +3291,7 @@ export class DaemonApp {
       diffText = perItemDiff;
     } else if (turnDiffText && !this.deliveredTurnDiffByKey.has(cacheKey) && isUnifiedDiffText(turnDiffText)) {
       diffText = formatDiffBlock("Turn diff (aggregated)", turnDiffText);
-      this.deliveredTurnDiffByKey.add(cacheKey);
-      if (this.deliveredTurnDiffByKey.size > 2000) {
-        const oldest = this.deliveredTurnDiffByKey.values().next().value;
-        if (oldest) {
-          this.deliveredTurnDiffByKey.delete(oldest);
-        }
-      }
+      boundedCollectionAdd(this.deliveredTurnDiffByKey, cacheKey, 2000);
     } else if (perItemDiff) {
       diffText = perItemDiff;
     } else if (toolOutputText && isUnifiedDiffText(toolOutputText)) {
@@ -3210,13 +3302,7 @@ export class DaemonApp {
     }
 
     if (itemId) {
-      this.deliveredFileChangeItemIds.add(itemId);
-      if (this.deliveredFileChangeItemIds.size > 2000) {
-        const oldest = this.deliveredFileChangeItemIds.values().next().value;
-        if (oldest) {
-          this.deliveredFileChangeItemIds.delete(oldest);
-        }
-      }
+      boundedCollectionAdd(this.deliveredFileChangeItemIds, itemId, 2000);
     }
 
     const deliveryKey = itemId
@@ -3637,8 +3723,26 @@ export class DaemonApp {
         await this.#sendMessage(adapter, context, "Usage: /ask <prompt>");
         return true;
       }
-      const started = await this.#startTurnWithRecovery(adapter, context, binding, bKey, prompt, overrides);
+      // In-flight turn guard: a binding may only have one active turn. Set the
+      // guard synchronously before the await so two callers cannot both pass.
+      if (this.activeTurnByBinding.get(bKey)) {
+        await this.#sendMessage(
+          adapter,
+          context,
+          "A turn is already running for this chat. Use /turn steer to add input, or /interrupt to stop it."
+        );
+        return true;
+      }
+      this.activeTurnByBinding.set(bKey, TURN_GUARD_PENDING);
+      let started;
+      try {
+        started = await this.#startTurnWithRecovery(adapter, context, binding, bKey, prompt, overrides);
+      } catch (error) {
+        this.#releaseTurnGuard(bKey);
+        throw error;
+      }
       if (!started) {
+        this.#releaseTurnGuard(bKey);
         return true;
       }
       const { threadId, turnResponse } = started;
@@ -3663,6 +3767,8 @@ export class DaemonApp {
             );
           }
         }
+      } else {
+        this.#releaseTurnGuard(bKey);
       }
       if (adapter.channel !== "discord") {
         await this.#sendMessage(adapter, context, `Turn started: ${turnId || "unknown"}`);
@@ -3709,7 +3815,7 @@ export class DaemonApp {
       if (action === "ask") {
         let turnCwd = binding.workingDir;
         if (options.cwd) {
-          const resolved = resolveWorkspacePath(options.cwd, binding.workingDir);
+          const resolved = resolveWorkspacePath(options.cwd, binding.workingDir, this.#workspaceRootFor(binding));
           if (resolved.error) {
             await this.#sendMessage(adapter, context, resolved.error);
             return;
@@ -3779,11 +3885,29 @@ export class DaemonApp {
           target = { type: "custom", instructions };
         }
 
-        const review = await this.runtime.startReview({
-          threadId: binding.threadId,
-          delivery,
-          target,
-        });
+        // In-flight turn guard: reject if a turn is already running, and claim the
+        // guard synchronously before awaiting so concurrent callers cannot both pass.
+        if (this.activeTurnByBinding.get(bKey)) {
+          await this.#sendMessage(
+            adapter,
+            context,
+            "A turn is already running for this chat. Use /turn steer to add input, or /interrupt to stop it."
+          );
+          return;
+        }
+        this.activeTurnByBinding.set(bKey, TURN_GUARD_PENDING);
+
+        let review;
+        try {
+          review = await this.runtime.startReview({
+            threadId: binding.threadId,
+            delivery,
+            target,
+          });
+        } catch (error) {
+          this.#releaseTurnGuard(bKey);
+          throw error;
+        }
         const reviewTurnId = turnIdFromResponse(review);
         const reviewThreadId = review?.reviewThreadId || binding.threadId;
         if (delivery === "detached" && reviewThreadId && reviewThreadId !== binding.threadId) {
@@ -3812,6 +3936,8 @@ export class DaemonApp {
               );
             }
           }
+        } else {
+          this.#releaseTurnGuard(bKey);
         }
         await this.#sendMessage(
           adapter,
@@ -3829,7 +3955,9 @@ export class DaemonApp {
       const { positional, options } = parseArgsAndOptions(command.args);
 
       if (action === "start") {
-        const cwdResolved = options.cwd ? resolveWorkspacePath(options.cwd, binding.workingDir) : { value: binding.workingDir };
+        const cwdResolved = options.cwd
+          ? resolveWorkspacePath(options.cwd, binding.workingDir, this.#workspaceRootFor(binding))
+          : { value: binding.workingDir };
         if (cwdResolved.error) {
           await this.#sendMessage(adapter, context, cwdResolved.error);
           return;
@@ -4470,11 +4598,14 @@ export class DaemonApp {
 
       if (!resolution) {
         await this.#sendMessage(adapter, context, `Unknown or expired approval request: ${command.requestId}`);
+      } else if (resolution.notOwner === true) {
+        await this.#sendMessage(adapter, context, "That approval was requested by another user.");
       }
       return;
     }
 
     if (command.type === "cwd") {
+      const workspaceRoot = this.#workspaceRootFor(binding);
       const pathInput = String(command.path || "").trim();
       const browseTargetInput = parseCwdBrowseTarget(pathInput);
       const newTargetInput = parseCwdNewTarget(pathInput);
@@ -4483,7 +4614,7 @@ export class DaemonApp {
           await this.#sendMessage(adapter, context, `Usage: /${command.command || "cwd"} new <path>`);
           return;
         }
-        const resolved = resolveWorkspacePath(newTargetInput, binding.workingDir);
+        const resolved = resolveWorkspacePath(newTargetInput, binding.workingDir, workspaceRoot);
         if (resolved.error && !resolved.error.startsWith("Directory does not exist:")) {
           await this.#sendMessage(adapter, context, resolved.error);
           return;
@@ -4513,7 +4644,7 @@ export class DaemonApp {
       }
       if (!pathInput || browseTargetInput != null) {
         const browseTarget = browseTargetInput != null
-          ? resolveWorkspacePath(browseTargetInput, binding.workingDir)
+          ? resolveWorkspacePath(browseTargetInput, binding.workingDir, workspaceRoot)
           : { value: binding.workingDir };
         if (browseTarget.error) {
           await this.#sendMessage(adapter, context, browseTarget.error);
@@ -4539,7 +4670,7 @@ export class DaemonApp {
         return;
       }
 
-      const resolved = resolveWorkspacePath(pathInput, binding.workingDir);
+      const resolved = resolveWorkspacePath(pathInput, binding.workingDir, workspaceRoot);
       if (resolved.error) {
         await this.#sendMessage(adapter, context, resolved.error);
         return;
@@ -4559,11 +4690,17 @@ export class DaemonApp {
 
     if (command.type === "files") {
       const { options } = parseArgsAndOptions(command.args);
-      const rootDir = decodeCommandValue(options.root64) || binding.workingDir;
-      const currentDir = decodeCommandValue(options.dir64) || binding.workingDir;
+      // Pin the root to the binding's workspace root; ignore caller-supplied
+      // root64 so navigation targets cannot escape the jail.
+      const rootDir = this.#workspaceRootFor(binding);
+      const currentDir = decodeCommandValue(options.dir64) || rootDir;
       const previewPath = decodeCommandValue(options.preview64);
 
       if (previewPath) {
+        if (!isWithinRoot(previewPath, rootDir)) {
+          await this.#sendMessage(adapter, context, `Preview target is outside workspace root: ${previewPath}`);
+          return;
+        }
         const preview = buildFilePreview(previewPath, rootDir);
         if (preview.error) {
           await this.#sendMessage(adapter, context, preview.error);
@@ -4576,6 +4713,10 @@ export class DaemonApp {
         return;
       }
 
+      if (!isWithinRoot(currentDir, rootDir)) {
+        await this.#sendMessage(adapter, context, `Directory is outside workspace root: ${currentDir}`);
+        return;
+      }
       const listed = listWorkspaceEntries(rootDir, currentDir);
       if (listed.error) {
         await this.#sendMessage(adapter, context, listed.error);
@@ -4606,12 +4747,18 @@ export class DaemonApp {
 
     if (command.type === "search") {
       const { options } = parseArgsAndOptions(command.args);
-      const rootDir = decodeCommandValue(options.root64) || binding.workingDir;
+      // Pin the root to the binding's workspace root; ignore caller-supplied
+      // root64 so search and preview cannot escape the jail.
+      const rootDir = this.#workspaceRootFor(binding);
       const previewPath = decodeCommandValue(options.preview64);
       const queryFromOption = decodeCommandValue(options.query64);
       const query = queryFromOption || String(command.pattern || "").trim();
 
       if (previewPath) {
+        if (!isWithinRoot(previewPath, rootDir)) {
+          await this.#sendMessage(adapter, context, `Preview target is outside workspace root: ${previewPath}`);
+          return;
+        }
         const preview = buildFilePreview(previewPath, rootDir);
         if (preview.error) {
           await this.#sendMessage(adapter, context, preview.error);
@@ -4802,6 +4949,9 @@ export class DaemonApp {
       serverRequest,
       binding,
       autoApprove: Boolean(binding.policyProfile?.autoApprove) || threadScopedAutoApprove,
+      // Owner of this request: the user bound to this chat. The broker rejects
+      // resolutions from a different user unless overrideOwnership is set.
+      initiatorUserId: binding.userId || null,
     });
 
     if (created.autoResolved) {

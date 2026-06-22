@@ -1,6 +1,7 @@
 export class EventBus {
-  constructor() {
+  constructor({ logger = null } = {}) {
     this.listeners = new Map();
+    this.logger = logger;
   }
 
   on(event, handler) {
@@ -18,7 +19,14 @@ export class EventBus {
   emit(event, payload) {
     const list = this.listeners.get(event) || [];
     for (const handler of list) {
-      handler(payload);
+      // Per-listener isolation: a throwing handler must not abort the loop or
+      // propagate into the emitter (e.g. the stdout data callback).
+      try {
+        handler(payload);
+      } catch (error) {
+        const log = this.logger && typeof this.logger.error === "function" ? this.logger : console;
+        log.error(`EventBus listener for "${event}" threw:`, error);
+      }
     }
   }
 }

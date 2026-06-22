@@ -24,6 +24,22 @@ class FailingAdapter extends BaseAdapter {
   }
 }
 
+class FlakyAdapter extends BaseAdapter {
+  constructor(logger) {
+    super({ channel: "flaky", logger });
+    this.messages = [];
+    this.failNext = true;
+  }
+
+  async sendMessage(context, text) {
+    if (this.failNext) {
+      this.failNext = false;
+      throw new Error("transient send failure");
+    }
+    this.messages.push({ context, text });
+  }
+}
+
 test("sendApprovalPrompt emits formatted approval instructions", async () => {
   const adapter = new StubAdapter();
   await adapter.sendApprovalPrompt(
@@ -80,4 +96,23 @@ test("base adapter catches async flush errors from sendMessage", async () => {
   await new Promise((resolve) => setTimeout(resolve, 950));
   assert.equal(logs.length >= 1, true);
   assert.equal(logs.some((line) => line.includes("failed to flush streaming delta")), true);
+});
+
+test("base adapter re-buffers a failed flush so the next flush delivers it", async () => {
+  const logs = [];
+  const logger = { error: (line) => logs.push(String(line || "")) };
+  const adapter = new FlakyAdapter(logger);
+  const context = { channel: "flaky", chatId: "1", turnId: "t3" };
+
+  await adapter.sendStreamingDelta(context, "chunk-one ");
+  await new Promise((resolve) => setTimeout(resolve, 950));
+  // First flush failed: nothing delivered, content retained for retry.
+  assert.equal(adapter.messages.length, 0);
+  assert.equal(logs.some((line) => line.includes("failed to flush streaming delta")), true);
+
+  await adapter.sendStreamingDelta(context, "chunk-two");
+  await new Promise((resolve) => setTimeout(resolve, 950));
+  // Second flush succeeds and delivers the re-buffered chunk ahead of the new one.
+  assert.equal(adapter.messages.length, 1);
+  assert.equal(adapter.messages[0].text, "chunk-one chunk-two");
 });

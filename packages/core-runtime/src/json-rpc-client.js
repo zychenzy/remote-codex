@@ -3,13 +3,12 @@ import { EventBus } from "./events.js";
 const DEFAULT_TIMEOUT_MS = 30_000;
 
 export class JsonRpcClient {
-  constructor({ send, timeoutMs = DEFAULT_TIMEOUT_MS, now = Date.now } = {}) {
+  constructor({ send, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
     if (typeof send !== "function") {
       throw new Error("JsonRpcClient requires a send function");
     }
     this.send = send;
     this.timeoutMs = timeoutMs;
-    this.now = now;
     this.nextId = 1;
     this.pending = new Map();
     this.events = new EventBus();
@@ -20,7 +19,10 @@ export class JsonRpcClient {
   }
 
   request(method, params) {
-    const id = this.nextId++;
+    // Namespace client-assigned ids so a server-assigned request id (a bare
+    // integer or arbitrary string) can never collide with a pending client
+    // request key in this.pending.
+    const id = `c-${this.nextId++}`;
     const request = {
       jsonrpc: "2.0",
       id,
@@ -34,7 +36,7 @@ export class JsonRpcClient {
         reject(new Error(`JSON-RPC request timed out: ${method}`));
       }, this.timeoutMs);
 
-      this.pending.set(id, { resolve, reject, timeout, method, startedAt: this.now() });
+      this.pending.set(id, { resolve, reject, timeout, method });
       this.send(JSON.stringify(request));
     });
   }

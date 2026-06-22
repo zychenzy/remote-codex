@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import readline from "node:readline/promises";
 
 import { StateStore } from "../../state-store/src/index.js";
@@ -294,12 +295,15 @@ async function cmdStart() {
     return;
   }
 
-  const child = spawn(process.execPath, [path.resolve("./packages/ops-cli/src/cli.js"), "daemon-run"], {
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), "daemon-run"], {
     detached: true,
     stdio: "ignore",
     env: { ...process.env, IM_CODEX_HOME: BASE_DIR },
   });
 
+  child.on("error", (error) => {
+    console.error("failed to start daemon: " + error.message);
+  });
   child.unref();
   console.log("Daemon start requested");
 }
@@ -318,6 +322,7 @@ async function cmdDaemonRun() {
   const app = new DaemonApp({ baseDir: BASE_DIR });
   const keepAlive = setInterval(() => {}, 45_000);
   let released = false;
+  let teardownStarted = false;
 
   const releaseLock = () => {
     if (released) {
@@ -328,63 +333,70 @@ async function cmdDaemonRun() {
     globalDaemonLock.release();
   };
 
-  fs.writeFileSync(GLOBAL_PID_FILE, String(process.pid));
-  fs.writeFileSync(PID_FILE, String(process.pid));
-  writeStatus({ running: true, pid: process.pid, startedAt: new Date().toISOString() });
-
-  const shutdown = async (reason) => {
-    writeStatus({ running: false, pid: process.pid, stoppedAt: new Date().toISOString(), reason });
+  const removePidFiles = () => {
     try {
       fs.rmSync(PID_FILE, { force: true });
       fs.rmSync(GLOBAL_PID_FILE, { force: true });
     } catch {
       // ignore
     }
+  };
+
+  // Single guarded teardown for fatal errors. Always runs at most once, always
+  // removes both PID files and releases the lock, then exits with `code`.
+  const crash = async (reason, code) => {
+    if (teardownStarted) {
+      return;
+    }
+    teardownStarted = true;
+    writeStatus({ running: false, pid: process.pid, crashedAt: new Date().toISOString(), reason });
+    try {
+      await app.stop();
+    } catch {
+      // ignore: best-effort stop during crash teardown
+    }
+    clearInterval(keepAlive);
+    removePidFiles();
+    releaseLock();
+    process.exit(code);
+  };
+
+  const shutdown = async (reason) => {
+    if (teardownStarted) {
+      return;
+    }
+    teardownStarted = true;
+    writeStatus({ running: false, pid: process.pid, stoppedAt: new Date().toISOString(), reason });
+    removePidFiles();
     try {
       await app.stop();
     } finally {
-      releaseLock();
       clearInterval(keepAlive);
+      releaseLock();
       process.exit(0);
     }
   };
 
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("uncaughtException", (error) => crash(`uncaughtException: ${error.message}`, 1));
+  process.on("unhandledRejection", (error) => crash(`unhandledRejection: ${String(error)}`, 1));
 
-  process.on("uncaughtException", async (error) => {
-    writeStatus({ running: false, pid: process.pid, crashedAt: new Date().toISOString(), reason: `uncaughtException: ${error.message}` });
-    await app.stop();
-    releaseLock();
-    process.exit(1);
-  });
-
-  process.on("unhandledRejection", async (error) => {
-    writeStatus({ running: false, pid: process.pid, crashedAt: new Date().toISOString(), reason: `unhandledRejection: ${String(error)}` });
-    await app.stop();
-    releaseLock();
-    clearInterval(keepAlive);
-    fs.rmSync(PID_FILE, { force: true });
-    fs.rmSync(GLOBAL_PID_FILE, { force: true });
-    process.exit(1);
-  });
+  // Only advertise "starting" until app.start() resolves; PID files and the
+  // running:true status are published after startup actually succeeds so that
+  // `status`/`start` never observe a half-started daemon as running.
+  writeStatus({ starting: true, pid: process.pid, startedAt: new Date().toISOString() });
 
   try {
     await app.start();
   } catch (error) {
-    writeStatus({
-      running: false,
-      pid: process.pid,
-      crashedAt: new Date().toISOString(),
-      reason: `startup_failed: ${error.message}`,
-    });
-    fs.rmSync(PID_FILE, { force: true });
-    fs.rmSync(GLOBAL_PID_FILE, { force: true });
-    await app.stop();
-    releaseLock();
-    clearInterval(keepAlive);
-    process.exit(1);
+    await crash(`startup_failed: ${error.message}`, 1);
+    return;
   }
+
+  fs.writeFileSync(GLOBAL_PID_FILE, String(process.pid));
+  fs.writeFileSync(PID_FILE, String(process.pid));
+  writeStatus({ running: true, pid: process.pid, startedAt: new Date().toISOString() });
 }
 
 async function cmdStop() {
@@ -396,8 +408,22 @@ async function cmdStop() {
     return;
   }
 
-  process.kill(pid, "SIGTERM");
-  console.log(`Sent SIGTERM to daemon pid ${pid}`);
+  try {
+    process.kill(pid, "SIGTERM");
+    console.log(`Sent SIGTERM to daemon pid ${pid}`);
+  } catch (error) {
+    if (error?.code === "ESRCH") {
+      fs.rmSync(PID_FILE, { force: true });
+      fs.rmSync(GLOBAL_PID_FILE, { force: true });
+      console.log("Daemon is not running");
+      return;
+    }
+    if (error?.code === "EPERM") {
+      console.log(`Cannot signal daemon pid ${pid}: permission denied`);
+      return;
+    }
+    throw error;
+  }
 }
 
 async function cmdRestart() {
@@ -521,11 +547,10 @@ async function discordApi(token, path) {
   });
 
   const text = await response.text();
-  const payload = text ? JSON.parse(text) : null;
   if (!response.ok) {
     throw new Error(`discord ${path} failed: ${response.status} ${text}`);
   }
-  return payload;
+  return text ? JSON.parse(text) : null;
 }
 
 async function cmdDiscord(args) {
@@ -540,22 +565,32 @@ async function cmdDiscord(args) {
   if (sub === "channels") {
     const guilds = await discordApi(token, "/users/@me/guilds?limit=200");
     const rows = [];
+    const errors = [];
     for (const guild of guilds) {
-      const channels = await discordApi(token, `/guilds/${guild.id}/channels`);
-      for (const ch of channels) {
-        if (![0, 5].includes(ch.type)) {
-          continue;
+      // Isolate per-guild failures so a single 403/429 does not abort the listing.
+      try {
+        const channels = await discordApi(token, `/guilds/${guild.id}/channels`);
+        for (const ch of channels) {
+          if (![0, 5].includes(ch.type)) {
+            continue;
+          }
+          rows.push({
+            guildId: String(guild.id),
+            guildName: guild.name,
+            channelId: String(ch.id),
+            channelName: ch.name || "(unnamed)",
+            type: ch.type === 0 ? "GUILD_TEXT" : "GUILD_ANNOUNCEMENT",
+          });
         }
-        rows.push({
+      } catch (error) {
+        errors.push({
           guildId: String(guild.id),
           guildName: guild.name,
-          channelId: String(ch.id),
-          channelName: ch.name || "(unnamed)",
-          type: ch.type === 0 ? "GUILD_TEXT" : "GUILD_ANNOUNCEMENT",
+          error: error.message,
         });
       }
     }
-    console.log(JSON.stringify({ channels: rows }, null, 2));
+    console.log(JSON.stringify(errors.length ? { channels: rows, errors } : { channels: rows }, null, 2));
     return;
   }
 

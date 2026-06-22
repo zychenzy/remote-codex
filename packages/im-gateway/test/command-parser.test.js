@@ -257,3 +257,42 @@ test("parser handles namespaced skills command", () => {
   assert.equal(result.type, "skills");
   assert.equal(result.action, "list");
 });
+
+test("parser strips control bytes from slice-based command payloads", () => {
+  const result = parseIncomingCommand("/cwd /tmp/a\x00\nb");
+  assert.equal(result.type, "cwd");
+  assert.equal(result.path, "/tmp/ab");
+});
+
+test("parser strips embedded NUL bytes from search pattern", () => {
+  const result = parseIncomingCommand("/search foo\x00bar");
+  assert.equal(result.type, "search");
+  assert.equal(result.pattern, "foobar");
+});
+
+test("parser caps total command length", () => {
+  const result = parseIncomingCommand(`/ask ${"x".repeat(20000)}`);
+  assert.equal(result.type, "ask");
+  assert.equal(result.prompt.length <= 8000, true);
+});
+
+test("parser rejects non-integer thread limits and falls back to default", () => {
+  assert.equal(parseIncomingCommand("/threads 1.5").limit, 10);
+  assert.equal(parseIncomingCommand("/threads 1e3").limit, 10);
+  assert.equal(parseIncomingCommand("/threads 0x10").limit, 10);
+});
+
+test("parser routes a non-UUID answer request id by arity", () => {
+  const result = parseIncomingCommand("/answer req-42 q1=on;q2=off");
+  assert.equal(result.type, "answer");
+  assert.equal(result.decision, "allow");
+  assert.equal(result.requestId, "req-42");
+  assert.equal(result.payload, "q1=on;q2=off");
+});
+
+test("parser keeps numeric-only answer shorthand as payload", () => {
+  const result = parseIncomingCommand("/answer 1 2 1");
+  assert.equal(result.type, "answer");
+  assert.equal(result.requestId, "");
+  assert.equal(result.payload, "1 2 1");
+});

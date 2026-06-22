@@ -153,3 +153,103 @@ test("runtime exposes extended thread, review, model, and skills wrappers", asyn
 
   await runtime.stop();
 });
+
+test("M-spawnerror: spawn failure makes initialize() reject fast, not hang", async () => {
+  const runtime = new AppServerRuntime({
+    launchSpec: {
+      command: "this-binary-does-not-exist-xyz",
+      args: [],
+      description: "missing binary",
+      options: {},
+    },
+    reconnect: false,
+    // A large request timeout: if teardown is missing, initialize() would hang
+    // this long. The assertion below bounds the failure well under it.
+    requestTimeoutMs: 60_000,
+  });
+
+  const start = Date.now();
+  await assert.rejects(() => runtime.initialize());
+  assert.ok(Date.now() - start < 5000, "initialize() should fail fast, not wait for requestTimeoutMs");
+
+  // child/rpc must be torn down so the runtime is reusable / not leaking.
+  assert.equal(runtime.child, null);
+  assert.equal(runtime.rpc, null);
+
+  await runtime.stop();
+});
+
+test("C5b: reconnect retries with backoff and emits terminal 'down'", async () => {
+  const runtime = new AppServerRuntime({
+    launchSpec: {
+      command: "this-binary-does-not-exist-xyz",
+      args: [],
+      description: "missing binary",
+      options: {},
+    },
+    reconnect: true,
+    reconnectDelayMs: 10,
+    reconnectMaxDelayMs: 40,
+    reconnectMaxAttempts: 2,
+    requestTimeoutMs: 60_000,
+  });
+
+  let downPayload = null;
+  const down = new Promise((resolve) => {
+    runtime.on("down", (payload) => {
+      downPayload = payload;
+      resolve();
+    });
+  });
+
+  // First initialize() fails fast; its spawn "error" kicks off the reconnect
+  // loop. Every reconnect attempt also fails (missing binary), so after
+  // reconnectMaxAttempts the loop emits the terminal "down" event.
+  await assert.rejects(() => runtime.initialize());
+
+  await down;
+  assert.equal(downPayload.attempts, 2);
+
+  await runtime.stop();
+});
+
+test("H4-core: stop() escalates a hung child to SIGKILL and resolves on exit", async () => {
+  // Inline child that completes the initialize handshake but ignores SIGTERM,
+  // so only SIGKILL can stop it. This proves stop() escalates and that the
+  // returned promise resolves on the child's actual exit.
+  const childSrc = [
+    "const rl = require('node:readline').createInterface({ input: process.stdin });",
+    "rl.on('line', (line) => {",
+    "  if (!line.trim()) return;",
+    "  let m; try { m = JSON.parse(line); } catch { return; }",
+    "  if (m.method === 'initialize') process.stdout.write(JSON.stringify({ id: m.id, result: {} }) + '\\n');",
+    "});",
+    "process.on('SIGTERM', () => {});",
+    "setInterval(() => {}, 1000);",
+  ].join("\n");
+
+  const runtime = new AppServerRuntime({
+    launchSpec: {
+      command: process.execPath,
+      args: ["-e", childSrc],
+      description: "sigterm-ignoring child",
+      options: {},
+    },
+    reconnect: false,
+    requestTimeoutMs: 60_000,
+    stopTimeoutMs: 200,
+  });
+
+  await runtime.initialize();
+  const child = runtime.child;
+  assert.ok(child, "child should be spawned");
+
+  const start = Date.now();
+  await runtime.stop();
+  const elapsed = Date.now() - start;
+
+  assert.equal(child.killed, true);
+  // Resolved only after escalation: at least the SIGTERM grace window elapsed.
+  assert.ok(elapsed >= 180, `stop() should await escalation, took ${elapsed}ms`);
+  assert.equal(runtime.child, null);
+});

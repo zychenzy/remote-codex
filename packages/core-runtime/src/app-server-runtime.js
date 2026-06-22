@@ -63,23 +63,30 @@ export class AppServerRuntime {
     env = process.env,
     reconnect = true,
     reconnectDelayMs = 1500,
+    reconnectMaxDelayMs = 30_000,
+    reconnectMaxAttempts = Infinity,
     requestTimeoutMs = 60_000,
+    stopTimeoutMs = 10_000,
     logger = console,
   } = {}) {
     this.launchSpec = launchSpec || defaultLaunchSpec();
     this.env = env;
     this.reconnect = reconnect;
     this.reconnectDelayMs = reconnectDelayMs;
+    this.reconnectMaxDelayMs = reconnectMaxDelayMs;
+    this.reconnectMaxAttempts = reconnectMaxAttempts;
     this.requestTimeoutMs = requestTimeoutMs;
+    this.stopTimeoutMs = stopTimeoutMs;
     this.logger = logger;
 
     this.child = null;
     this.buffer = "";
     this.rpc = null;
-    this.events = new EventBus();
+    this.events = new EventBus({ logger });
     this.initialized = false;
     this.manualStop = false;
     this.reconnectTimer = null;
+    this.reconnectAttempts = 0;
   }
 
   on(event, handler) {
@@ -329,6 +336,10 @@ export class AppServerRuntime {
     );
   }
 
+  // H4-core: graceful stop. Sends SIGTERM, awaits the child's "close" with a
+  // timeout, then escalates to SIGKILL so a hung child can never orphan. The
+  // returned promise resolves only once the child has actually exited. Mirrors
+  // the SIGTERM-then-verify-then-escalate idiom in ops-cli/daemon-instance.js.
   async stop() {
     this.manualStop = true;
     clearTimeout(this.reconnectTimer);
@@ -338,16 +349,38 @@ export class AppServerRuntime {
       this.rpc.close("runtime stopped");
     }
 
-    if (!this.child) {
-      return;
-    }
-
     const child = this.child;
     this.child = null;
 
-    if (child.exitCode == null) {
-      child.kill("SIGTERM");
+    if (!child) {
+      return;
     }
+
+    if (child.exitCode != null || child.signalCode != null) {
+      return;
+    }
+
+    await new Promise((resolve) => {
+      let killTimer = null;
+      const onClose = () => {
+        if (killTimer) {
+          clearTimeout(killTimer);
+        }
+        resolve();
+      };
+      child.once("close", onClose);
+
+      child.kill("SIGTERM");
+
+      killTimer = setTimeout(() => {
+        // Escalate: SIGTERM did not land within stopTimeoutMs. "close" still
+        // fires after SIGKILL and resolves the promise via onClose.
+        if (child.exitCode == null && child.signalCode == null) {
+          child.kill("SIGKILL");
+        }
+      }, this.stopTimeoutMs);
+      killTimer.unref?.();
+    });
   }
 
   async #ensureStarted() {
@@ -356,6 +389,16 @@ export class AppServerRuntime {
     }
 
     this.manualStop = false;
+    // C5a: reset the stdout line buffer on every (re)start. Otherwise a partial
+    // line left by an unclean child death is concatenated onto the new child's
+    // first chunk, corrupting one message (and stalling reconnect if it was the
+    // initialize response).
+    this.buffer = "";
+    this.initialized = false;
+
+    if (this.launchSpec.description) {
+      this.logger?.log?.(`spawning app-server: ${this.launchSpec.description}`);
+    }
 
     const child = spawn(this.launchSpec.command, this.launchSpec.args, {
       env: { ...this.env },
@@ -364,7 +407,6 @@ export class AppServerRuntime {
     });
 
     this.child = child;
-    this.initialized = false;
 
     const rpc = new JsonRpcClient({
       send: (line) => this.#sendLine(line),
@@ -395,25 +437,74 @@ export class AppServerRuntime {
 
     child.on("error", (error) => {
       this.events.emit("error", error);
+      // M-spawnerror: on a spawn failure (e.g. ENOENT) "close" may never fire,
+      // so without teardown this.child/this.rpc stay set and the in-flight
+      // initialize() hangs for requestTimeoutMs. Tear down the same way "close"
+      // does so initialize() (and any reconnect attempt) fails fast. If close
+      // does also fire, the teardown is idempotent.
+      this.#teardown(child, rpc, `app-server spawn error: ${error.message}`);
+      this.#maybeReconnect();
     });
 
     child.on("close", (code, signal) => {
       this.events.emit("close", { code, signal });
-      this.child = null;
-      this.initialized = false;
-      rpc.close(`app-server closed (${code ?? "n/a"})`);
-
-      if (!this.manualStop && this.reconnect) {
-        this.reconnectTimer = setTimeout(async () => {
-          try {
-            await this.initialize();
-            this.events.emit("reconnected", { ok: true });
-          } catch (err) {
-            this.events.emit("error", err);
-          }
-        }, this.reconnectDelayMs);
-      }
+      this.#teardown(child, rpc, `app-server closed (${code ?? "n/a"})`);
+      this.#maybeReconnect();
     });
+  }
+
+  // Idempotent teardown shared by the "error" and "close" handlers. Only clears
+  // the current child/rpc if they still point at the instance being torn down,
+  // so a stale handler from a previous child cannot wipe a freshly started one.
+  #teardown(child, rpc, reason) {
+    if (this.child === child) {
+      this.child = null;
+    }
+    this.initialized = false;
+    if (this.rpc === rpc) {
+      this.rpc = null;
+    }
+    rpc.close(reason);
+  }
+
+  // C5b: reconnect loops with capped exponential backoff, re-arming on each
+  // failed attempt, until it succeeds, manualStop is set, or reconnectMaxAttempts
+  // is exhausted (after which a terminal "down" event is emitted). A single
+  // pending timer guards against concurrent loops (e.g. error + close both fire).
+  #maybeReconnect() {
+    if (this.manualStop || !this.reconnect || this.reconnectTimer) {
+      return;
+    }
+
+    if (this.reconnectAttempts >= this.reconnectMaxAttempts) {
+      this.events.emit("down", { attempts: this.reconnectAttempts });
+      return;
+    }
+
+    const delay = Math.min(
+      this.reconnectDelayMs * 2 ** this.reconnectAttempts,
+      this.reconnectMaxDelayMs
+    );
+    this.reconnectAttempts += 1;
+
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
+      // ponytail: manualStop is re-checked here and inside #maybeReconnect, but
+      // a stop() that lands during the await below can still race a mid-spawn
+      // reconnect. Closing that window fully needs an abort token; out of scope.
+      if (this.manualStop) {
+        return;
+      }
+      try {
+        await this.initialize();
+        this.reconnectAttempts = 0;
+        this.events.emit("reconnected", { ok: true });
+      } catch (err) {
+        this.events.emit("error", err);
+        // Re-arm: the next attempt backs off further or emits "down".
+        this.#maybeReconnect();
+      }
+    }, delay);
   }
 
   #sendLine(line) {

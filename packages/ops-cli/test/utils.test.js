@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { toBoolean, resolveBindTargets } from "../src/utils.js";
+import { toBoolean, resolveBindTargets, getArgValue } from "../src/utils.js";
 
 test("toBoolean accepts y/n and yes/no", () => {
   assert.equal(toBoolean("y", false), true);
@@ -13,6 +13,25 @@ test("toBoolean accepts y/n and yes/no", () => {
 test("toBoolean falls back for unknown values", () => {
   assert.equal(toBoolean("maybe", true), true);
   assert.equal(toBoolean("maybe", false), false);
+});
+
+test("getArgValue returns the value following a flag", () => {
+  const args = ["bind", "discord", "--chat", "12345", "--cwd", "/repo"];
+  assert.equal(getArgValue(args, "--chat", null), "12345");
+  assert.equal(getArgValue(args, "--cwd", "/default"), "/repo");
+});
+
+test("getArgValue does not consume the next flag as a value", () => {
+  // --auto-approve is a present-but-valueless flag followed by another flag.
+  const args = ["--auto-approve", "--model", "gpt-5.4"];
+  assert.equal(getArgValue(args, "--auto-approve", "fallback"), "fallback");
+  assert.equal(getArgValue(args, "--model", null), "gpt-5.4");
+});
+
+test("getArgValue returns fallback for a trailing flag with no value", () => {
+  const args = ["bind", "discord", "--user"];
+  assert.equal(getArgValue(args, "--user", null), null);
+  assert.equal(getArgValue(args, "--missing", "fb"), "fb");
 });
 
 test("resolveBindTargets infers discord ids from config", () => {

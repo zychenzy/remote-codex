@@ -19,10 +19,10 @@ export async function startTurnWithRecovery({
   }
 
   let recovered = false;
+  let resumeResponse;
   try {
-    const resumeResponse = await resumeThread(threadId);
+    resumeResponse = await resumeThread(threadId);
     recovered = true;
-    await onRecovered({ threadId, resumeResponse });
   } catch (resumeError) {
     if (!isThreadNotFoundError(resumeError)) {
       throw resumeError;
@@ -32,6 +32,9 @@ export async function startTurnWithRecovery({
   if (recovered) {
     try {
       const turnResponse = await startTurn({ ...baseParams, threadId });
+      // Persist only after the retry succeeds: a retry 404 must not leave the
+      // binding pointing at a thread that cannot accept turns.
+      await onRecovered({ threadId, resumeResponse });
       return { threadId, turnResponse };
     } catch (retryError) {
       if (!isThreadNotFoundError(retryError)) {

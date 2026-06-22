@@ -56,24 +56,32 @@ export class AutopilotSupervisor {
       decision: decision.action === "deny" ? "deny" : "allow",
       payload: decision.action === "answer" ? String(decision.payload || "") : "",
       actor: "autopilot",
+      // System actor, not a user: bypass initiator-ownership checks (approval-ownership contract).
+      overrideOwnership: true,
     });
     if (!resolution) {
       return { handled: false, decision: null };
     }
 
-    const session = this.#currentSession(binding);
-    this.#writeSession(binding, {
-      ...session,
-      threadId: serverRequest?.params?.threadId || session.threadId || binding.threadId || null,
-      activeTurnId: serverRequest?.params?.turnId || session.activeTurnId || null,
-      status: serverRequest?.method === "item/tool/requestUserInput"
-        ? "waiting_tool_input_decision"
-        : "waiting_approval_decision",
-      lastAction: {
-        type: decision.action,
-        reason: decision.reason,
-      },
-    });
+    // The broker already resolved (and emitted) above; a failed bookkeeping write
+    // must not retract that, so keep handled:true and only log the write failure.
+    try {
+      const session = this.#currentSession(binding);
+      this.#writeSession(binding, {
+        ...session,
+        threadId: serverRequest?.params?.threadId || session.threadId || binding.threadId || null,
+        activeTurnId: serverRequest?.params?.turnId || session.activeTurnId || null,
+        status: serverRequest?.method === "item/tool/requestUserInput"
+          ? "waiting_tool_input_decision"
+          : "waiting_approval_decision",
+        lastAction: {
+          type: decision.action,
+          reason: decision.reason,
+        },
+      });
+    } catch (error) {
+      this.logger.warn?.(`autopilot session write failed after resolve: ${error.message}`);
+    }
     return { handled: true, decision };
   }
 
@@ -113,9 +121,12 @@ export class AutopilotSupervisor {
 
     try {
       await this.startFollowupTurn(binding, String(decision.payload || ""));
+      // Re-read after the await: startFollowupTurn may have mutated the session
+      // (e.g. onTurnStarted), so increment counters off the fresh snapshot, not the stale one.
+      const latest = this.#currentSession(binding);
       this.#writeSession(binding, {
-        ...baseSession,
-        automaticTurns: Number(baseSession?.automaticTurns || 0) + 1,
+        ...latest,
+        automaticTurns: Number(latest?.automaticTurns ?? baseSession?.automaticTurns ?? 0) + 1,
         consecutivePauses: 0,
         status: "waiting_followup_decision",
         lastCompletionFingerprint: continuationState.lastCompletionFingerprint,
@@ -128,9 +139,11 @@ export class AutopilotSupervisor {
       return { handled: true, decision };
     } catch (error) {
       this.logger.warn?.(`autopilot follow-up failed: ${error.message}`);
+      // Re-read after the await for the same reason as the success path (lost-update guard).
+      const latest = this.#currentSession(binding);
       this.#writeSession(binding, {
-        ...baseSession,
-        consecutivePauses: Number(baseSession?.consecutivePauses || 0) + 1,
+        ...latest,
+        consecutivePauses: Number(latest?.consecutivePauses ?? baseSession?.consecutivePauses ?? 0) + 1,
         status: "paused",
         lastCompletionFingerprint: continuationState.lastCompletionFingerprint,
         repeatedCompletionCount: continuationState.repeatedCompletionCount,

@@ -80,7 +80,7 @@ test("approval pauses destructive command", () => {
   assert.equal(decision.action, "pause");
 });
 
-test("tool-input answers first option when structured", () => {
+test("tool-input pauses when no option is marked recommended", () => {
   const decision = decideToolInput({
     method: "item/tool/requestUserInput",
     params: {
@@ -93,8 +93,58 @@ test("tool-input answers first option when structured", () => {
       ],
     },
   }, binding());
+  assert.equal(decision.action, "pause");
+});
+
+test("tool-input answers runtime-recommended option as JSON answers form", () => {
+  const decision = decideToolInput({
+    method: "item/tool/requestUserInput",
+    params: {
+      questions: [
+        {
+          id: "mode",
+          question: "Pick one",
+          options: [{ label: "fast" }, { label: "safe", recommended: true }],
+        },
+      ],
+    },
+  }, binding());
   assert.equal(decision.action, "answer");
-  assert.equal(decision.payload, "mode=fast");
+  // JSON { answers: { <key>: { answers: [<label>] } } } is what the broker parses.
+  assert.deepEqual(JSON.parse(decision.payload), { answers: { mode: { answers: ["safe"] } } });
+});
+
+test("tool-input preserves '=' and ',' in recommended labels via JSON encoding", () => {
+  const decision = decideToolInput({
+    method: "item/tool/requestUserInput",
+    params: {
+      questions: [
+        {
+          id: "expr",
+          question: "Pick one",
+          options: [
+            { label: "a=b, c=d", isRecommended: true },
+            { label: "plain" },
+          ],
+        },
+      ],
+    },
+  }, binding());
+  assert.equal(decision.action, "answer");
+  assert.deepEqual(JSON.parse(decision.payload), { answers: { expr: { answers: ["a=b, c=d"] } } });
+});
+
+test("tool-input pauses when only some questions have a recommended option", () => {
+  const decision = decideToolInput({
+    method: "item/tool/requestUserInput",
+    params: {
+      questions: [
+        { id: "a", question: "Pick", options: [{ label: "x", recommended: true }] },
+        { id: "b", question: "Pick", options: [{ label: "y" }, { label: "z" }] },
+      ],
+    },
+  }, binding());
+  assert.equal(decision.action, "pause");
 });
 
 test("turn continuation continues only for safe completed turns", () => {

@@ -954,3 +954,110 @@ test("discord adapter rejects unauthorized slash and component interactions ephe
     await adapter.stop();
   }
 });
+
+test("discord adapter registers client error listeners and survives gateway errors", async () => {
+  const client = createFakeClient();
+  const channel = createFakeChannel({ id: "123" });
+  client.__channels.set("123", channel);
+  const errors = [];
+  const adapter = new DiscordAdapter({
+    token: "token",
+    client,
+    allowedChannels: ["123"],
+    dmUserIds: ["user-1"],
+    minSendIntervalMs: 0,
+    logger: { warn() {}, error: (line) => errors.push(String(line || "")), info() {}, debug() {} },
+  });
+
+  await adapter.start();
+  // Without listeners these would throw and crash the process; they must be logged.
+  client.emit("error", new Error("gateway boom"));
+  client.emit("shardError", new Error("shard boom"));
+  client.emit("invalidated");
+  await adapter.stop();
+
+  assert.equal(errors.some((line) => line.includes("client error: gateway boom")), true);
+  assert.equal(errors.some((line) => line.includes("shard error: shard boom")), true);
+  assert.equal(errors.some((line) => line.includes("session invalidated")), true);
+});
+
+test("discord adapter rejects a second fast click on an approval (double-ack guard)", async () => {
+  const client = createFakeClient();
+  const channel = createFakeChannel({ id: "123" });
+  client.__channels.set("123", channel);
+  const adapter = createAdapter({
+    client,
+    allowedChannels: ["123"],
+    authorizeInteraction: async () => true,
+  });
+  const seen = [];
+  adapter.registerInboundHandler((context) => seen.push(context));
+
+  try {
+    await adapter.sendApprovalPrompt(
+      { channel: "discord", chatId: "123", threadId: "123" },
+      { localRequestId: "req-dbl", kind: "item/commandExecution/requestApproval", summary: "Run npm test" }
+    );
+    const message = channel.sent[0];
+    const buttonId = message.components[0].components[0].custom_id;
+    const first = createComponentInteraction({ kind: "button", customId: buttonId, channel, message });
+    const second = createComponentInteraction({ kind: "button", customId: buttonId, channel, message });
+
+    // Emit both before awaiting so both clear the top guard before either closes.
+    client.emit("interactionCreate", first);
+    client.emit("interactionCreate", second);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].text, "/approve req-dbl allow");
+    // Exactly one update() committed; the loser was rejected ephemerally.
+    const updates = first.updates.length + second.updates.length;
+    const ephemerals = first.replies.length + second.replies.length;
+    assert.equal(updates, 1);
+    assert.equal(ephemerals, 1);
+  } finally {
+    await adapter.stop();
+  }
+});
+
+test("discord adapter logs in once for overlapping start() calls", async () => {
+  const client = createFakeClient();
+  const channel = createFakeChannel({ id: "123" });
+  client.__channels.set("123", channel);
+  let logins = 0;
+  const baseLogin = client.login;
+  client.login = async (...args) => {
+    logins += 1;
+    return baseLogin.apply(client, args);
+  };
+  const adapter = createAdapter({ client, allowedChannels: ["123"] });
+
+  await Promise.all([adapter.start(), adapter.start()]);
+  await adapter.stop();
+
+  assert.equal(logins, 1);
+});
+
+test("discord adapter editMessage distinguishes missing id from empty content", async () => {
+  const client = createFakeClient();
+  const channel = createFakeChannel({ id: "123" });
+  client.__channels.set("123", channel);
+  const warnings = [];
+  const adapter = new DiscordAdapter({
+    token: "token",
+    client,
+    allowedChannels: ["123"],
+    dmUserIds: ["user-1"],
+    minSendIntervalMs: 0,
+    logger: { warn: (line) => warnings.push(String(line || "")), error() {}, info() {}, debug() {} },
+  });
+
+  const missingId = await adapter.editMessage({ channel: "discord", chatId: "123" }, "", "hello");
+  const emptyContent = await adapter.editMessage({ channel: "discord", chatId: "123" }, "m-1", "   ");
+
+  assert.equal(missingId, null);
+  assert.equal(emptyContent, null);
+  // Missing id logs; empty content stays silent.
+  assert.equal(warnings.some((line) => line.includes("without a message id")), true);
+  assert.equal(warnings.length, 1);
+});

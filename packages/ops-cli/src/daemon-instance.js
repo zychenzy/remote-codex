@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import process from "node:process";
 
@@ -25,19 +26,35 @@ export function readPidFile(pidFile, { fsModule = fs } = {}) {
   }
 }
 
-function readLockOwner(lockFile, { fsModule = fs } = {}) {
+function readLockRecord(lockFile, { fsModule = fs } = {}) {
   try {
     const raw = fsModule.readFileSync(lockFile, "utf8");
     const parsed = JSON.parse(raw);
-    return Number(parsed?.pid) || 0;
+    return {
+      pid: Number(parsed?.pid) || 0,
+      token: parsed?.token ? String(parsed.token) : "",
+    };
   } catch {
-    return 0;
+    return { pid: 0, token: "" };
   }
 }
 
-function clearIfOwned(lockFile, ownerPid, { fsModule = fs } = {}) {
-  const currentOwner = readLockOwner(lockFile, { fsModule });
-  if (currentOwner && currentOwner !== ownerPid) {
+// Remove the lock only if it still matches what we observed (pid + token), so a
+// concurrent claimant that has already replaced the record is never clobbered.
+// ponytail: POSIX has no atomic compare-and-unlink, so a sub-millisecond race
+// remains between the re-read and rmSync; the token check makes a stomp require
+// an exact pid+token collision, which randomUUID makes effectively impossible.
+function clearIfMatches(lockFile, observed, { fsModule = fs } = {}) {
+  const current = readLockRecord(lockFile, { fsModule });
+  if (!current.pid && !current.token) {
+    // already gone or unowned
+    return true;
+  }
+  if (observed.token) {
+    if (current.token !== observed.token) {
+      return false;
+    }
+  } else if (current.pid !== observed.pid) {
     return false;
   }
   fsModule.rmSync(lockFile, { force: true });
@@ -103,6 +120,8 @@ export async function claimDaemonLock({
   pidFile,
   lockFile,
   currentPid = process.pid,
+  priorToken = "",
+  tokenFn = crypto.randomUUID,
   fsModule = fs,
   killFn = process.kill,
   sleepFn = sleep,
@@ -119,46 +138,52 @@ export async function claimDaemonLock({
     });
   }
 
+  const token = tokenFn();
+  const data = JSON.stringify({
+    pid: currentPid,
+    token,
+    acquiredAt: new Date().toISOString(),
+  }, null, 2);
+  const owned = { pid: currentPid, token };
+  const acquire = () => ({
+    token,
+    release() {
+      clearIfMatches(lockFile, owned, { fsModule });
+    },
+  });
+
   const deadline = Date.now() + takeoverTimeoutMs;
   while (true) {
     try {
-      const fd = fsModule.openSync(lockFile, "wx", 0o600);
-      fsModule.writeFileSync(fd, JSON.stringify({
-        pid: currentPid,
-        acquiredAt: new Date().toISOString(),
-      }, null, 2));
-      fsModule.closeSync(fd);
-      return {
-        release() {
-          clearIfOwned(lockFile, currentPid, { fsModule });
-        },
-      };
+      fsModule.writeFileSync(lockFile, data, { flag: "wx", mode: 0o600 });
+      return acquire();
     } catch (error) {
       if (error?.code !== "EEXIST") {
         throw error;
       }
     }
 
-    const ownerPid = readLockOwner(lockFile, { fsModule });
-    if (!ownerPid) {
-      fsModule.rmSync(lockFile, { force: true });
-    } else if (ownerPid === currentPid) {
-      return {
-        release() {
-          clearIfOwned(lockFile, currentPid, { fsModule });
-        },
-      };
-    } else if (!isPidRunning(ownerPid, { killFn })) {
-      fsModule.rmSync(lockFile, { force: true });
-    } else {
-      await stopExistingDaemon(ownerPid, {
+    const owner = readLockRecord(lockFile, { fsModule });
+    if (!owner.pid) {
+      // unowned record (corrupt/empty): safe to clear since we just observed it
+      clearIfMatches(lockFile, owner, { fsModule });
+    } else if (owner.pid === currentPid) {
+      return acquire();
+    } else if (!isPidRunning(owner.pid, { killFn })) {
+      // dead owner: only clear the exact record we just observed as dead
+      clearIfMatches(lockFile, owner, { fsModule });
+    } else if (priorToken && owner.token === priorToken) {
+      // alive owner is a prior incarnation of ours (token matches): safe to replace
+      await stopExistingDaemon(owner.pid, {
         timeoutMs: Math.max(1, deadline - Date.now()),
         pollIntervalMs,
         killFn,
         sleepFn,
       });
-      clearIfOwned(lockFile, ownerPid, { fsModule });
+      clearIfMatches(lockFile, owner, { fsModule });
     }
+    // else: alive owner with an unknown token. It may be an unrelated (possibly
+    // recycled) PID, so we never SIGTERM it; wait and retry until the deadline.
 
     if (Date.now() >= deadline) {
       throw new Error("failed to acquire daemon lock before timeout");

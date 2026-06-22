@@ -5,7 +5,13 @@ export function getArgValue(args, key, fallback = null) {
   if (idx === -1) {
     return fallback;
   }
-  return args[idx + 1] ?? fallback;
+  const next = args[idx + 1];
+  // "flag present, no value": next token is missing or is itself a flag, so do
+  // not consume it as this flag's value.
+  if (next === undefined || (typeof next === "string" && next.startsWith("-"))) {
+    return fallback;
+  }
+  return next;
 }
 
 export function toBoolean(value, fallback = false) {

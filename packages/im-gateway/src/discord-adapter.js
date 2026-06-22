@@ -167,10 +167,6 @@ function isThreadChannel(channel) {
   return Boolean(channel.parentId || channel.parent);
 }
 
-function optionType(discordApi, key, fallback) {
-  return discordApi?.ApplicationCommandOptionType?.[key] ?? fallback;
-}
-
 function capitalize(word = "") {
   const input = String(word || "");
   return input ? `${input[0].toUpperCase()}${input.slice(1)}` : "";
@@ -181,9 +177,6 @@ export class DiscordAdapter extends BaseAdapter {
     token,
     allowedChannels = [],
     dmUserIds = [],
-    loadCursor = null,
-    saveCursor = null,
-    pollIntervalMs = 1800,
     minSendIntervalMs = DEFAULT_MIN_SEND_INTERVAL_MS,
     logger = console,
     discordApi = DiscordJs,
@@ -194,9 +187,7 @@ export class DiscordAdapter extends BaseAdapter {
     this.token = token;
     this.allowedChannels = Array.isArray(allowedChannels) ? allowedChannels.map((value) => String(value || "").trim()).filter(Boolean) : [];
     this.allowedUserIds = Array.isArray(dmUserIds) ? dmUserIds.map((value) => String(value || "").trim()).filter(Boolean) : [];
-    this.loadCursor = loadCursor;
-    this.saveCursor = saveCursor;
-    this.pollIntervalMs = pollIntervalMs;
+    // ponytail: rely on discord.js resume + dedupe, no manual cursor.
     this.minSendIntervalMs = minSendIntervalMs;
     this.discordApi = discordApi;
     this.authorizeInteraction = authorizeInteraction;
@@ -205,6 +196,7 @@ export class DiscordAdapter extends BaseAdapter {
     this.nextAllowedSendAt = 0;
     this.started = false;
     this.readyPromise = null;
+    this.startPromise = null;
     this.viewState = new Map();
     this.seenInboundKeys = new Map();
     this.clientHandlersInstalled = false;
@@ -293,6 +285,17 @@ export class DiscordAdapter extends BaseAdapter {
     if (this.started) {
       return;
     }
+    // Set the in-flight gate synchronously so two overlapping start() calls
+    // share one login() instead of both racing to log in.
+    if (!this.startPromise) {
+      this.startPromise = this.#startOnce().finally(() => {
+        this.startPromise = null;
+      });
+    }
+    await this.startPromise;
+  }
+
+  async #startOnce() {
     this.readyPromise = this.#waitForReady();
     try {
       await this.client.login(this.token);
@@ -388,7 +391,14 @@ export class DiscordAdapter extends BaseAdapter {
   async editMessage(context, messageId, text) {
     const content = formatDiscordContent(text);
     const resolvedMessageId = String(messageId || "").trim();
-    if (!resolvedMessageId || !content.trim()) {
+    // Distinguish the two no-op causes: a missing message id is a caller misuse
+    // (worth a log), whereas empty content is a benign skip (e.g. an empty
+    // streaming edit) and stays silent.
+    if (!resolvedMessageId) {
+      this.logger.warn("[discord] editMessage called without a message id; skipping");
+      return null;
+    }
+    if (!content.trim()) {
       return null;
     }
 
@@ -480,17 +490,20 @@ export class DiscordAdapter extends BaseAdapter {
   }
 
   async #enqueueSend(operation) {
-    this.sendQueue = this.sendQueue
-      .catch(() => {})
-      .then(async () => {
-        const waitMs = this.nextAllowedSendAt - Date.now();
-        if (waitMs > 0) {
-          await sleep(waitMs);
-        }
-        await operation();
-        this.nextAllowedSendAt = Date.now() + this.minSendIntervalMs;
-      });
-    await this.sendQueue;
+    // The chain link records this slot for ordering/rate-limiting. Its own
+    // rejection must NOT block future sends, so only the queue-chaining catch
+    // (below) swallows. The per-operation rejection is awaited separately so it
+    // propagates to the caller (e.g. so streaming flushes can re-buffer).
+    const link = this.sendQueue.then(async () => {
+      const waitMs = this.nextAllowedSendAt - Date.now();
+      if (waitMs > 0) {
+        await sleep(waitMs);
+      }
+      await operation();
+      this.nextAllowedSendAt = Date.now() + this.minSendIntervalMs;
+    });
+    this.sendQueue = link.catch(() => {});
+    await link;
   }
 
   #installClientHandlers() {
@@ -503,6 +516,18 @@ export class DiscordAdapter extends BaseAdapter {
       this.#handleInteractionCreate(interaction).catch((error) => {
         this.logger.error(`[discord] interaction handler failed: ${error.message}`);
       });
+    });
+    // A discord.js Client 'error' (and shardError) with no listener throws and
+    // exits the process; 'invalidated' means the session is unrecoverable.
+    // Log all three so the daemon stays alive on transient gateway faults.
+    this.client.on("error", (error) => {
+      this.logger.error(`[discord] client error: ${error?.message || error}`);
+    });
+    this.client.on("shardError", (error) => {
+      this.logger.error(`[discord] shard error: ${error?.message || error}`);
+    });
+    this.client.on("invalidated", () => {
+      this.logger.error("[discord] session invalidated; gateway connection is no longer usable");
     });
   }
 
@@ -542,10 +567,10 @@ export class DiscordAdapter extends BaseAdapter {
 
   #buildSlashCommands() {
     const ApplicationCommandOptionType = this.discordApi?.ApplicationCommandOptionType || {};
-    const STRING = optionType(this.discordApi, "String", ApplicationCommandOptionType.String ?? 3);
-    const INTEGER = optionType(this.discordApi, "Integer", ApplicationCommandOptionType.Integer ?? 4);
-    const BOOLEAN = optionType(this.discordApi, "Boolean", ApplicationCommandOptionType.Boolean ?? 5);
-    const SUB = optionType(this.discordApi, "Subcommand", ApplicationCommandOptionType.Subcommand ?? 1);
+    const STRING = ApplicationCommandOptionType.String ?? 3;
+    const INTEGER = ApplicationCommandOptionType.Integer ?? 4;
+    const BOOLEAN = ApplicationCommandOptionType.Boolean ?? 5;
+    const SUB = ApplicationCommandOptionType.Subcommand ?? 1;
 
     return [
       { name: "new", description: "Start a new thread for this chat binding." },
@@ -866,7 +891,11 @@ export class DiscordAdapter extends BaseAdapter {
     if (!message || message.author?.bot) {
       return;
     }
-    const allowed = this.#isMessageAllowed(message);
+    const allowed = this.#isAllowed({
+      channel: message?.channel,
+      userId: message.author?.id,
+      guild: message.guild,
+    });
     if (!allowed) {
       return;
     }
@@ -905,7 +934,12 @@ export class DiscordAdapter extends BaseAdapter {
   }
 
   async #authorizeInteractiveContext(interaction, context) {
-    if (!this.#isInteractiveChannelAllowed(interaction)) {
+    if (!this.#isAllowed({
+      channel: interaction?.channel,
+      userId: interaction.user?.id,
+      guild: interaction.guild,
+      channelId: interaction.channelId,
+    })) {
       await this.#replyEphemeral(interaction, "This Discord channel is not enabled for the daemon.");
       return false;
     }
@@ -928,7 +962,10 @@ export class DiscordAdapter extends BaseAdapter {
     }
     const [, viewId, controlId, extra = ""] = match;
     const state = this.viewState.get(viewId);
-    if (!state || state.expiresAt <= nowMs()) {
+    // state.closed is the double-ack guard: it is set synchronously before the
+    // first interaction.update() in each terminal handler, so a second fast
+    // click sees it here and is rejected before reaching a duplicate update().
+    if (!state || state.closed || state.expiresAt <= nowMs()) {
       if (state) {
         this.#expireView(viewId);
       }
@@ -973,6 +1010,12 @@ export class DiscordAdapter extends BaseAdapter {
       return;
     }
 
+    // Synchronous double-ack guard: the authorize await above lets two fast
+    // clicks both reach here; close atomically before the first update().
+    if (state.closed) {
+      await this.#replyEphemeral(interaction, "This control expired. Rerun the command to refresh it.");
+      return;
+    }
     state.closed = true;
     const commandText = `/approve ${state.requestId} ${action}`;
     const payload = {
@@ -988,7 +1031,7 @@ export class DiscordAdapter extends BaseAdapter {
       components: disableComponents(state.components),
     };
     await interaction.update(payload);
-    this.#expireView(state.viewId, { keepDisabled: true });
+    this.#expireView(state.viewId);
     this.emitInbound({
       ...context,
       text: commandText,
@@ -997,6 +1040,10 @@ export class DiscordAdapter extends BaseAdapter {
 
   async #handleQuestionInteraction(interaction, context, state, controlId, extra) {
     if (controlId === "deny") {
+      if (state.closed) {
+        await this.#replyEphemeral(interaction, "This control expired. Rerun the command to refresh it.");
+        return;
+      }
       state.closed = true;
       await interaction.update({
         content: state.content || "",
@@ -1010,7 +1057,7 @@ export class DiscordAdapter extends BaseAdapter {
         ],
         components: disableComponents(state.components),
       });
-      this.#expireView(state.viewId, { keepDisabled: true });
+      this.#expireView(state.viewId);
       this.emitInbound({
         ...context,
         text: `/answer deny ${state.requestId}`,
@@ -1034,6 +1081,10 @@ export class DiscordAdapter extends BaseAdapter {
         await this.#replyEphemeral(interaction, "This prompt does not have selectable options. Use the text command fallback.");
         return;
       }
+      if (state.closed) {
+        await this.#replyEphemeral(interaction, "This control expired. Rerun the command to refresh it.");
+        return;
+      }
       state.closed = true;
       await interaction.update({
         content: state.content || "",
@@ -1047,7 +1098,7 @@ export class DiscordAdapter extends BaseAdapter {
         ],
         components: disableComponents(state.components),
       });
-      this.#expireView(state.viewId, { keepDisabled: true });
+      this.#expireView(state.viewId);
       this.emitInbound({
         ...context,
         text: `/answer ${state.requestId} ${pairs.join(";")}`,
@@ -1105,6 +1156,10 @@ export class DiscordAdapter extends BaseAdapter {
 
   async #handleCwdBrowserInteraction(interaction, context, state, controlId) {
     if (controlId === "cancel") {
+      if (state.closed) {
+        await this.#replyEphemeral(interaction, "This control expired. Rerun the command to refresh it.");
+        return;
+      }
       state.closed = true;
       const embed = plainEmbed({
         title: "Workspace Browse Cancelled",
@@ -1120,13 +1175,17 @@ export class DiscordAdapter extends BaseAdapter {
         embeds: [embed],
         components: disableComponents(state.components),
       });
-      this.#expireView(state.viewId, { keepDisabled: true });
+      this.#expireView(state.viewId);
       return;
     }
 
     if (controlId === "confirm") {
       if (!state.selectedPath) {
         await this.#replyEphemeral(interaction, "Choose a subdirectory before confirming.");
+        return;
+      }
+      if (state.closed) {
+        await this.#replyEphemeral(interaction, "This control expired. Rerun the command to refresh it.");
         return;
       }
       state.closed = true;
@@ -1142,7 +1201,7 @@ export class DiscordAdapter extends BaseAdapter {
         embeds: [embed],
         components: disableComponents(state.components),
       });
-      this.#expireView(state.viewId, { keepDisabled: true });
+      this.#expireView(state.viewId);
       this.emitInbound({
         ...context,
         text: `/cwd ${state.selectedPath}`,
@@ -1175,6 +1234,10 @@ export class DiscordAdapter extends BaseAdapter {
 
   async #handleFilePickerInteraction(interaction, context, state, controlId) {
     if (controlId === "cancel") {
+      if (state.closed) {
+        await this.#replyEphemeral(interaction, "This control expired. Rerun the command to refresh it.");
+        return;
+      }
       state.closed = true;
       const embed = plainEmbed({
         title: "File Picker Closed",
@@ -1190,7 +1253,7 @@ export class DiscordAdapter extends BaseAdapter {
         embeds: [embed],
         components: disableComponents(state.components),
       });
-      this.#expireView(state.viewId, { keepDisabled: true });
+      this.#expireView(state.viewId);
       return;
     }
 
@@ -1259,7 +1322,7 @@ export class DiscordAdapter extends BaseAdapter {
 
   #messageContext(message, text) {
     const channel = message.channel;
-    const threadId = isThreadChannel(channel) ? String(channel.id || "") : String(channel.id || "");
+    const threadId = String(channel.id || "");
     return {
       channel: "discord",
       chatId: String(channel.id || ""),
@@ -1268,7 +1331,7 @@ export class DiscordAdapter extends BaseAdapter {
       text: String(text || ""),
       messageId: String(message.id || ""),
       replyToMessageId: String(message.reference?.messageId || message.reference?.message_id || ""),
-      threadId: threadId || String(channel.id || ""),
+      threadId,
       raw: message,
       discordMeta: {
         kind: "message",
@@ -1301,28 +1364,14 @@ export class DiscordAdapter extends BaseAdapter {
     };
   }
 
-  #isMessageAllowed(message) {
-    if (!message?.channel) {
-      return false;
-    }
-    if (message.channel.isDMBased?.() || message.guild == null) {
-      return this.allowedUserIds.includes(String(message.author?.id || ""));
-    }
-    if (this.allowedChannels.includes(String(message.channel.id || ""))) {
-      return true;
-    }
-    return this.allowedChannels.includes(String(message.channel.parentId || message.channel.parent?.id || ""));
-  }
-
-  #isInteractiveChannelAllowed(interaction) {
-    const channel = interaction?.channel;
+  #isAllowed({ channel, userId, guild, channelId = "" } = {}) {
     if (!channel) {
       return false;
     }
-    if (channel.isDMBased?.() || interaction.guild == null) {
-      return this.allowedUserIds.includes(String(interaction.user?.id || ""));
+    if (channel.isDMBased?.() || guild == null) {
+      return this.allowedUserIds.includes(String(userId || ""));
     }
-    if (this.allowedChannels.includes(String(channel.id || interaction.channelId || ""))) {
+    if (this.allowedChannels.includes(String(channel.id || channelId || ""))) {
       return true;
     }
     return this.allowedChannels.includes(String(channel.parentId || channel.parent?.id || ""));
@@ -1356,9 +1405,7 @@ export class DiscordAdapter extends BaseAdapter {
     if (nativeUi.kind === "filePicker") {
       return this.#renderFilePickerUi(nativeUi, { fallbackText });
     }
-    if (nativeUi.kind === "threadList" || nativeUi.kind === "modelPicker") {
-      return this.#renderCommandControlsUi(nativeUi, { fallbackText });
-    }
+    // threadList/modelPicker and any other kind render as command controls.
     return this.#renderCommandControlsUi(nativeUi, { fallbackText });
   }
 
@@ -1829,10 +1876,12 @@ export class DiscordAdapter extends BaseAdapter {
       }
     }
     state.components = disabled;
-    this.#expireView(viewId, { keepDisabled: true });
+    this.#expireView(viewId);
   }
 
-  #expireView(viewId, { keepDisabled = false } = {}) {
+  #expireView(viewId) {
+    // Removing the view from viewState is the removal; state.closed is the
+    // double-ack guard. The former 'expired' flag was written, never read.
     const state = this.viewState.get(viewId);
     if (!state) {
       return;
@@ -1841,9 +1890,6 @@ export class DiscordAdapter extends BaseAdapter {
       clearTimeout(state.timer);
     }
     this.viewState.delete(viewId);
-    if (!keepDisabled) {
-      state.expired = true;
-    }
   }
 
   #commandTextForInteraction(interaction) {

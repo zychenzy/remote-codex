@@ -7,7 +7,10 @@ import path from "node:path";
 import { DaemonApp } from "../src/daemon-app.js";
 
 function tempDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "im-codex-daemon-test-"));
+  // realpathSync so the path has no symlink segments (macOS /var -> /private/var).
+  // Workspace-jail containment realpaths the root, so the stored root and any
+  // navigation targets must already live in the same (resolved) symlink space.
+  return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "im-codex-daemon-test-")));
 }
 
 function sleep(ms) {
@@ -299,6 +302,12 @@ test("daemon eagerly resumes restored threads at startup so the first follow-up 
         return { turn: { id: `turn-start-${attempts}`, status: "inProgress" } };
       },
     },
+  });
+  // Permissive jail root so the /cwd /tmp navigation below stays in-root.
+  app.store.upsertBinding({
+    ...app.store.getBinding("discord", "chat-1"),
+    workingDir: "/",
+    workspaceRoot: "/",
   });
 
   try {
@@ -1415,6 +1424,13 @@ test("daemon /resume preserves inline fragmented user text without inserting lin
 test("daemon supports /cwd absolute, ~, and /workspace alias with resolved errors", async () => {
   const { app, adapter } = await setupDaemonHarness();
   const missing = `~/definitely-missing-${Date.now()}`;
+  // Permissive jail root ("/") so absolute, ~, and /tmp navigation stay in-root;
+  // this test exercises path resolution and resolved-error reporting, not jailing.
+  app.store.upsertBinding({
+    ...app.store.getBinding("discord", "chat-1"),
+    workingDir: "/",
+    workspaceRoot: "/",
+  });
 
   try {
     adapter.emitInbound({
@@ -2355,6 +2371,16 @@ test("daemon sends explicit collaboration mode default after /plan off", async (
       text: "/ask first turn",
     });
     await sleep(60);
+    // Complete the first turn so the in-flight guard releases before the next /ask.
+    runtime.emit("notification", {
+      method: "turn/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-start-1",
+        turn: { status: { type: "completed" } },
+      },
+    });
+    await sleep(40);
 
     adapter.emitInbound({
       channel: "discord",
@@ -2734,4 +2760,346 @@ test("daemon ignores near-simultaneous duplicate /new controls with different di
   assert.equal(runtime.startThreadCalls.length, 1);
   assert.equal(adapter.messages.filter((item) => item.text.startsWith("Started thread:")).length, 1);
   assert.equal(app.store.getBinding("discord", "chat-1")?.threadId, "thread-start-1");
+});
+
+function b64url(value) {
+  return Buffer.from(String(value || ""), "utf8").toString("base64url");
+}
+
+test("daemon /cwd rejects navigation outside the workspace root", async () => {
+  const { app, adapter } = await setupDaemonHarness();
+  const workspace = tempDir();
+  const sibling = tempDir(); // a different root, outside `workspace`
+  fs.mkdirSync(path.join(workspace, "inside"));
+  app.store.upsertBinding({
+    ...app.store.getBinding("discord", "chat-1"),
+    workingDir: workspace,
+  });
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: `/cwd ${sibling}`,
+    });
+    await sleep(60);
+
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/cwd inside",
+    });
+    await sleep(60);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(adapter.messages.some((item) => item.text.includes("Outside workspace root:")), true);
+  // A path within the root still resolves and binds.
+  assert.equal(app.store.getBinding("discord", "chat-1").workingDir, path.join(workspace, "inside"));
+  assert.equal(
+    adapter.messages.some((item) => item.text === `Workspace set to: ${path.join(workspace, "inside")}`),
+    true
+  );
+});
+
+test("daemon /cwd new refuses to create a directory outside the workspace root", async () => {
+  const { app, adapter } = await setupDaemonHarness();
+  const workspace = tempDir();
+  const escapeTarget = path.join(workspace, "..", "escaped-create");
+  app.store.upsertBinding({
+    ...app.store.getBinding("discord", "chat-1"),
+    workingDir: workspace,
+  });
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: `/cwd new ${escapeTarget}`,
+    });
+    await sleep(60);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(fs.existsSync(path.resolve(escapeTarget)), false);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Outside workspace root:")), true);
+  assert.equal(app.store.getBinding("discord", "chat-1").workingDir, workspace);
+});
+
+test("daemon /files pins root to the workspace and ignores caller-supplied root64", async () => {
+  const { app, adapter } = await setupDaemonHarness();
+  const workspace = tempDir();
+  const sibling = tempDir();
+  fs.mkdirSync(path.join(workspace, "src"));
+  fs.writeFileSync(path.join(sibling, "secret.txt"), "top secret\n");
+  app.store.upsertBinding({
+    ...app.store.getBinding("discord", "chat-1"),
+    workingDir: workspace,
+  });
+
+  try {
+    // root64 points at an outside directory; it must be ignored and the picker
+    // must be rooted at the binding workspace instead.
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: `/files --root64 ${b64url(sibling)}`,
+    });
+    await sleep(60);
+
+    // dir64 navigation outside the workspace is rejected.
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: `/files --dir64 ${b64url(sibling)}`,
+    });
+    await sleep(60);
+
+    // preview64 outside the workspace is rejected.
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: `/files --preview64 ${b64url(path.join(sibling, "secret.txt"))} --root64 ${b64url(sibling)}`,
+    });
+    await sleep(60);
+  } finally {
+    await app.stop();
+  }
+
+  const picker = adapter.messages.find((item) => item.nativeUi?.kind === "filePicker");
+  assert.ok(picker);
+  assert.equal(picker.nativeUi.rootDir, workspace);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Directory is outside workspace root:")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("Preview target is outside workspace root:")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("top secret")), false);
+});
+
+test("daemon /search pins root to the workspace and refuses previews outside it", async () => {
+  const { app, adapter } = await setupDaemonHarness();
+  const workspace = tempDir();
+  const sibling = tempDir();
+  fs.writeFileSync(path.join(sibling, "secret.txt"), "do not leak\n");
+  app.store.upsertBinding({
+    ...app.store.getBinding("discord", "chat-1"),
+    workingDir: workspace,
+  });
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: `/search --preview64 ${b64url(path.join(sibling, "secret.txt"))} --root64 ${b64url(sibling)}`,
+    });
+    await sleep(60);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(adapter.messages.some((item) => item.text.includes("Preview target is outside workspace root:")), true);
+  assert.equal(adapter.messages.some((item) => item.text.includes("do not leak")), false);
+});
+
+test("daemon rejects a second concurrent /ask while a turn is already running", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/ask first turn",
+      messageId: "guard-1",
+    });
+    await sleep(60);
+    // No turn/completed emitted: the binding still has an active turn.
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/ask second turn",
+      messageId: "guard-2",
+    });
+    await sleep(60);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(runtime.startTurnCalls.length, 1);
+  assert.equal(adapter.messages.some((item) => item.text.includes("A turn is already running")), true);
+});
+
+test("daemon clears the in-flight turn guard after completion so the next /ask runs", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+
+  try {
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/ask first turn",
+    });
+    await sleep(60);
+    runtime.emit("notification", {
+      method: "turn/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-start-1",
+        turn: { status: { type: "completed" } },
+      },
+    });
+    await sleep(40);
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/ask second turn",
+    });
+    await sleep(60);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(runtime.startTurnCalls.length, 2);
+  assert.equal(adapter.messages.some((item) => item.text.includes("A turn is already running")), false);
+});
+
+test("daemon passes the bound user as approval initiator and refuses cross-user /approve", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+  let createArgs = null;
+  const realCreate = app.approvalBroker.create.bind(app.approvalBroker);
+  app.approvalBroker.create = (params) => {
+    createArgs = params;
+    return realCreate(params);
+  };
+  // Simulate the broker rejecting a non-owner resolution (broker support is owned
+  // by another module); this verifies the daemon surfaces the sentinel.
+  app.approvalBroker.resolve = () => ({ notOwner: true });
+
+  try {
+    runtime.emit("serverRequest", {
+      id: "srv-owner-1",
+      method: "item/commandExecution/requestApproval",
+      params: { threadId: "thread-1", turnId: "turn-owner-1", reason: "run command" },
+    });
+    await sleep(60);
+
+    const requestId = adapter.approvalPrompts[0]?.payload?.localRequestId;
+    assert.equal(Boolean(requestId), true);
+
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: `/approve ${requestId} allow`,
+    });
+    await sleep(40);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(createArgs?.initiatorUserId, "user-1");
+  assert.equal(adapter.messages.some((item) => item.text === "That approval was requested by another user."), true);
+});
+
+test("daemon survives an approval resolution handler failure without crashing", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+  // respondServerRequest rejecting (e.g. dead socket) must not crash the daemon.
+  runtime.respondServerRequest = async () => {
+    throw new Error("socket closed");
+  };
+
+  try {
+    runtime.emit("serverRequest", {
+      id: "srv-resolve-fail-1",
+      method: "item/commandExecution/requestApproval",
+      params: { threadId: "thread-1", turnId: "turn-resolve-fail-1", reason: "run command" },
+    });
+    await sleep(60);
+
+    const requestId = adapter.approvalPrompts[0]?.payload?.localRequestId;
+    assert.equal(Boolean(requestId), true);
+
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: `/approve ${requestId} allow`,
+    });
+    await sleep(60);
+
+    // The daemon is still responsive to a subsequent command.
+    adapter.emitInbound({
+      channel: "discord",
+      chatId: "chat-1",
+      userId: "user-1",
+      text: "/status",
+    });
+    await sleep(40);
+  } finally {
+    await app.stop();
+  }
+
+  assert.equal(adapter.messages.some((item) => item.text.includes("Binding: discord:chat-1")), true);
+});
+
+test("daemon serializes runtime notifications so handlers never overlap", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+  const order = [];
+  // Wrap the adapter send so we can observe ordering of two notification handlers
+  // whose work overlaps in time. The first handler is deliberately slow.
+  const realSend = adapter.sendMessageRich.bind(adapter);
+  adapter.sendMessageRich = async (context, payload) => {
+    const text = String(payload?.text || "");
+    if (text.includes("Turn completed (completed).")) {
+      order.push(`start:${context.turnId}`);
+      await sleep(40);
+      order.push(`end:${context.turnId}`);
+    }
+    return realSend(context, payload);
+  };
+
+  try {
+    // Two distinct turns map to the same binding; each completion sends a message.
+    app.turnToBinding.set("turn-seq-1", "discord:chat-1");
+    app.turnToBinding.set("turn-seq-2", "discord:chat-1");
+    runtime.emit("notification", {
+      method: "turn/completed",
+      params: { threadId: "thread-1", turnId: "turn-seq-1", turn: { status: { type: "completed" } } },
+    });
+    runtime.emit("notification", {
+      method: "turn/completed",
+      params: { threadId: "thread-1", turnId: "turn-seq-2", turn: { status: { type: "completed" } } },
+    });
+    await sleep(160);
+  } finally {
+    await app.stop();
+  }
+
+  // If handlers ran concurrently we'd see start:1, start:2, ... interleaved.
+  assert.deepEqual(order, ["start:turn-seq-1", "end:turn-seq-1", "start:turn-seq-2", "end:turn-seq-2"]);
+});
+
+test("daemon writes the chat-history file with owner-only permissions", async () => {
+  const { app, runtime } = await setupDaemonHarness();
+  runtime.emit("notification", {
+    method: "turn/completed",
+    params: { threadId: "thread-1", turnId: "turn-perm-1", turn: { status: { type: "completed" } } },
+  });
+  await sleep(40);
+  await app.stop();
+
+  assert.equal(fs.existsSync(app.chatHistoryPath), true);
+  if (process.platform !== "win32") {
+    const mode = fs.statSync(app.chatHistoryPath).mode & 0o777;
+    assert.equal(mode, 0o600);
+  }
 });

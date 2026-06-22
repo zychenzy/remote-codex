@@ -243,61 +243,55 @@ test("autopilot sessions persist across writes", () => {
   assert.equal(session.lastAction.type, "continue");
 });
 
-test("appendAudit writes through buffered async flush", async () => {
+test("appendAudit writes synchronously and is immediately readable", async () => {
   const dir = tempDir();
   const store = new StateStore({ baseDir: dir });
 
   store.appendAudit({ type: "daemon_started", pid: 123 });
   store.appendAudit({ type: "daemon_stopped", pid: 123 });
-  await store.flush();
 
+  // No flush needed: appends land on disk synchronously.
   const audit = store.readAudit(10);
   assert.equal(audit.length >= 2, true);
   assert.equal(audit[audit.length - 2].type, "daemon_started");
   assert.equal(audit[audit.length - 1].type, "daemon_stopped");
-});
 
-test("readAudit includes buffered entries before flush", () => {
-  const dir = tempDir();
-  const store = new StateStore({ baseDir: dir });
-
-  store.appendAudit({ type: "event_one" });
-  store.appendAudit({ type: "event_two" });
-
-  const audit = store.readAudit(10);
-  assert.equal(audit.length >= 2, true);
-  assert.equal(audit[audit.length - 2].type, "event_one");
-  assert.equal(audit[audit.length - 1].type, "event_two");
-});
-
-test("readAudit de-duplicates records with the same auditId", () => {
-  const dir = tempDir();
-  const store = new StateStore({ baseDir: dir });
-
-  store.appendAudit({ type: "dedupe_event" });
-  const line = String(store.auditBuffer[0] || "");
-  fs.appendFileSync(store.auditPath, `${line}\n`, { encoding: "utf8" });
-  store.auditInFlight.push([line]);
-
-  const audit = store.readAudit(10).filter((entry) => entry.type === "dedupe_event");
-  assert.equal(audit.length, 1);
-});
-
-test("appendAudit requeues failed async writes and retries later", async () => {
-  const dir = tempDir();
-  const store = new StateStore({ baseDir: dir });
-  const originalAuditPath = store.auditPath;
-
-  store.auditPath = store.dataDir;
-  store.appendAudit({ type: "retry_event" });
-  await new Promise((resolve) => setTimeout(resolve, 350));
-
-  store.auditPath = originalAuditPath;
-  await new Promise((resolve) => setTimeout(resolve, 400));
+  // flush() remains a callable no-op (daemon-app.js awaits it).
   await store.flush();
+});
 
-  const audit = store.readAudit(20).filter((entry) => entry.type === "retry_event");
+test("appendAudit survives a process restart by reading the file", () => {
+  const dir = tempDir();
+  const store1 = new StateStore({ baseDir: dir });
+  store1.appendAudit({ type: "event_one" });
+  store1.appendAudit({ type: "event_two" });
+
+  const store2 = new StateStore({ baseDir: dir });
+  const audit = store2.readAudit(10);
+  assert.equal(audit.length, 2);
+  assert.equal(audit[0].type, "event_one");
+  assert.equal(audit[1].type, "event_two");
+});
+
+test("appendAudit rotates audit.jsonl by size and keeps generations", () => {
+  const dir = tempDir();
+  const store = new StateStore({ baseDir: dir });
+
+  // Prime an oversized current log so the next append triggers rotation.
+  fs.writeFileSync(store.auditPath, `${"x".repeat(60 * 1024 * 1024)}\n`, { encoding: "utf8" });
+  store.appendAudit({ type: "after_rotate" });
+
+  assert.equal(fs.existsSync(`${store.auditPath}.1`), true);
+  // The fresh log holds only the post-rotation event.
+  const audit = store.readAudit(10);
   assert.equal(audit.length, 1);
+  assert.equal(audit[0].type, "after_rotate");
+
+  // Rotate a second time: .1 shifts to .2, current becomes .1.
+  fs.appendFileSync(store.auditPath, `${"y".repeat(60 * 1024 * 1024)}\n`, { encoding: "utf8" });
+  store.appendAudit({ type: "after_rotate_again" });
+  assert.equal(fs.existsSync(`${store.auditPath}.1`), true);
+  assert.equal(fs.existsSync(`${store.auditPath}.2`), true);
 });
 
 test("markDeliveryOnce persists dedupe keys across store reload", () => {
@@ -322,4 +316,162 @@ test("channel cursors persist across store reload", () => {
 
   const store3 = new StateStore({ baseDir: dir });
   assert.equal(store3.getChannelCursor("discord", "chat-1"), "11");
+});
+
+test("readConfig normalizes for use without writing the file back", () => {
+  const dir = tempDir();
+  const store = new StateStore({ baseDir: dir });
+
+  // No config file on disk yet.
+  assert.equal(fs.existsSync(store.configPath), false);
+  const config = store.readConfig();
+  assert.equal(config.defaults.approvalMode, "on-request");
+
+  // H5-config: reading must not create or rewrite the operator-owned file.
+  assert.equal(fs.existsSync(store.configPath), false);
+});
+
+test("readConfig does not clobber an operator-edited config with extra keys", () => {
+  const dir = tempDir();
+  const store = new StateStore({ baseDir: dir });
+
+  // Write a config that carries an operator key the normalizer does not model.
+  store.writeConfig({ defaults: { approvalMode: "never" }, operatorNote: "do-not-touch" });
+  const before = fs.readFileSync(store.configPath, "utf8");
+
+  store.readConfig();
+
+  // The read had no side effects: the file is byte-identical.
+  assert.equal(fs.readFileSync(store.configPath, "utf8"), before);
+});
+
+test("getBindings normalizes for use without writing the file back", () => {
+  const dir = tempDir();
+  const store = new StateStore({ baseDir: dir });
+
+  // Seed a raw binding with a legacy field that normalization strips.
+  fs.writeFileSync(
+    store.bindingsPath,
+    JSON.stringify({ "discord:x": { channel: "discord", chatId: "x", policyProfile: { desktopSyncEnabled: true } } }),
+    "utf8"
+  );
+  const before = fs.readFileSync(store.bindingsPath, "utf8");
+
+  const bindings = store.getBindings();
+  assert.equal(Object.prototype.hasOwnProperty.call(bindings["discord:x"].policyProfile, "desktopSyncEnabled"), false);
+
+  // H5-config: the getter must not rewrite disk.
+  assert.equal(fs.readFileSync(store.bindingsPath, "utf8"), before);
+});
+
+test("getAutopilotSessions normalizes for use without writing the file back", () => {
+  const dir = tempDir();
+  const store = new StateStore({ baseDir: dir });
+
+  fs.writeFileSync(
+    store.autopilotSessionsPath,
+    JSON.stringify({ "discord:1": { status: "running_turn", automaticTurns: 2 } }),
+    "utf8"
+  );
+  const before = fs.readFileSync(store.autopilotSessionsPath, "utf8");
+
+  const sessions = store.getAutopilotSessions();
+  assert.equal(sessions["discord:1"].status, "running_turn");
+  assert.equal(fs.readFileSync(store.autopilotSessionsPath, "utf8"), before);
+});
+
+test("migrate rewrites on-disk files into normalized shape exactly once", () => {
+  const dir = tempDir();
+  const store = new StateStore({ baseDir: dir });
+
+  fs.writeFileSync(
+    store.bindingsPath,
+    JSON.stringify({ "discord:m": { channel: "discord", chatId: "m", policyProfile: { desktopSyncEnabled: true } } }),
+    "utf8"
+  );
+
+  store.migrate();
+
+  // After an explicit migrate, the legacy field is gone on disk.
+  const onDisk = JSON.parse(fs.readFileSync(store.bindingsPath, "utf8"));
+  assert.equal(Object.prototype.hasOwnProperty.call(onDisk["discord:m"].policyProfile, "desktopSyncEnabled"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(onDisk["discord:m"].policyProfile, "autopilot"), true);
+
+  // Running migrate again on already-normalized data is a no-op (idempotent).
+  const before = fs.readFileSync(store.bindingsPath, "utf8");
+  store.migrate();
+  assert.equal(fs.readFileSync(store.bindingsPath, "utf8"), before);
+});
+
+test("binding normalization preserves a string workspaceRoot", () => {
+  const dir = tempDir();
+  const store = new StateStore({ baseDir: dir });
+
+  store.upsertBinding({
+    channel: "discord",
+    chatId: "ws",
+    workspaceRoot: "/srv/project",
+  });
+
+  const binding = store.getBinding("discord", "ws");
+  assert.equal(binding.workspaceRoot, "/srv/project");
+
+  // Survives a reload (read path preserves it too).
+  const store2 = new StateStore({ baseDir: dir });
+  assert.equal(store2.getBinding("discord", "ws").workspaceRoot, "/srv/project");
+
+  // Partial update without workspaceRoot keeps the existing value.
+  store2.upsertBinding({ channel: "discord", chatId: "ws", policyProfile: { approvalMode: "never" } });
+  assert.equal(store2.getBinding("discord", "ws").workspaceRoot, "/srv/project");
+});
+
+test("binding normalization drops a non-string or empty workspaceRoot", () => {
+  const dir = tempDir();
+  const store = new StateStore({ baseDir: dir });
+
+  fs.writeFileSync(
+    store.bindingsPath,
+    JSON.stringify({
+      "discord:a": { channel: "discord", chatId: "a", workspaceRoot: 123 },
+      "discord:b": { channel: "discord", chatId: "b", workspaceRoot: "   " },
+    }),
+    "utf8"
+  );
+
+  const bindings = store.getBindings();
+  assert.equal(Object.prototype.hasOwnProperty.call(bindings["discord:a"], "workspaceRoot"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(bindings["discord:b"], "workspaceRoot"), false);
+});
+
+test("config normalization accepts optional defaults.workspaceRoot", () => {
+  const dir = tempDir();
+  const store = new StateStore({ baseDir: dir });
+
+  store.writeConfig({ defaults: { workspaceRoot: "/srv/root" } });
+  const config = store.readConfig();
+  assert.equal(config.defaults.workspaceRoot, "/srv/root");
+
+  // Absent when not provided.
+  const dir2 = tempDir();
+  const store2 = new StateStore({ baseDir: dir2 });
+  assert.equal(Object.prototype.hasOwnProperty.call(store2.readConfig().defaults, "workspaceRoot"), false);
+});
+
+test("thread plan-mode normalization persists across reload", () => {
+  const dir = tempDir();
+  const store = new StateStore({ baseDir: dir });
+
+  store.upsertBinding({
+    channel: "discord",
+    chatId: "plan",
+    policyProfile: {
+      threadPlanModeByThreadId: { "thread-plan": true, "thread-off": false },
+    },
+  });
+
+  const store2 = new StateStore({ baseDir: dir });
+  const binding = store2.getBinding("discord", "plan");
+  assert.equal(binding.policyProfile.threadPlanModeByThreadId["thread-plan"], true);
+  // Falsey entries are dropped by normalization.
+  assert.equal(Object.prototype.hasOwnProperty.call(binding.policyProfile.threadPlanModeByThreadId, "thread-off"), false);
 });

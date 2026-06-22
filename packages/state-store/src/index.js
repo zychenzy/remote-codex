@@ -1,13 +1,14 @@
 import fs from "node:fs";
-import fsp from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 
-const AUDIT_FLUSH_INTERVAL_MS = 250;
 const DELIVERY_DEDUPE_TTL_MS = 24 * 60 * 60 * 1000;
 const DELIVERY_DEDUPE_MAX_ENTRIES = 5_000;
 const CHANNEL_CURSOR_MAX_ENTRIES = 5_000;
+// ponytail: sync append + size rotation, drop async staging. 50 MB ceiling, keep 2 old generations.
+const AUDIT_MAX_BYTES = 50 * 1024 * 1024;
+const AUDIT_ROTATE_GENERATIONS = 2;
 const AUTOPILOT_DEFAULT_COMMAND_ALLOW_PREFIXES = [
   "pwd",
   "ls",
@@ -22,7 +23,7 @@ function nowIso() {
 }
 
 function ensureDir(dir) {
-  fs.mkdirSync(dir, { recursive: true });
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 }
 
 function isWritableDir(dir) {
@@ -30,7 +31,9 @@ function isWritableDir(dir) {
     ensureDir(dir);
     fs.accessSync(dir, fs.constants.W_OK);
     return true;
-  } catch {
+  } catch (error) {
+    // L1: do not silently relocate state; surface why the preferred dir was rejected.
+    console.warn(`[state-store] directory not writable, falling back: ${dir}: ${error.message}`);
     return false;
   }
 }
@@ -45,9 +48,29 @@ function readJson(filePath, fallback) {
 }
 
 function writeJson(filePath, value, mode) {
-  const temp = `${filePath}.tmp`;
-  fs.writeFileSync(temp, JSON.stringify(value, null, 2), { mode });
+  // L2: unique temp suffix so concurrent processes never collide on the staging file.
+  const temp = `${filePath}.tmp.${process.pid}.${randomUUID()}`;
+  // H3-durability: fsync the data before the rename so a crash cannot land the
+  // rename ahead of the bytes (which would leave a truncated/empty file).
+  const fd = fs.openSync(temp, "w", mode);
+  try {
+    fs.writeFileSync(fd, JSON.stringify(value, null, 2));
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
   fs.renameSync(temp, filePath);
+  // Best-effort directory fsync so the rename itself is durable.
+  try {
+    const dirFd = fs.openSync(path.dirname(filePath), "r");
+    try {
+      fs.fsyncSync(dirFd);
+    } finally {
+      fs.closeSync(dirFd);
+    }
+  } catch {
+    // Directory fsync is unsupported on some platforms; ignore.
+  }
 }
 
 function keyOf(channel, chatId) {
@@ -99,16 +122,8 @@ function normalizeCursorMap(raw = {}, { maxEntries = CHANNEL_CURSOR_MAX_ENTRIES 
   return Object.fromEntries(entries);
 }
 
-function normalizeThreadAutoApproveByThreadId(raw = {}, { maxEntries = 500 } = {}) {
-  const source = raw && typeof raw === "object" ? raw : {};
-  const entries = Object.entries(source)
-    .map(([threadId, enabled]) => [String(threadId || "").trim(), Boolean(enabled)])
-    .filter(([threadId, enabled]) => threadId && enabled)
-    .slice(-maxEntries);
-  return Object.fromEntries(entries);
-}
-
-function normalizeThreadPlanModeByThreadId(raw = {}, { maxEntries = 500 } = {}) {
+// S2: thread auto-approve and thread plan-mode share byte-identical normalization.
+function normalizeBooleanByThreadId(raw = {}, { maxEntries = 500 } = {}) {
   const source = raw && typeof raw === "object" ? raw : {};
   const entries = Object.entries(source)
     .map(([threadId, enabled]) => [String(threadId || "").trim(), Boolean(enabled)])
@@ -135,11 +150,6 @@ function normalizeAutopilotMode(value) {
   return ["conservative", "aggressive"].includes(normalized) ? normalized : "conservative";
 }
 
-function normalizeAutopilotToolInputStrategy(value) {
-  const normalized = String(value || "").trim().toLowerCase();
-  return ["recommended_only"].includes(normalized) ? normalized : "recommended_only";
-}
-
 function normalizeAutopilotPolicy(raw = {}) {
   const source = raw && typeof raw === "object" ? raw : {};
   return {
@@ -154,7 +164,8 @@ function normalizeAutopilotPolicy(raw = {}) {
         : AUTOPILOT_DEFAULT_COMMAND_ALLOW_PREFIXES
     ),
     allowedWriteRoots: normalizeStringList(source.allowedWriteRoots || []),
-    toolInputStrategy: normalizeAutopilotToolInputStrategy(source.toolInputStrategy),
+    // ponytail: single legal value today; field gates a future tool-input enum.
+    toolInputStrategy: "recommended_only",
   };
 }
 
@@ -186,6 +197,80 @@ function normalizeAutopilotSessions(raw = {}) {
   return normalized;
 }
 
+function normalizeConfig(raw = {}) {
+  const defaults = {
+    workingDir: raw?.defaults?.workingDir || os.homedir(),
+    approvalMode: raw?.defaults?.approvalMode || "on-request",
+    output: {
+      resumeHistoryTurns: normalizeInt(raw?.defaults?.output?.resumeHistoryTurns, 3, 1, 100),
+      chatHistoryFlushIntervalMs: normalizeInt(raw?.defaults?.output?.chatHistoryFlushIntervalMs, 250, 10, 10_000),
+      turnOutputMinChunkChars: normalizeInt(raw?.defaults?.output?.turnOutputMinChunkChars, 160, 40, 8_000),
+      turnOutputSoftChunkChars: normalizeInt(raw?.defaults?.output?.turnOutputSoftChunkChars, 280, 40, 8_000),
+      liveSectionMaxLen: normalizeInt(raw?.defaults?.output?.liveSectionMaxLen, 1400, 200, 1900),
+      liveSectionDelayMs: normalizeInt(raw?.defaults?.output?.liveSectionDelayMs, 250, 0, 10_000),
+      discord: {
+        replyToUser: Boolean(raw?.defaults?.output?.discord?.replyToUser ?? true),
+        useLiveEdits: Boolean(raw?.defaults?.output?.discord?.useLiveEdits ?? true),
+        statusEditIntervalMs: normalizeInt(raw?.defaults?.output?.discord?.statusEditIntervalMs, 500, 50, 10_000),
+        statusMessageMaxLen: normalizeInt(raw?.defaults?.output?.discord?.statusMessageMaxLen, 1600, 200, 1900),
+        toolProgressMode: normalizeChoice(raw?.defaults?.output?.discord?.toolProgressMode, ["off", "compact", "verbose"], "compact"),
+        toolOutputTailLines: normalizeInt(raw?.defaults?.output?.discord?.toolOutputTailLines, 8, 1, 50),
+        finalMessageMaxLen: normalizeInt(raw?.defaults?.output?.discord?.finalMessageMaxLen, 1600, 200, 1900),
+        finalMessageDelayMs: normalizeInt(raw?.defaults?.output?.discord?.finalMessageDelayMs, 350, 0, 10_000),
+      },
+    },
+  };
+  // CONTRACT workspace-root: accept an optional defaults.workspaceRoot (string) when present.
+  if (typeof raw?.defaults?.workspaceRoot === "string" && raw.defaults.workspaceRoot.trim()) {
+    defaults.workspaceRoot = raw.defaults.workspaceRoot;
+  }
+  return {
+    runtime: {
+      appServer: {
+        command: raw?.runtime?.appServer?.command || "codex",
+        args: raw?.runtime?.appServer?.args || ["app-server", "--listen", "stdio://"],
+      },
+    },
+    defaults,
+    channels: {
+      discord: {
+        enabled: Boolean(raw?.channels?.discord?.enabled),
+        botToken: raw?.channels?.discord?.botToken || "",
+        allowlist: raw?.channels?.discord?.allowlist || [],
+        allowedChannels: raw?.channels?.discord?.allowedChannels || [],
+      },
+    },
+  };
+}
+
+function normalizeBinding(binding) {
+  const policy = { ...(binding?.policyProfile || {}) };
+  // Drop a long-removed field if it lingers on disk.
+  delete policy.desktopSyncEnabled;
+  policy.threadAutoApproveByThreadId = normalizeBooleanByThreadId(policy.threadAutoApproveByThreadId);
+  policy.threadPlanModeByThreadId = normalizeBooleanByThreadId(policy.threadPlanModeByThreadId);
+  policy.autopilot = normalizeAutopilotPolicy(policy.autopilot);
+  const normalized = {
+    ...binding,
+    policyProfile: policy,
+  };
+  // CONTRACT workspace-root: preserve a string workspaceRoot if present, drop otherwise.
+  if (typeof binding?.workspaceRoot === "string" && binding.workspaceRoot.trim()) {
+    normalized.workspaceRoot = binding.workspaceRoot;
+  } else {
+    delete normalized.workspaceRoot;
+  }
+  return normalized;
+}
+
+function normalizeBindings(raw = {}) {
+  const normalized = {};
+  for (const [key, binding] of Object.entries(raw || {})) {
+    normalized[key] = normalizeBinding(binding);
+  }
+  return normalized;
+}
+
 export class StateStore {
   constructor({ baseDir } = {}) {
     const preferred = baseDir || path.join(os.homedir(), ".im-codex-tool");
@@ -203,10 +288,6 @@ export class StateStore {
     this.auditPath = path.join(this.dataDir, "audit.jsonl");
     this.deliveryDedupePath = path.join(this.dataDir, "delivery-dedupe.json");
     this.channelCursorPath = path.join(this.dataDir, "channel-cursors.json");
-    this.auditBuffer = [];
-    this.auditInFlight = [];
-    this.auditFlushTimer = null;
-    this.auditFlushChain = Promise.resolve();
     this.deliveryDedupeCache = null;
     this.channelCursorCache = null;
 
@@ -216,50 +297,31 @@ export class StateStore {
     ensureDir(this.logsDir);
   }
 
-  readConfig() {
-    const raw = readJson(this.configPath, {});
-    const normalized = {
-      runtime: {
-        appServer: {
-          command: raw?.runtime?.appServer?.command || "codex",
-          args: raw?.runtime?.appServer?.args || ["app-server", "--listen", "stdio://"],
-        },
-      },
-      defaults: {
-        workingDir: raw?.defaults?.workingDir || os.homedir(),
-        approvalMode: raw?.defaults?.approvalMode || "on-request",
-        output: {
-          resumeHistoryTurns: normalizeInt(raw?.defaults?.output?.resumeHistoryTurns, 3, 1, 100),
-          chatHistoryFlushIntervalMs: normalizeInt(raw?.defaults?.output?.chatHistoryFlushIntervalMs, 250, 10, 10_000),
-          turnOutputMinChunkChars: normalizeInt(raw?.defaults?.output?.turnOutputMinChunkChars, 160, 40, 8_000),
-          turnOutputSoftChunkChars: normalizeInt(raw?.defaults?.output?.turnOutputSoftChunkChars, 280, 40, 8_000),
-          liveSectionMaxLen: normalizeInt(raw?.defaults?.output?.liveSectionMaxLen, 1400, 200, 1900),
-          liveSectionDelayMs: normalizeInt(raw?.defaults?.output?.liveSectionDelayMs, 250, 0, 10_000),
-          discord: {
-            replyToUser: Boolean(raw?.defaults?.output?.discord?.replyToUser ?? true),
-            useLiveEdits: Boolean(raw?.defaults?.output?.discord?.useLiveEdits ?? true),
-            statusEditIntervalMs: normalizeInt(raw?.defaults?.output?.discord?.statusEditIntervalMs, 500, 50, 10_000),
-            statusMessageMaxLen: normalizeInt(raw?.defaults?.output?.discord?.statusMessageMaxLen, 1600, 200, 1900),
-            toolProgressMode: normalizeChoice(raw?.defaults?.output?.discord?.toolProgressMode, ["off", "compact", "verbose"], "compact"),
-            toolOutputTailLines: normalizeInt(raw?.defaults?.output?.discord?.toolOutputTailLines, 8, 1, 50),
-            finalMessageMaxLen: normalizeInt(raw?.defaults?.output?.discord?.finalMessageMaxLen, 1600, 200, 1900),
-            finalMessageDelayMs: normalizeInt(raw?.defaults?.output?.discord?.finalMessageDelayMs, 350, 0, 10_000),
-          },
-        },
-      },
-      channels: {
-        discord: {
-          enabled: Boolean(raw?.channels?.discord?.enabled),
-          botToken: raw?.channels?.discord?.botToken || "",
-          allowlist: raw?.channels?.discord?.allowlist || [],
-          allowedChannels: raw?.channels?.discord?.allowedChannels || [],
-        },
-      },
-    };
-    if (JSON.stringify(raw || {}) !== JSON.stringify(normalized)) {
-      this.writeConfig(normalized);
+  // Explicit, run-once migration: rewrite on-disk files into normalized shape.
+  // Reads stay pure (no write side effects); call this at init to migrate.
+  migrate() {
+    const rawConfig = readJson(this.configPath, {});
+    const normalizedConfig = normalizeConfig(rawConfig);
+    if (JSON.stringify(rawConfig || {}) !== JSON.stringify(normalizedConfig)) {
+      this.writeConfig(normalizedConfig);
     }
-    return normalized;
+
+    const rawBindings = readJson(this.bindingsPath, {});
+    const normalizedBindings = normalizeBindings(rawBindings);
+    if (JSON.stringify(rawBindings || {}) !== JSON.stringify(normalizedBindings)) {
+      writeJson(this.bindingsPath, normalizedBindings, 0o600);
+    }
+
+    const rawAutopilot = readJson(this.autopilotSessionsPath, {});
+    const normalizedAutopilot = normalizeAutopilotSessions(rawAutopilot);
+    if (JSON.stringify(rawAutopilot || {}) !== JSON.stringify(normalizedAutopilot)) {
+      writeJson(this.autopilotSessionsPath, normalizedAutopilot, 0o600);
+    }
+  }
+
+  readConfig() {
+    // H5-config: normalize for use only; never write back from a read.
+    return normalizeConfig(readJson(this.configPath, {}));
   }
 
   writeConfig(config) {
@@ -272,42 +334,8 @@ export class StateStore {
   }
 
   getBindings() {
-    const raw = readJson(this.bindingsPath, {});
-    let changed = false;
-    const normalized = {};
-
-    for (const [key, binding] of Object.entries(raw || {})) {
-      const policy = { ...(binding?.policyProfile || {}) };
-      if (Object.prototype.hasOwnProperty.call(policy, "desktopSyncEnabled")) {
-        delete policy.desktopSyncEnabled;
-        changed = true;
-      }
-      const normalizedThreadAutoApprove = normalizeThreadAutoApproveByThreadId(policy.threadAutoApproveByThreadId);
-      if (JSON.stringify(policy.threadAutoApproveByThreadId || {}) !== JSON.stringify(normalizedThreadAutoApprove)) {
-        policy.threadAutoApproveByThreadId = normalizedThreadAutoApprove;
-        changed = true;
-      }
-      const normalizedThreadPlanMode = normalizeThreadPlanModeByThreadId(policy.threadPlanModeByThreadId);
-      if (JSON.stringify(policy.threadPlanModeByThreadId || {}) !== JSON.stringify(normalizedThreadPlanMode)) {
-        policy.threadPlanModeByThreadId = normalizedThreadPlanMode;
-        changed = true;
-      }
-      const normalizedAutopilot = normalizeAutopilotPolicy(policy.autopilot);
-      if (JSON.stringify(policy.autopilot || {}) !== JSON.stringify(normalizedAutopilot)) {
-        policy.autopilot = normalizedAutopilot;
-        changed = true;
-      }
-      normalized[key] = {
-        ...binding,
-        policyProfile: policy,
-      };
-    }
-
-    if (changed) {
-      writeJson(this.bindingsPath, normalized, 0o600);
-    }
-
-    return normalized;
+    // H5-config: normalize for use only; never write back from a read.
+    return normalizeBindings(readJson(this.bindingsPath, {}));
   }
 
   listBindings() {
@@ -356,12 +384,12 @@ export class StateStore {
       autopilot: hasPolicyField("autopilot")
         ? normalizeAutopilotPolicy(incomingPolicy.autopilot)
         : normalizeAutopilotPolicy(existing.policyProfile?.autopilot),
-      threadAutoApproveByThreadId: normalizeThreadAutoApproveByThreadId(
+      threadAutoApproveByThreadId: normalizeBooleanByThreadId(
         hasPolicyField("threadAutoApproveByThreadId")
           ? (incomingPolicy.threadAutoApproveByThreadId ?? {})
           : (existing.policyProfile?.threadAutoApproveByThreadId ?? {})
       ),
-      threadPlanModeByThreadId: normalizeThreadPlanModeByThreadId(
+      threadPlanModeByThreadId: normalizeBooleanByThreadId(
         hasPolicyField("threadPlanModeByThreadId")
           ? (incomingPolicy.threadPlanModeByThreadId ?? {})
           : (existing.policyProfile?.threadPlanModeByThreadId ?? {})
@@ -379,6 +407,14 @@ export class StateStore {
       policyProfile,
       updatedAt: nowIso(),
     };
+
+    // CONTRACT workspace-root: preserve a string workspaceRoot across upserts.
+    const incomingWorkspaceRoot = Object.prototype.hasOwnProperty.call(binding, "workspaceRoot")
+      ? binding.workspaceRoot
+      : existing.workspaceRoot;
+    if (typeof incomingWorkspaceRoot === "string" && incomingWorkspaceRoot.trim()) {
+      next.workspaceRoot = incomingWorkspaceRoot;
+    }
 
     bindings[key] = next;
     writeJson(this.bindingsPath, bindings, 0o600);
@@ -457,12 +493,8 @@ export class StateStore {
   }
 
   getAutopilotSessions() {
-    const raw = readJson(this.autopilotSessionsPath, {});
-    const normalized = normalizeAutopilotSessions(raw);
-    if (JSON.stringify(raw || {}) !== JSON.stringify(normalized)) {
-      writeJson(this.autopilotSessionsPath, normalized, 0o600);
-    }
-    return normalized;
+    // H5-config: normalize for use only; never write back from a read.
+    return normalizeAutopilotSessions(readJson(this.autopilotSessionsPath, {}));
   }
 
   getAutopilotSession(bindingKey) {
@@ -500,46 +532,34 @@ export class StateStore {
   }
 
   appendAudit(event) {
+    // S1 + H7: synchronous append is more durable than the old buffered async
+    // staging, and far simpler. Rotate by size before the line lands.
     const line = JSON.stringify({
       auditId: randomUUID(),
       timestamp: nowIso(),
       ...event,
     });
-    this.auditBuffer.push(line);
-    this.#scheduleAuditFlush();
+    this.#rotateAuditIfNeeded();
+    try {
+      fs.appendFileSync(this.auditPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
+    } catch (error) {
+      console.warn(`[state-store] failed to append audit event: ${error.message}`);
+    }
   }
 
   readAudit(limit = 100) {
-    const pendingLines = [
-      ...this.auditInFlight.flatMap((batch) => batch),
-      ...this.auditBuffer,
-    ];
+    // Single source of truth now lives on disk, so no dedupe/merge is needed.
     try {
       const content = fs.readFileSync(this.auditPath, "utf8");
-      const persistedLines = content.trim().split("\n").filter(Boolean);
-      const mergedLines = [...persistedLines, ...pendingLines];
-      const parsed = [];
-      const seenAuditIds = new Set();
-      for (const line of mergedLines) {
-        const record = parseAuditLine(line);
-        if (!record) {
-          continue;
-        }
-        const id = record.auditId ? String(record.auditId) : "";
-        if (id && seenAuditIds.has(id)) {
-          continue;
-        }
-        if (id) {
-          seenAuditIds.add(id);
-        }
-        parsed.push(record);
-      }
-      return parsed.slice(-limit);
-    } catch {
-      return pendingLines
+      return content
+        .trim()
+        .split("\n")
+        .filter(Boolean)
         .map((line) => parseAuditLine(line))
         .filter(Boolean)
         .slice(-limit);
+    } catch {
+      return [];
     }
   }
 
@@ -602,62 +622,32 @@ export class StateStore {
     }
   }
 
-  async flush() {
-    await this.#flushAuditBuffer({ force: true });
-  }
+  // ponytail: kept as a no-op stub; appends are synchronous so there is nothing
+  // to drain. daemon-app.js still awaits store.flush().
+  async flush() {}
 
-  #scheduleAuditFlush() {
-    if (this.auditFlushTimer) {
-      return;
-    }
-    this.auditFlushTimer = setTimeout(() => {
-      this.auditFlushTimer = null;
-      this.#flushAuditBuffer().catch((error) => {
-        console.warn(`[state-store] failed to flush audit buffer: ${error.message}`);
-      });
-    }, AUDIT_FLUSH_INTERVAL_MS);
-  }
-
-  async #flushAuditBuffer({ force = false } = {}) {
-    if (this.auditFlushTimer && force) {
-      clearTimeout(this.auditFlushTimer);
-      this.auditFlushTimer = null;
-    }
-    if (!this.auditBuffer.length) {
-      if (force) {
-        await this.auditFlushChain.catch(() => {});
-      }
-      return;
-    }
-    const batch = this.auditBuffer.splice(0, this.auditBuffer.length);
-    const payload = `${batch.join("\n")}\n`;
-    this.auditInFlight.push(batch);
-
-    const writeTask = this.auditFlushChain
-      .catch(() => {})
-      .then(() => fsp.appendFile(this.auditPath, payload, { encoding: "utf8", mode: 0o600 }));
-    this.auditFlushChain = writeTask.catch(() => {});
-
+  #rotateAuditIfNeeded() {
+    let size = 0;
     try {
-      await writeTask;
-    } catch (error) {
-      if (force) {
-        try {
-          fs.appendFileSync(this.auditPath, payload, { encoding: "utf8", mode: 0o600 });
-          return;
-        } catch (syncError) {
-          console.warn(`[state-store] failed to force-flush audit buffer: ${syncError.message}`);
+      size = fs.statSync(this.auditPath).size;
+    } catch {
+      return; // No file yet: nothing to rotate.
+    }
+    if (size < AUDIT_MAX_BYTES) {
+      return;
+    }
+    try {
+      // Shift generations: audit.jsonl.1 -> .2, then audit.jsonl -> .1.
+      for (let gen = AUDIT_ROTATE_GENERATIONS - 1; gen >= 1; gen -= 1) {
+        const from = `${this.auditPath}.${gen}`;
+        const to = `${this.auditPath}.${gen + 1}`;
+        if (fs.existsSync(from)) {
+          fs.renameSync(from, to);
         }
-      } else {
-        console.warn(`[state-store] failed to flush audit buffer: ${error.message}`);
       }
-      this.auditBuffer = [...batch, ...this.auditBuffer];
-      this.#scheduleAuditFlush();
-    } finally {
-      const idx = this.auditInFlight.indexOf(batch);
-      if (idx >= 0) {
-        this.auditInFlight.splice(idx, 1);
-      }
+      fs.renameSync(this.auditPath, `${this.auditPath}.1`);
+    } catch (error) {
+      console.warn(`[state-store] failed to rotate audit log: ${error.message}`);
     }
   }
 }

@@ -111,3 +111,48 @@ test("reconcileRuntimeState refreshes binding cwd from runtime thread metadata",
   assert.equal(upserts.length, 1);
   assert.equal(upserts[0].workingDir, "/new-cwd");
 });
+
+test("reconcileRuntimeState does not mark healthy on a non-404 resume failure", async () => {
+  const binding = {
+    channel: "discord",
+    chatId: "55",
+    threadId: "thread-resumable",
+    workingDir: "/old-cwd",
+    policyProfile: {},
+  };
+  const upserts = [];
+  const store = {
+    listBindings: () => [binding],
+    upsertBinding: (next) => {
+      upserts.push(next);
+      return next;
+    },
+  };
+
+  const runtime = {
+    listLoadedThreads: async () => ({ data: [] }),
+    readThread: async () => ({ thread: { cwd: "/new-cwd" } }),
+  };
+
+  const result = await reconcileRuntimeState({
+    store,
+    runtime,
+    logger: makeLogger(),
+    threadToBinding: new Map(),
+    turnToBinding: new Map(),
+    activeTurnByBinding: new Map(),
+    bindingKeyFn: (channel, chatId) => `${channel}:${chatId}`,
+    isThreadNotFoundError: (error) => String(error?.message || "").includes("thread not found"),
+    extractThreadCwd: (thread) => String(thread?.cwd || ""),
+    // Transient (non-404) resume failure: binding is not proven healthy.
+    resumeThread: async () => {
+      throw new Error("runtime busy");
+    },
+  });
+
+  assert.equal(result.verifiedThreads, 0);
+  assert.equal(result.refreshedCwd, 0);
+  assert.equal(result.clearedBindings, 0);
+  // Binding left untouched (no cwd refresh upsert) for a later retry.
+  assert.equal(upserts.length, 0);
+});
