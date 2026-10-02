@@ -4,7 +4,7 @@ IM-first remote control daemon for Codex, backed by `codex app-server`.
 
 This project lets you run Codex on your host machine and control it from Discord, while keeping operations local and policy-gated.
 
-Allowlisted Discord users can also operate the bot via direct message; the daemon resolves and polls their DM channels at startup. DM-only operation is supported.
+Allowlisted Discord users can also operate the bot via direct message through Discord Gateway events. DM-only operation is supported.
 
 ## Highlights
 
@@ -157,12 +157,12 @@ launchctl bootout gui/$(id -u)/local.reco
 
 ## DM-Only Operation
 
-If you no longer want server-channel polling:
+If you no longer want server-channel messages:
 
 - remove old server channel IDs from Discord config
 - keep your Discord allowlist user IDs
 - bind the DM chat instead of a server text channel
-- restart the daemon so the active poll set matches config
+- restart the daemon so the active channel and user allowlists match config
 
 DM-only setups still use the same thread, approval, and audit flow as server-channel bindings.
 

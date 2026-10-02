@@ -178,6 +178,7 @@ export class DiscordAdapter extends BaseAdapter {
     allowedChannels = [],
     dmUserIds = [],
     minSendIntervalMs = DEFAULT_MIN_SEND_INTERVAL_MS,
+    startupTimeoutMs = 30_000,
     logger = console,
     discordApi = DiscordJs,
     client = null,
@@ -189,6 +190,7 @@ export class DiscordAdapter extends BaseAdapter {
     this.allowedUserIds = Array.isArray(dmUserIds) ? dmUserIds.map((value) => String(value || "").trim()).filter(Boolean) : [];
     // ponytail: rely on discord.js resume + dedupe, no manual cursor.
     this.minSendIntervalMs = minSendIntervalMs;
+    this.startupTimeoutMs = startupTimeoutMs;
     this.discordApi = discordApi;
     this.authorizeInteraction = authorizeInteraction;
     this.client = client || this.#createClient();
@@ -197,6 +199,9 @@ export class DiscordAdapter extends BaseAdapter {
     this.started = false;
     this.readyPromise = null;
     this.startPromise = null;
+    this.cancelReady = null;
+    this.startGeneration = 0;
+    this.seenSlashInteractions = new Map();
     this.viewState = new Map();
     this.seenInboundKeys = new Map();
     this.clientHandlersInstalled = false;
@@ -269,7 +274,7 @@ export class DiscordAdapter extends BaseAdapter {
     if (dmPartial != null) {
       partials.push(dmPartial);
     }
-    return new this.discordApi.Client({ intents, partials });
+    return new this.discordApi.Client({ intents, partials, allowedMentions: { parse: [], repliedUser: false } });
   }
 
   async start() {
@@ -296,19 +301,28 @@ export class DiscordAdapter extends BaseAdapter {
   }
 
   async #startOnce() {
+    const generation = this.startGeneration;
     this.readyPromise = this.#waitForReady();
     try {
-      await this.client.login(this.token);
-      await this.readyPromise;
+      await Promise.all([Promise.resolve().then(() => this.client.login(this.token)), this.readyPromise]);
+      if (generation !== this.startGeneration) throw new Error("Discord startup canceled");
     } catch (error) {
+      this.cancelReady?.(error);
+      await this.client.destroy();
       this.logger.error(`[discord] failed to start gateway client: ${error.message}`);
       throw error;
+    } finally {
+      this.cancelReady = null;
+      this.readyPromise = null;
     }
     this.started = true;
     await this.#syncSlashCommands();
   }
 
   async stop() {
+    this.startGeneration += 1;
+    this.cancelReady?.(new Error("Discord startup canceled"));
+    await this.startPromise?.catch(() => {});
     this.started = false;
     for (const state of this.viewState.values()) {
       if (state.timer) {
@@ -336,25 +350,28 @@ export class DiscordAdapter extends BaseAdapter {
       const interaction = this.#interactionForContext(context);
       const interactionKind = String(context?.discordMeta?.kind || "");
       const isComponentInteraction = interactionKind === "button" || interactionKind === "select";
-      if (interaction && isComponentInteraction && !interaction.responded && !interaction.deferred && typeof interaction.update === "function") {
-        sent = await interaction.update({
+      if (interaction && isComponentInteraction && !interaction.replied && !interaction.responded && !interaction.deferred && typeof interaction.update === "function") {
+        const response = await interaction.update({
           content: prepared.content || undefined,
           embeds: prepared.embeds,
           components: prepared.components,
-          allowedMentions: { repliedUser: false },
+          allowedMentions: { parse: [], repliedUser: false },
+          withResponse: true,
         });
+        sent = response?.resource?.message || interaction.message;
         interaction.responded = true;
         if (context?.discordMeta) {
           context.discordMeta.responded = true;
         }
-      } else if (interaction && !interaction.responded && !interaction.deferred) {
-        sent = await interaction.reply({
+      } else if (interaction && !interaction.replied && !interaction.responded && !interaction.deferred) {
+        const response = await interaction.reply({
           content: prepared.content || undefined,
           embeds: prepared.embeds,
           components: prepared.components,
-          allowedMentions: { repliedUser: false },
-          fetchReply: true,
+          allowedMentions: { parse: [], repliedUser: false },
+          withResponse: true,
         });
+        sent = response?.resource?.message || await interaction.fetchReply();
         interaction.responded = true;
         if (context?.discordMeta) {
           context.discordMeta.responded = true;
@@ -364,7 +381,7 @@ export class DiscordAdapter extends BaseAdapter {
           content: prepared.content || undefined,
           embeds: prepared.embeds,
           components: prepared.components,
-          allowedMentions: { repliedUser: false },
+          allowedMentions: { parse: [], repliedUser: false },
         });
         if (context?.discordMeta) {
           context.discordMeta.responded = true;
@@ -407,7 +424,7 @@ export class DiscordAdapter extends BaseAdapter {
     await this.#enqueueSend(async () => {
       const channel = await this.#resolveChannel(targetChatId);
       const message = await channel.messages.fetch(resolvedMessageId);
-      edited = await message.edit({ content });
+      edited = await message.edit({ content, allowedMentions: { parse: [], repliedUser: false } });
     });
 
     return normalizeMessageRef({
@@ -467,12 +484,13 @@ export class DiscordAdapter extends BaseAdapter {
       ...(prepared.content ? { content: prepared.content } : {}),
       ...(prepared.embeds.length ? { embeds: prepared.embeds } : {}),
       ...(prepared.components.length ? { components: prepared.components } : {}),
-      allowedMentions: { repliedUser: false },
+      allowedMentions: { parse: [], repliedUser: false },
     };
     const replyToMessageId = String(payload.replyToMessageId || context.replyToMessageId || "").trim();
     if (replyToMessageId) {
       out.reply = {
         messageReference: replyToMessageId,
+        failIfNotExists: false,
       };
     }
     return out;
@@ -528,6 +546,8 @@ export class DiscordAdapter extends BaseAdapter {
       this.logger.error(`[discord] shard error: ${error?.message || error}`);
     });
     this.client.on("invalidated", () => {
+      this.started = false;
+      this.cancelReady?.(new Error("Discord gateway session invalidated"));
       this.logger.error("[discord] session invalidated; gateway connection is no longer usable");
     });
   }
@@ -544,13 +564,19 @@ export class DiscordAdapter extends BaseAdapter {
     if (typeof this.client.isReady === "function" && this.client.isReady()) {
       return Promise.resolve();
     }
-    return new Promise((resolve) => {
-      const event = typeof this.client.once === "function" ? "ready" : null;
-      if (!event) {
-        resolve();
-        return;
-      }
-      this.client.once(event, () => resolve());
+    return new Promise((resolve, reject) => {
+      const event = this.discordApi.Events?.ClientReady || "clientReady";
+      const finish = (error) => {
+        clearTimeout(timer);
+        this.client.off(event, onReady);
+        this.cancelReady = null;
+        if (error) reject(error);
+        else resolve();
+      };
+      const onReady = () => finish();
+      const timer = setTimeout(() => finish(new Error("Discord gateway readiness timed out; check the bot token, intents, and network")), this.startupTimeoutMs);
+      this.cancelReady = (error) => finish(error);
+      this.client.on(event, onReady);
     });
   }
 
@@ -880,9 +906,14 @@ export class DiscordAdapter extends BaseAdapter {
       return cached;
     }
     if (typeof this.client.channels?.fetch === "function") {
-      const fetched = await this.client.channels.fetch(id);
-      if (fetched) {
-        return fetched;
+      try {
+        const fetched = await this.client.channels.fetch(id);
+        if (fetched) return fetched;
+      } catch (error) {
+        if ([10003, 50001, 50013].includes(Number(error.code))) {
+          throw new Error(`Discord channel ${id} is deleted or inaccessible. Restore bot access or rebind to an accessible channel.`, { cause: error });
+        }
+        throw error;
       }
     }
     throw new Error(`discord channel not found: ${id}`);
@@ -917,9 +948,22 @@ export class DiscordAdapter extends BaseAdapter {
       if (!context) {
         return;
       }
+      // Claim the interaction before awaiting authorization/acknowledgement.
+      // Gateway retries must not issue two callbacks for the same token.
+      const id = String(interaction.id || "");
+      const now = nowMs();
+      for (const [key, expiry] of this.seenSlashInteractions) {
+        if (expiry <= now) this.seenSlashInteractions.delete(key);
+      }
+      if (id && this.seenSlashInteractions.has(id)) return;
+      if (id) this.seenSlashInteractions.set(id, now + INBOUND_DEDUP_TTL_MS);
+      while (this.seenSlashInteractions.size > INBOUND_DEDUP_MAX) {
+        this.seenSlashInteractions.delete(this.seenSlashInteractions.keys().next().value);
+      }
       if (!await this.#authorizeInteractiveContext(interaction, context)) {
         return;
       }
+      if (!interaction.deferred && !interaction.replied) await interaction.deferReply();
       this.emitInbound(context);
       return;
     }
@@ -1379,12 +1423,12 @@ export class DiscordAdapter extends BaseAdapter {
   }
 
   async #replyEphemeral(interaction, content) {
-    const payload = { content, ephemeral: true };
-    if (interaction.deferred && !interaction.replied && typeof interaction.editReply === "function") {
-      await interaction.editReply(payload);
+    const payload = { content, flags: this.discordApi.MessageFlags?.Ephemeral ?? 64, allowedMentions: { parse: [], repliedUser: false } };
+    if (interaction.deferred && interaction.ephemeral && !interaction.replied && typeof interaction.editReply === "function") {
+      await interaction.editReply({ content, allowedMentions: payload.allowedMentions });
       return;
     }
-    if (!interaction.replied && typeof interaction.reply === "function") {
+    if (!interaction.replied && !interaction.deferred && typeof interaction.reply === "function") {
       await interaction.reply(payload);
       return;
     }

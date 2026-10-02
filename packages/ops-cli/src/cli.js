@@ -258,7 +258,7 @@ async function cmdSetup() {
     ? splitCsv((await rl.question(`Discord allowlist user IDs (csv) [${(existing.channels.discord.allowlist || []).join(",")}]: `)).trim() || (existing.channels.discord.allowlist || []).join(","))
     : [];
   const discordChannels = discordEnabled
-    ? splitCsv((await rl.question(`Discord allowed channel IDs for polling (csv) [${(existing.channels.discord.allowedChannels || []).join(",")}]: `)).trim() || (existing.channels.discord.allowedChannels || []).join(","))
+    ? splitCsv((await rl.question(`Discord allowed channel IDs (csv) [${(existing.channels.discord.allowedChannels || []).join(",")}]: `)).trim() || (existing.channels.discord.allowedChannels || []).join(","))
     : [];
 
   rl.close();

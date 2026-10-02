@@ -56,6 +56,20 @@ If `reco doctor` reports multiple daemon processes, stop the extra instance and 
 Common Discord error:
 
 - `Unknown Channel (code 10003)` means configured channel ID is wrong/inaccessible.
+- Deleted channels and missing access/permissions now produce an actionable
+  adapter error; restore bot access or update configuration and rebind.
+- Gateway readiness times out after 30 seconds instead of waiting indefinitely.
+  Check the token, Message Content Intent, and network, then restart.
+- Authorized slash commands are acknowledged before daemon work begins. A
+  deferred reply can finish after Discord's initial three-second deadline.
+
+The adapter targets discord.js 14.27.0 or newer within v14. It uses `clientReady`,
+message flags for private replies, and callback responses for reply IDs. Output
+does not trigger user, role, or everyone mentions. Deleted source messages do
+not prevent subsequent replies from being sent.
+
+References: [discord.js interaction options](https://discord.js.org/docs/packages/discord.js/14.27.0/InteractionReplyOptions:Interface),
+[Discord interaction deadlines](https://docs.discord.com/developers/interactions/receiving-and-responding).
 
 ## 5) `thread not found` in logs
 

@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 
 import { DiscordAdapter } from "../src/discord-adapter.js";
 
+let interactionCounter = 0;
+
 function createFakeClient() {
   const events = new Map();
   const channels = new Map();
@@ -37,6 +39,12 @@ function createFakeClient() {
       list.push(handler);
       events.set(event, list);
     },
+    off(event, handler) {
+      events.set(event, (events.get(event) || []).filter((entry) => entry !== handler));
+    },
+    listenerCount(event) {
+      return (events.get(event) || []).length;
+    },
     once(event, handler) {
       const wrapped = (...args) => {
         const list = events.get(event) || [];
@@ -56,7 +64,7 @@ function createFakeClient() {
     },
     async login() {
       ready = true;
-      client.emit("ready");
+      client.emit("clientReady");
       return "token";
     },
     async destroy() {
@@ -82,6 +90,7 @@ function createFakeChannel({ id, parentId = null, isDm = false } = {}) {
       embeds: payload.embeds || [],
       components: payload.components || [],
       reply: payload.reply || null,
+      allowedMentions: payload.allowedMentions,
       async edit(nextPayload = {}) {
         if (Object.prototype.hasOwnProperty.call(nextPayload, "content")) {
           record.content = String(nextPayload.content || "");
@@ -158,7 +167,7 @@ function createOptions({ subcommand = "", values = {} } = {}) {
 function createSlashInteraction({ commandName, options, channel, userId = "user-1", userName = "tester" } = {}) {
   const replies = [];
   return {
-    id: "interaction-1",
+    id: `interaction-${++interactionCounter}`,
     commandName,
     options,
     channel,
@@ -182,12 +191,17 @@ function createSlashInteraction({ commandName, options, channel, userId = "user-
       this.replied = true;
       this.responded = true;
       replies.push(payload);
-      return {
+      const message = {
         id: "reply-1",
         channelId: channel.id,
       };
+      return payload.withResponse ? { resource: { message } } : undefined;
+    },
+    async deferReply() {
+      this.deferred = true;
     },
     async editReply(payload = {}) {
+      this.replied = true;
       replies.push(payload);
       return {
         id: "reply-1",
@@ -245,6 +259,7 @@ function createComponentInteraction({
       return payload;
     },
     async update(payload = {}) {
+      this.replied = true;
       updates.push(payload);
       if (Object.prototype.hasOwnProperty.call(payload, "content")) {
         message.content = String(payload.content || "");
@@ -536,8 +551,114 @@ test("discord adapter uses interaction reply for the first slash-command respons
 
   assert.equal(interaction.replies.length, 1);
   assert.equal(interaction.replies[0].content, "Status sent.");
+  assert.equal(interaction.replies[0].withResponse, true);
+  assert.equal("fetchReply" in interaction.replies[0], false);
   assert.equal(channel.sent.length, 1);
   assert.equal(channel.sent[0].content, "Second response.");
+});
+
+test("slash commands are acknowledged before dispatch and fill the deferred reply once", async (t) => {
+  const client = createFakeClient();
+  const channel = createFakeChannel({ id: "123" });
+  client.__channels.set("123", channel);
+  const adapter = createAdapter({ client });
+  t.after(() => adapter.stop());
+  const interaction = createSlashInteraction({ commandName: "status", options: createOptions(), channel });
+  let acknowledgements = 0;
+  interaction.deferReply = async () => { acknowledgements++; interaction.deferred = true; };
+  const contextReady = new Promise((resolve) => adapter.registerInboundHandler(resolve));
+  client.emit("interactionCreate", interaction);
+  client.emit("interactionCreate", interaction);
+  const context = await contextReady;
+  assert.equal(interaction.deferred, true);
+  assert.equal(acknowledgements, 1);
+  assert.deepEqual(await adapter.sendMessage(context, "Result"), { messageId: "reply-1", chatId: "123" });
+  await adapter.sendMessage(context, "Follow-up");
+  assert.equal(interaction.replies.length, 1);
+  assert.equal(channel.sent[0].content, "Follow-up");
+});
+
+test("startup times out, removes its readiness listener, and can retry", async (t) => {
+  const client = createFakeClient();
+  const login = client.login;
+  client.login = async () => new Promise(() => {});
+  const adapter = new DiscordAdapter({ token: "test", client, allowedChannels: ["123"], startupTimeoutMs: 10, logger: { error() {} } });
+  t.after(() => adapter.stop());
+  await assert.rejects(adapter.start(), /readiness timed out/);
+  assert.equal(client.listenerCount("clientReady"), 0);
+  assert.equal(adapter.started, false);
+  client.login = login;
+  await adapter.start();
+  assert.equal(adapter.started, true);
+  assert.equal(client.listenerCount("clientReady"), 0);
+});
+
+test("failed login and stop during startup clean up readiness without hanging", async () => {
+  const client = createFakeClient();
+  client.login = async () => { throw new Error("Invalid bot token"); };
+  const adapter = createAdapter({ client });
+  await assert.rejects(adapter.start(), /Invalid bot token/);
+  assert.equal(client.listenerCount("clientReady"), 0);
+  client.login = async () => new Promise(() => {});
+  const starting = adapter.start();
+  const rejection = assert.rejects(starting, /startup canceled/);
+  await adapter.stop();
+  await rejection;
+  assert.equal(client.listenerCount("clientReady"), 0);
+  assert.equal(adapter.started, false);
+});
+
+test("permission approval buttons do not acknowledge an already-updated interaction twice", async (t) => {
+  const client = createFakeClient();
+  const channel = createFakeChannel({ id: "123" });
+  client.__channels.set("123", channel);
+  const adapter = createAdapter({ client });
+  t.after(() => adapter.stop());
+  await adapter.sendApprovalPrompt({ chatId: "123" }, {
+    localRequestId: "permission-1", kind: "item/permissions/requestApproval", summary: "Write /tmp/requested for this turn",
+  });
+  const message = channel.sent[0];
+  const contextReady = new Promise((resolve) => adapter.registerInboundHandler(resolve));
+  const interaction = createComponentInteraction({ customId: message.components[0].components[0].custom_id, channel, message });
+  client.emit("interactionCreate", interaction);
+  const context = await contextReady;
+  assert.equal(context.text, "/approve permission-1 allow");
+  await adapter.sendMessage(context, "Permission granted");
+  assert.equal(interaction.updates.length, 1);
+  assert.equal(interaction.replies.length, 0);
+  assert.equal(channel.sent[1].content, "Permission granted");
+});
+
+test("private denials use flags and never edit a publicly deferred message", async () => {
+  const client = createFakeClient();
+  const channel = createFakeChannel({ id: "123" });
+  const adapter = createAdapter({ client, authorizeInteraction: async () => false });
+  const seen = [];
+  adapter.registerInboundHandler((context) => seen.push(context));
+  for (const deferred of [false, true]) {
+    const interaction = createSlashInteraction({ commandName: "status", options: createOptions(), channel });
+    interaction.deferred = deferred;
+    interaction.editReply = async () => assert.fail("must not edit a public deferred reply");
+    client.emit("interactionCreate", interaction);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(interaction.replies[0].flags, 64);
+    assert.equal("ephemeral" in interaction.replies[0], false);
+  }
+  assert.equal(seen.length, 0);
+  await adapter.stop();
+});
+
+test("deleted channels fail clearly without blocking later sends, and deleted reply targets are optional", async () => {
+  const client = createFakeClient();
+  const channel = createFakeChannel({ id: "123" });
+  client.__channels.set("123", channel);
+  client.channels.fetch = async () => { throw Object.assign(new Error("Unknown Channel"), { code: 10003 }); };
+  const adapter = createAdapter({ client });
+  await assert.rejects(adapter.sendMessage({ chatId: "deleted" }, "Result"), /deleted or inaccessible/);
+  await adapter.sendMessage({ chatId: "123", replyToMessageId: "deleted-message" }, "@everyone <@123> Result");
+  assert.deepEqual(channel.sent[0].reply, { messageReference: "deleted-message", failIfNotExists: false });
+  assert.deepEqual(channel.sent[0].allowedMentions, { parse: [], repliedUser: false });
+  await adapter.stop();
 });
 
 test("discord adapter renders approval buttons and emits canonical approval commands", async () => {

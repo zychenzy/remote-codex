@@ -36,13 +36,13 @@ If this machine should run `reco` continuously, switch from `./reco start` to an
 
 3. Invite bot:
 - Open `OAuth2` -> `URL Generator`
-- Scope: `bot`
-- Permissions: `View Channels`, `Send Messages`, `Read Message History`
+- Scopes: `bot`, `applications.commands`
+- Permissions: `View Channels`, `Send Messages`, `Read Message History`, `Embed Links`; add `Send Messages in Threads` when using threads
 - Invite to target server
 
 4. Collect IDs:
 - Bot token
-- Text channel ID(s) where bot should poll
+- Text channel ID(s) where the bot should accept Gateway messages
 - Allowed user ID(s) for command execution
 
 Tip: enable Discord Developer Mode to copy IDs.
@@ -51,7 +51,7 @@ Tip: enable Discord Developer Mode to copy IDs.
 - `Enable Discord?` -> `y`
 - Paste Discord bot token
 - Set Discord allowlist user IDs (csv)
-- Set Discord allowed channel IDs for polling (csv)
+- Set Discord allowed channel IDs (csv)
 
 6. Optional diagnostics:
 
@@ -86,7 +86,14 @@ Allowlisted users can operate the daemon in DM without keeping a server channel 
 ./reco bind discord <dmChannelId>
 ```
 
-The daemon resolves and polls eligible DM channels at startup, so a restart is the normal way to pick up DM-binding changes.
+The adapter receives messages and interactions through the Discord Gateway,
+including uncached DM channels. It does not poll DM history. Restart after
+changing the configured channel or user allowlists.
+
+If the old bot was deleted, create a replacement and run setup with its new
+token. If only the old channel was deleted, remove its ID from configuration
+and bind an accessible channel or DM. `npm test` tests the adapter with local
+Gateway and interaction fixtures and does not require either credential.
 
 ## Recommended macOS service setup
 
