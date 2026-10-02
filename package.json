@@ -19,10 +19,14 @@
     "status": "node ./packages/ops-cli/src/cli.js status",
     "doctor": "node ./packages/ops-cli/src/cli.js doctor",
     "test": "node --test packages/*/test/*.test.js",
+    "test:app-server": "node --test packages/core-runtime/test/integration/*.test.js",
     "test:coverage": "node --experimental-test-coverage --test packages/*/test/*.test.js",
     "ci": "npm test"
   },
   "engines": {
     "node": ">=24"
+  },
+  "devDependencies": {
+    "@openai/codex": "0.160.0"
   }
 }

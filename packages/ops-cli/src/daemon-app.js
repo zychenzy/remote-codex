@@ -11,7 +11,7 @@ import {
   parseIncomingCommand,
 } from "../../im-gateway/src/index.js";
 import { StateStore } from "../../state-store/src/index.js";
-import { ApprovalBroker } from "./approval-broker.js";
+import { ApprovalBroker, decisionForMethod } from "./approval-broker.js";
 import { commandManual } from "./help-manual.js";
 import { createLogger } from "./logger.js";
 import { handleModelAndSkillsCommand } from "./model-skills-handler.js";
@@ -65,6 +65,7 @@ function supportedApprovalMethod(method) {
   return (
     method === "item/commandExecution/requestApproval" ||
     method === "item/fileChange/requestApproval" ||
+    method === "item/permissions/requestApproval" ||
     method === "item/tool/requestUserInput"
   );
 }
@@ -496,13 +497,13 @@ function goalFromResponse(response = {}) {
     return response.goal;
   }
   if (response?.goal && typeof response.goal === "object") {
-    return response.goal.text || response.goal.description || JSON.stringify(response.goal);
+    return response.goal.objective || response.goal.text || response.goal.description || JSON.stringify(response.goal);
   }
   if (typeof response?.thread?.goal === "string") {
     return response.thread.goal;
   }
   if (response?.thread?.goal && typeof response.thread.goal === "object") {
-    return response.thread.goal.text || response.thread.goal.description || JSON.stringify(response.thread.goal);
+    return response.thread.goal.objective || response.thread.goal.text || response.thread.goal.description || JSON.stringify(response.thread.goal);
   }
   return "";
 }
@@ -2740,6 +2741,7 @@ export class DaemonApp {
       cwd,
       model: overrides.model ?? binding.policyProfile.model ?? null,
       effort: overrides.effort ?? binding.policyProfile.reasoningEffort ?? null,
+      serviceTier: binding.policyProfile.serviceTier ?? null,
       collaborationMode: this.#effectiveCollaborationMode(
         binding,
         threadId,
@@ -3643,7 +3645,7 @@ export class DaemonApp {
         `Workspace: ${binding.workingDir}`,
         `Model: ${binding.policyProfile?.model || "runtime default"}`,
         `Effort: ${binding.policyProfile?.reasoningEffort || "runtime default"}`,
-        `Fast mode: ${binding.policyProfile?.reasoningEffort === "low" ? "on" : "off"}`,
+        `Fast mode: ${binding.policyProfile?.serviceTier === "priority" ? "on" : "off"}`,
         `Mode: ${binding.policyProfile?.collaborationMode || "runtime default"}`,
         `Autopilot: ${autopilot.enabled ? "on" : "off"} (${autopilot.mode || "rules"})`,
         `Autopilot continue: ${autopilot.continueOnTurnComplete ? "on" : "off"}`,
@@ -4273,11 +4275,11 @@ export class DaemonApp {
     if (command.type === "fast") {
       const action = String(command.action || "show").toLowerCase();
       if (["show", "status"].includes(action)) {
-        const enabled = binding.policyProfile?.reasoningEffort === "low";
+        const enabled = binding.policyProfile?.serviceTier === "priority";
         await this.#sendMessage(
           adapter,
           context,
-          `Fast mode is ${enabled ? "ON" : "OFF"} for this chat. Effort: ${binding.policyProfile?.reasoningEffort || "runtime default"}.`
+          `Fast mode is ${enabled ? "ON" : "OFF"} for this chat. Service tier: ${binding.policyProfile?.serviceTier || "default"}.`
         );
         return;
       }
@@ -4286,11 +4288,11 @@ export class DaemonApp {
           ...binding,
           policyProfile: {
             ...binding.policyProfile,
-            reasoningEffort: "low",
+            serviceTier: "priority",
           },
         });
         Object.assign(binding, updated);
-        await this.#sendMessage(adapter, context, "Fast mode enabled. New turns will use reasoning effort: low.");
+        await this.#sendMessage(adapter, context, "Fast mode enabled. New turns request the priority service tier (subject to account availability and pricing). Reasoning effort is unchanged.");
         return;
       }
       if (["off", "disable", "disabled"].includes(action)) {
@@ -4298,11 +4300,11 @@ export class DaemonApp {
           ...binding,
           policyProfile: {
             ...binding.policyProfile,
-            reasoningEffort: null,
+            serviceTier: null,
           },
         });
         Object.assign(binding, updated);
-        await this.#sendMessage(adapter, context, "Fast mode disabled. New turns will use the runtime default effort.");
+        await this.#sendMessage(adapter, context, "Fast mode disabled. New turns will use the default service tier. Reasoning effort is unchanged.");
         return;
       }
       await this.#sendMessage(adapter, context, "Usage: /fast <on|off|show>");
@@ -4822,6 +4824,13 @@ export class DaemonApp {
       return;
     }
 
+    if (method === "serverRequest/resolved") {
+      for (const record of this.approvalBroker.dismissServerRequest(params?.requestId, params?.threadId)) {
+        this.store.resolvePendingApproval(record.localRequestId, { decision: "canceled", actor: "runtime" });
+      }
+      return;
+    }
+
     if (method === "item/agentMessage/delta") {
       await this.#handleAgentDelta(params);
       return;
@@ -4921,6 +4930,16 @@ export class DaemonApp {
   async #handleServerRequest(serverRequest) {
     if (!supportedApprovalMethod(serverRequest.method)) {
       this.logger.warn(`unhandled server request method: ${serverRequest.method}`);
+      if (serverRequest.method === "mcpServer/elicitation/request") {
+        await this.runtime.respondServerRequest(serverRequest.id, { action: "decline", content: null });
+      } else if (serverRequest.method === "item/tool/call") {
+        await this.runtime.respondServerRequest(serverRequest.id, {
+          success: false,
+          contentItems: [{ type: "inputText", text: "Dynamic tools are not implemented by this daemon." }],
+        });
+      } else {
+        await this.runtime.respondServerError(serverRequest.id);
+      }
       return;
     }
 
@@ -4928,7 +4947,7 @@ export class DaemonApp {
     const bKey = threadId ? this.threadToBinding.get(threadId) : null;
     if (!bKey) {
       this.logger.warn(`no binding found for server request on thread ${threadId || "unknown"}`);
-      await this.runtime.respondServerRequest(serverRequest.id, { decision: "decline" });
+      await this.runtime.respondServerRequest(serverRequest.id, decisionForMethod(serverRequest.method, "deny"));
       return;
     }
 
@@ -4937,7 +4956,7 @@ export class DaemonApp {
     const adapter = this.#getAdapter(channel);
 
     if (!binding || !adapter) {
-      await this.runtime.respondServerRequest(serverRequest.id, { decision: "decline" });
+      await this.runtime.respondServerRequest(serverRequest.id, decisionForMethod(serverRequest.method, "deny"));
       return;
     }
 
@@ -4948,7 +4967,9 @@ export class DaemonApp {
     const created = this.approvalBroker.create({
       serverRequest,
       binding,
-      autoApprove: Boolean(binding.policyProfile?.autoApprove) || threadScopedAutoApprove,
+      // New permission grants always require an explicit operator decision.
+      autoApprove: serverRequest.method !== "item/permissions/requestApproval"
+        && (Boolean(binding.policyProfile?.autoApprove) || threadScopedAutoApprove),
       // Owner of this request: the user bound to this chat. The broker rejects
       // resolutions from a different user unless overrideOwnership is set.
       initiatorUserId: binding.userId || null,
@@ -4973,7 +4994,10 @@ export class DaemonApp {
 
     const isToolInputRequest = serverRequest.method === "item/tool/requestUserInput";
     const questions = isToolInputRequest ? requestUserInputQuestions(serverRequest.params) : [];
-    const approvalSummary = serverRequest.params?.reason || serverRequest.params?.command || (isToolInputRequest ? "tool input required" : "");
+    let approvalSummary = serverRequest.params?.reason || serverRequest.params?.command || (isToolInputRequest ? "tool input required" : "");
+    if (serverRequest.method === "item/permissions/requestApproval") {
+      approvalSummary = `${approvalSummary || "Additional permissions requested"}\nCwd: ${serverRequest.params?.cwd || "unknown"}\nTurn-scoped grant:\n${JSON.stringify(serverRequest.params?.permissions || {}, null, 2)}`;
+    }
 
     this.store.createPendingApproval({
       ...created.record,

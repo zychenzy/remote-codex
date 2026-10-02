@@ -81,7 +81,7 @@ rl.on("line", (line) => {
     send({
       id: msg.id,
       result: {
-        threads: [...threads.values()].map((t) => ({ id: t.id, cwd: t.cwd || process.cwd(), status: { type: "idle" } })),
+        data: [...threads.values()].map((t) => ({ id: t.id, cwd: t.cwd || process.cwd(), status: { type: "idle" } })),
         nextCursor: null,
       },
     });
@@ -196,7 +196,11 @@ rl.on("line", (line) => {
       send({ id: msg.id, error: { code: -32600, message: "thread not found" } });
       return;
     }
-    const goal = msg.params?.goal || null;
+    if (!msg.params?.objective) {
+      send({ id: msg.id, error: { code: -32602, message: "objective is required for a new goal" } });
+      return;
+    }
+    const goal = { threadId: id, objective: msg.params.objective, status: "active", tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0 };
     threads.get(id).goal = goal;
     send({ id: msg.id, result: { goal } });
     send({ method: "thread/goal/updated", params: { threadId: id, goal } });
@@ -217,6 +221,10 @@ rl.on("line", (line) => {
 
   if (method === "turn/start") {
     const threadId = msg.params?.threadId;
+    if (msg.params?.collaborationMode && !msg.params.collaborationMode.settings?.model) {
+      send({ id: msg.id, error: { code: -32602, message: "collaborationMode.settings.model is required" } });
+      return;
+    }
     if (typeof msg.params?.collaborationMode === "string") {
       send({
         id: msg.id,

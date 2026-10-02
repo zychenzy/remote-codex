@@ -33,7 +33,7 @@ function normalizeDecision(decision) {
   return decision === "allow" ? "allow" : "deny";
 }
 
-function decisionForMethod(method, decision, payload) {
+export function decisionForMethod(method, decision, payload, params = {}) {
   const normalized = normalizeDecision(decision);
 
   if (method === "item/commandExecution/requestApproval") {
@@ -50,6 +50,10 @@ function decisionForMethod(method, decision, payload) {
 
   if (method === "item/tool/requestUserInput") {
     return normalized === "allow" ? parseToolInputPayload(payload) : { answers: {} };
+  }
+
+  if (method === "item/permissions/requestApproval") {
+    return { permissions: normalized === "allow" ? (params.permissions || {}) : {}, scope: "turn" };
   }
 
   return {
@@ -128,7 +132,7 @@ export class ApprovalBroker extends EventEmitter {
     this.pending.delete(entry.record.localRequestId);
 
     const normalized = normalizeDecision(decision);
-    const response = decisionForMethod(entry.record.method, normalized, payload);
+    const response = decisionForMethod(entry.record.method, normalized, payload, entry.record.params);
     const resolution = {
       localRequestId: entry.record.localRequestId,
       decision: normalized,
@@ -152,6 +156,18 @@ export class ApprovalBroker extends EventEmitter {
 
   listPending() {
     return [...this.pending.values()].map((entry) => entry.record);
+  }
+
+  dismissServerRequest(requestId, threadId) {
+    const dismissed = [];
+    for (const [id, entry] of this.pending) {
+      if (entry.record.serverRequestId !== requestId
+        || (threadId && entry.record.params?.threadId !== threadId)) continue;
+      clearTimeout(entry.timer);
+      this.pending.delete(id);
+      dismissed.push(entry.record);
+    }
+    return dismissed;
   }
 
   clearAll() {

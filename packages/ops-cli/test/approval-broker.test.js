@@ -3,6 +3,39 @@ import assert from "node:assert/strict";
 
 import { ApprovalBroker } from "../src/approval-broker.js";
 
+test("permission grants are limited to requested permissions and the current turn", () => {
+  const broker = new ApprovalBroker();
+  const permissions = { network: { enabled: true }, fileSystem: { write: ["/tmp/project"] } };
+  for (const decision of ["allow", "deny"]) {
+    const { record } = broker.create({
+      serverRequest: { id: decision, method: "item/permissions/requestApproval", params: { permissions } },
+      binding: {}, initiatorUserId: "owner",
+    });
+    assert.deepEqual(broker.resolve(record.localRequestId, { decision, actor: "stranger" }), { notOwner: true });
+    const result = broker.resolve(record.localRequestId, { decision, actor: "owner", payload: '{"permissions":{"network":{"enabled":true}},"scope":"session"}' });
+    assert.deepEqual(result.response, { permissions: decision === "allow" ? permissions : {}, scope: "turn" });
+  }
+});
+
+test("expired permission requests grant nothing", async () => {
+  const broker = new ApprovalBroker({ timeoutMs: 10 });
+  const resolved = new Promise((resolve) => broker.once("resolved", resolve));
+  broker.create({ serverRequest: { id: 1, method: "item/permissions/requestApproval", params: { permissions: { network: { enabled: true } } } }, binding: {} });
+  assert.deepEqual((await resolved).response, { permissions: {}, scope: "turn" });
+});
+
+test("server-resolved requests are dismissed without replying or timing out again", async () => {
+  const broker = new ApprovalBroker({ timeoutMs: 10 });
+  let resolutions = 0;
+  broker.on("resolved", () => resolutions++);
+  const { record } = broker.create({ serverRequest: { id: 1, method: "item/tool/requestUserInput", params: { threadId: "t" } }, binding: {} });
+  assert.deepEqual(broker.dismissServerRequest(1, "other"), []);
+  assert.deepEqual(broker.dismissServerRequest(1, "t"), [record]);
+  assert.equal(broker.resolve(record.localRequestId, { decision: "allow" }), null);
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(resolutions, 0);
+});
+
 test("approval broker resolves pending request once", async () => {
   const broker = new ApprovalBroker({ timeoutMs: 5000 });
 

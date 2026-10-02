@@ -34,7 +34,10 @@ function normalizeCollaborationMode(collaborationMode, { model = null, effort = 
     return null;
   }
   if (typeof collaborationMode === "object") {
-    return collaborationMode;
+    return {
+      ...collaborationMode,
+      settings: { model, reasoning_effort: effort, developer_instructions: null, ...collaborationMode.settings },
+    };
   }
   const mode = String(collaborationMode || "").trim();
   if (!mode) {
@@ -87,6 +90,8 @@ export class AppServerRuntime {
     this.manualStop = false;
     this.reconnectTimer = null;
     this.reconnectAttempts = 0;
+    this.threadModels = new Map();
+    this.initializePromise = null;
   }
 
   on(event, handler) {
@@ -99,8 +104,20 @@ export class AppServerRuntime {
     if (this.initialized) {
       return;
     }
+    if (this.initializePromise) {
+      return this.initializePromise;
+    }
+    const rpc = this.rpc;
+    this.initializePromise = this.#initializeRpc(rpc);
+    try {
+      await this.initializePromise;
+    } finally {
+      this.initializePromise = null;
+    }
+  }
 
-    await this.rpc.request("initialize", {
+  async #initializeRpc(rpc) {
+    await rpc.request("initialize", {
       clientInfo: {
         name: "im-codex-tool",
         title: "IM Codex Tool",
@@ -110,7 +127,7 @@ export class AppServerRuntime {
         experimentalApi: true,
       },
     });
-    this.rpc.notify("initialized");
+    rpc.notify("initialized");
     this.initialized = true;
     this.events.emit("ready", { initialized: true });
   }
@@ -124,23 +141,34 @@ export class AppServerRuntime {
     serviceName = null,
     persistExtendedHistory = null,
     dynamicTools = null,
+    ephemeral = null,
+    serviceTier = undefined,
   } = {}) {
     await this.initialize();
-    return this.rpc.request("thread/start", pickDefined({
-      cwd,
-      approvalPolicy,
-      sandbox,
-      model,
-      personality,
-      serviceName,
-      persistExtendedHistory,
-      dynamicTools,
-    }));
+    const response = await this.rpc.request("thread/start", {
+      ...pickDefined({
+        cwd,
+        approvalPolicy,
+        sandbox,
+        model,
+        personality,
+        serviceName,
+        dynamicTools,
+        ephemeral,
+        // persistExtendedHistory is retained as a public argument for older
+        // callers, but the current wire protocol no longer accepts the field.
+      }),
+      ...(serviceTier !== undefined ? { serviceTier } : {}),
+    });
+    if (response.model) this.threadModels.set(response.thread.id, response.model);
+    return response;
   }
 
   async resumeThread(threadId, overrides = {}) {
     await this.initialize();
-    return this.rpc.request("thread/resume", pickDefined({ threadId, ...overrides }));
+    const response = await this.rpc.request("thread/resume", pickDefined({ threadId, ...overrides }));
+    if (response.model) this.threadModels.set(threadId, response.model);
+    return response;
   }
 
   async startTurn({
@@ -155,22 +183,34 @@ export class AppServerRuntime {
     sandboxPolicy = null,
     outputSchema = null,
     summary = null,
+    serviceTier = undefined,
   } = {}) {
     await this.initialize();
-    const normalizedCollaborationMode = normalizeCollaborationMode(collaborationMode, { model, effort });
-    return this.rpc.request("turn/start", pickDefined({
-      threadId,
-      input: Array.isArray(input) ? input : toTextInput(String(input || "")),
-      approvalPolicy,
-      cwd,
-      model,
-      effort,
-      collaborationMode: normalizedCollaborationMode,
-      personality,
-      sandboxPolicy,
-      outputSchema,
-      summary,
-    }));
+    let modeModel = collaborationMode?.settings?.model || model || this.threadModels.get(threadId);
+    if (collaborationMode && !modeModel) {
+      const models = await this.listModels();
+      modeModel = models.data?.find((entry) => entry.isDefault)?.model;
+      if (!modeModel) throw new Error("Collaboration mode requires a model; select one with /model set.");
+    }
+    const normalizedCollaborationMode = normalizeCollaborationMode(collaborationMode, { model: modeModel, effort });
+    const response = await this.rpc.request("turn/start", {
+      ...pickDefined({
+        threadId,
+        input: Array.isArray(input) ? input : toTextInput(String(input || "")),
+        approvalPolicy,
+        cwd,
+        model,
+        effort,
+        collaborationMode: normalizedCollaborationMode,
+        personality,
+        sandboxPolicy,
+        outputSchema,
+        summary,
+      }),
+      ...(serviceTier !== undefined ? { serviceTier } : {}),
+    });
+    if (modeModel) this.threadModels.set(threadId, modeModel);
+    return response;
   }
 
   async steerTurn({ threadId, expectedTurnId, input } = {}) {
@@ -263,9 +303,12 @@ export class AppServerRuntime {
     return this.rpc.request("thread/goal/get", { threadId });
   }
 
-  async setThreadGoal({ threadId, goal } = {}) {
+  async setThreadGoal({ threadId, goal, objective = goal, status, tokenBudget } = {}) {
     await this.initialize();
-    return this.rpc.request("thread/goal/set", { threadId, goal });
+    return this.rpc.request("thread/goal/set", {
+      ...pickDefined({ threadId, objective, status }),
+      ...(tokenBudget !== undefined ? { tokenBudget } : {}),
+    });
   }
 
   async clearThreadGoal(threadId) {
@@ -326,7 +369,6 @@ export class AppServerRuntime {
   }
 
   async respondServerRequest(requestId, result) {
-    await this.initialize();
     this.#sendLine(
       JSON.stringify({
         jsonrpc: "2.0",
@@ -334,6 +376,10 @@ export class AppServerRuntime {
         result,
       })
     );
+  }
+
+  async respondServerError(requestId, { code = -32601, message = "Unsupported server request" } = {}) {
+    this.#sendLine(JSON.stringify({ id: requestId, error: { code, message } }));
   }
 
   // H4-core: graceful stop. Sends SIGTERM, awaits the child's "close" with a
@@ -395,6 +441,7 @@ export class AppServerRuntime {
     // initialize response).
     this.buffer = "";
     this.initialized = false;
+    this.threadModels.clear();
 
     if (this.launchSpec.description) {
       this.logger?.log?.(`spawning app-server: ${this.launchSpec.description}`);

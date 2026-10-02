@@ -145,8 +145,9 @@ class FakeRuntime {
   }
 
   async setThreadGoal({ threadId, goal }) {
-    this.goals.set(threadId, goal);
-    return { goal };
+    const value = { threadId, objective: goal, status: "active" };
+    this.goals.set(threadId, value);
+    return { goal: value };
   }
 
   async clearThreadGoal(threadId) {
@@ -177,6 +178,10 @@ class FakeRuntime {
 
   async respondServerRequest(requestId, result) {
     this.serverResponses.push({ requestId, result });
+  }
+
+  async respondServerError(requestId, error = { code: -32601 }) {
+    this.serverResponses.push({ requestId, error });
   }
 }
 
@@ -1805,8 +1810,9 @@ test("daemon /status includes auth inheritance note", async () => {
   assert.equal(adapter.messages.some((item) => item.text.includes("Auth mode: inherited from current Codex login state")), true);
 });
 
-test("daemon /fast toggles low reasoning effort", async () => {
-  const { app, adapter } = await setupDaemonHarness();
+test("daemon /fast toggles priority service tier without changing reasoning effort", async () => {
+  const { app, adapter, runtime } = await setupDaemonHarness();
+  app.store.upsertBinding({ ...app.store.getBinding("discord", "chat-1"), policyProfile: { reasoningEffort: "high" } });
   try {
     adapter.emitInbound({
       channel: "discord",
@@ -1816,7 +1822,12 @@ test("daemon /fast toggles low reasoning effort", async () => {
     });
     await sleep(50);
 
-    assert.equal(app.store.getBinding("discord", "chat-1").policyProfile.reasoningEffort, "low");
+    assert.equal(app.store.getBinding("discord", "chat-1").policyProfile.serviceTier, "priority");
+    assert.equal(app.store.getBinding("discord", "chat-1").policyProfile.reasoningEffort, "high");
+    adapter.emitInbound({ channel: "discord", chatId: "chat-1", userId: "user-1", text: "/ask hello" });
+    await sleep(50);
+    assert.equal(runtime.startTurnCalls[0].serviceTier, "priority");
+    assert.equal(runtime.startTurnCalls[0].effort, "high");
 
     adapter.emitInbound({
       channel: "discord",
@@ -1829,7 +1840,8 @@ test("daemon /fast toggles low reasoning effort", async () => {
     await app.stop();
   }
 
-  assert.equal(app.store.getBinding("discord", "chat-1").policyProfile.reasoningEffort, null);
+  assert.equal(app.store.getBinding("discord", "chat-1").policyProfile.reasoningEffort, "high");
+  assert.equal(app.store.getBinding("discord", "chat-1").policyProfile.serviceTier, null);
   assert.equal(adapter.messages.some((item) => item.text.includes("Fast mode enabled")), true);
   assert.equal(adapter.messages.some((item) => item.text.includes("Fast mode disabled")), true);
 });
@@ -1870,6 +1882,59 @@ test("daemon /goal and /usage use app-server account and goal APIs", async () =>
   assert.equal(adapter.messages.some((item) => item.text.includes("Weekly limit")), true);
   assert.equal(adapter.messages.some((item) => item.text.includes("75% left")), true);
   assert.equal(adapter.messages.some((item) => item.text.includes("```")), true);
+});
+
+test("daemon routes permission requests to manual approval even with auto-approve enabled", async () => {
+  const { app, runtime, adapter } = await setupDaemonHarness();
+  app.store.upsertBinding({ ...app.store.getBinding("discord", "chat-1"), policyProfile: { autoApprove: true } });
+  try {
+    const permissions = { fileSystem: { write: ["/tmp/requested"] } };
+    runtime.emit("serverRequest", { id: 901, method: "item/permissions/requestApproval", params: { threadId: "thread-1", turnId: "turn-1", cwd: "/tmp", permissions } });
+    await sleep(30);
+    assert.equal(runtime.serverResponses.length, 0);
+    assert.equal(adapter.approvalPrompts.length, 1);
+    const pending = app.approvalBroker.listPending()[0];
+    assert.ok(pending);
+    assert.match(JSON.stringify(adapter.approvalPrompts[0]), /\/tmp\/requested/);
+    app.approvalBroker.resolve(pending.localRequestId, { decision: "allow", actor: "user-1" });
+    await sleep(30);
+    assert.deepEqual(runtime.serverResponses[0], { requestId: 901, result: { permissions, scope: "turn" } });
+  } finally {
+    await app.stop();
+  }
+});
+
+test("daemon declines unbound requests with method-specific payloads and answers unsupported requests", async () => {
+  const { app, runtime } = await setupDaemonHarness();
+  try {
+    const methods = ["item/permissions/requestApproval", "item/tool/requestUserInput", "mcpServer/elicitation/request", "item/tool/call", "future/request"];
+    for (const [id, method] of methods.entries()) {
+      runtime.emit("serverRequest", { id, method, params: { threadId: "unbound" } });
+    }
+    await sleep(30);
+    assert.deepEqual(runtime.serverResponses[0].result, { permissions: {}, scope: "turn" });
+    assert.deepEqual(runtime.serverResponses[1].result, { answers: {} });
+    assert.deepEqual(runtime.serverResponses[2].result, { action: "decline", content: null });
+    assert.equal(runtime.serverResponses[3].result.success, false);
+    assert.equal(runtime.serverResponses[4].error.code, -32601);
+  } finally {
+    await app.stop();
+  }
+});
+
+test("daemon removes runtime-resolved approval prompts without sending a stale response", async () => {
+  const { app, runtime } = await setupDaemonHarness();
+  try {
+    runtime.emit("serverRequest", { id: 902, method: "item/tool/requestUserInput", params: { threadId: "thread-1", questions: [] } });
+    await sleep(30);
+    assert.equal(app.approvalBroker.listPending().length, 1);
+    runtime.emit("notification", { method: "serverRequest/resolved", params: { threadId: "thread-1", requestId: 902 } });
+    await sleep(30);
+    assert.equal(app.approvalBroker.listPending().length, 0);
+    assert.equal(runtime.serverResponses.length, 0);
+  } finally {
+    await app.stop();
+  }
 });
 
 test("daemon supports thread naming and requirements diagnostics", async () => {

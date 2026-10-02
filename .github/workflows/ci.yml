@@ -37,3 +37,6 @@ jobs:
 
       - name: Run tests
         run: npm test
+
+      - name: Test pinned app-server without Discord or API credentials
+        run: npm run test:app-server

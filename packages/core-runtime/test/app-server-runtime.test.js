@@ -27,8 +27,8 @@ test("runtime can initialize, start thread, and list threads", async () => {
   assert.ok(started.thread.id.startsWith("thread-"));
 
   const list = await runtime.listThreads({ limit: 10 });
-  assert.equal(Array.isArray(list.threads), true);
-  assert.equal(list.threads.length >= 1, true);
+  assert.equal(Array.isArray(list.data), true);
+  assert.equal(list.data.length >= 1, true);
 
   await runtime.stop();
 });
@@ -68,6 +68,28 @@ test("runtime encodes string collaborationMode as structured payload", async () 
   await runtime.stop();
 });
 
+test("runtime resolves collaboration model from thread and shares concurrent initialization", async (t) => {
+  const runtime = buildRuntime();
+  t.after(() => runtime.stop());
+  await Promise.all([runtime.initialize(), runtime.initialize(), runtime.initialize()]);
+  const { thread } = await runtime.startThread({ cwd: process.cwd() });
+  const turn = await runtime.startTurn({ threadId: thread.id, input: "plan this", collaborationMode: "plan" });
+  assert.ok(turn.turn.id);
+});
+
+test("runtime preserves explicit nulls that clear service tiers and goal budgets", async () => {
+  const runtime = new AppServerRuntime();
+  runtime.initialize = async () => {};
+  const calls = [];
+  runtime.rpc = { request: async (method, params) => { calls.push({ method, params }); return { turn: { id: "turn" } }; } };
+  await runtime.startTurn({ threadId: "t", input: "hi", serviceTier: "priority" });
+  await runtime.startTurn({ threadId: "t", input: "hi", serviceTier: null });
+  await runtime.setThreadGoal({ threadId: "t", goal: "Goal", tokenBudget: null });
+  assert.equal(calls[0].params.serviceTier, "priority");
+  assert.equal(calls[1].params.serviceTier, null);
+  assert.deepEqual(calls[2].params, { threadId: "t", objective: "Goal", tokenBudget: null });
+});
+
 test("runtime exposes extended thread, review, model, and skills wrappers", async () => {
   const runtime = buildRuntime();
   await runtime.initialize();
@@ -97,10 +119,10 @@ test("runtime exposes extended thread, review, model, and skills wrappers", asyn
   assert.equal(named.thread.name, "Release checklist");
 
   const setGoal = await runtime.setThreadGoal({ threadId, goal: "Ship the daemon" });
-  assert.equal(setGoal.goal, "Ship the daemon");
+  assert.equal(setGoal.goal.objective, "Ship the daemon");
 
   const goal = await runtime.getThreadGoal(threadId);
-  assert.equal(goal.goal, "Ship the daemon");
+  assert.equal(goal.goal.objective, "Ship the daemon");
 
   const clearedGoal = await runtime.clearThreadGoal(threadId);
   assert.deepEqual(clearedGoal, {});

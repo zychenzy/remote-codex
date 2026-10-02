@@ -375,6 +375,9 @@ export class StateStore {
       reasoningEffort: hasPolicyField("reasoningEffort")
         ? (incomingPolicy.reasoningEffort ?? null)
         : (existing.policyProfile?.reasoningEffort ?? null),
+      serviceTier: hasPolicyField("serviceTier")
+        ? (incomingPolicy.serviceTier ?? null)
+        : (existing.policyProfile?.serviceTier ?? null),
       collaborationMode: hasPolicyField("collaborationMode")
         ? (incomingPolicy.collaborationMode ?? null)
         : (existing.policyProfile?.collaborationMode ?? null),

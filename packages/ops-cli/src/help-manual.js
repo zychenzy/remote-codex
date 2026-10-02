@@ -24,7 +24,7 @@ const GENERAL_MANUAL = [
   "/answer [requestId] <questionId>=<answer>[;<questionId>=<answer>] - reply to tool user-input prompts.",
   "/autopilot <on|off|status|continue on|continue off|mode ...> - unattended helper.",
   "/plan <on|off|show> - quick collaboration mode toggle (plan/default).",
-  "/fast <on|off|show> - quick effort toggle (on uses low effort).",
+  "/fast <on|off|show> - priority service tier toggle; keeps reasoning effort unchanged.",
   "/goal [goal text] - set the current app-server thread goal; show/clear manage it.",
   "/usage - show ChatGPT quota windows reported by app-server.",
   "/requirements - show app-server policy requirements.",
@@ -229,7 +229,7 @@ const TOPIC_GROUPS = [
     lines: [
       "/fast <on|off|show>",
       "Convenience toggle for lower-latency turns.",
-      "on => set sticky reasoning effort to low, off => restore runtime default effort.",
+      "on => request priority service tier, off => restore default tier. Reasoning effort is unchanged.",
       "Examples: /fast on, /fast show, /fast off",
     ],
   },

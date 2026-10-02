@@ -69,6 +69,10 @@ Reference projects are kept in `ref/` for lookup only.
 - `codex` CLI installed and authenticated (`codex login`)
 - Discord bot credentials
 
+Discord credentials are needed for deployment, but not for development tests.
+The compatibility test pins Codex CLI `0.160.0`; see the
+[October 2026 compatibility review](references/app-server-compatibility.md).
+
 ## Install
 
 ```bash
@@ -178,6 +182,12 @@ Useful IM commands:
 - `/autopilot status`
 - `/autopilot continue`
 
+`/fast on` requests Codex's priority service tier without changing reasoning
+effort. Availability and pricing depend on the account/provider. `/fast off`
+clears that override. Older versions used this command to set low reasoning
+effort; existing effort preferences are preserved, so use `/model effort` to
+change them separately.
+
 ## CLI Commands
 
 Core:
@@ -252,9 +262,27 @@ Override base dir with `IM_CODEX_HOME`.
 
 - `npm test` (node test runner)
 - `npm run test:coverage`
+- `npm run test:app-server` (real pinned app-server, local inference fixture)
 - `npm run ci` (tests)
 
-GitHub Actions CI runs tests on Node 24/25.
+GitHub Actions CI runs both unit and app-server integration tests on Node 24.
+
+To test without a Discord bot or channel:
+
+```bash
+npm ci
+npm test
+npm run test:app-server
+```
+
+The integration test starts the installed development dependency's app-server
+with a temporary home and workspace, and serves deterministic model responses
+on a random loopback port. It needs no Codex login, API key, Discord credentials,
+or paid inference. It checks handshake, goals, plan/default modes, service-tier
+reset, streamed turns, a server tool request/reply, history, and restart/resume.
+The unit suite separately tests the daemon, approvals, allowlists, and Discord
+adapter using local fixtures. Live Discord access and live model entitlement
+are not covered by these tests.
 
 ## Development
 

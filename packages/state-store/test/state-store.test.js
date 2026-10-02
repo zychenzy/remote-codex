@@ -132,6 +132,7 @@ test("upsert binding preserves extended policy fields on partial updates", () =>
       autoApprove: false,
       model: "gpt-5.4",
       reasoningEffort: "high",
+      serviceTier: "priority",
       collaborationMode: "default",
       autopilot: {
         enabled: true,
@@ -162,6 +163,7 @@ test("upsert binding preserves extended policy fields on partial updates", () =>
   assert.deepEqual(binding.policyProfile.allowlist, ["u1", "u2"]);
   assert.equal(binding.policyProfile.model, "gpt-5.4");
   assert.equal(binding.policyProfile.reasoningEffort, "high");
+  assert.equal(binding.policyProfile.serviceTier, "priority");
   assert.equal(binding.policyProfile.collaborationMode, "default");
   assert.equal(binding.policyProfile.autopilot.enabled, true);
   assert.equal(binding.policyProfile.skillsContext.cwd, "/tmp");
@@ -179,6 +181,7 @@ test("upsert binding supports explicit clearing of nullable policy fields", () =
       model: "gpt-5.4",
       reasoningEffort: "high",
       collaborationMode: "plan",
+      serviceTier: "priority",
       skillsContext: { cwd: "/tmp" },
     },
   });
@@ -190,6 +193,7 @@ test("upsert binding supports explicit clearing of nullable policy fields", () =
       model: null,
       reasoningEffort: null,
       collaborationMode: null,
+      serviceTier: null,
       skillsContext: null,
     },
   });
@@ -198,6 +202,7 @@ test("upsert binding supports explicit clearing of nullable policy fields", () =
   assert.equal(binding.policyProfile.model, null);
   assert.equal(binding.policyProfile.reasoningEffort, null);
   assert.equal(binding.policyProfile.collaborationMode, null);
+  assert.equal(binding.policyProfile.serviceTier, null);
   assert.equal(binding.policyProfile.skillsContext, null);
 });
 

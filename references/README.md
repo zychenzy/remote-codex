@@ -7,3 +7,4 @@ Primary operator docs:
 - [usage.md](usage.md): daily operator workflows, autopilot, and service operation
 - [troubleshooting.md](troubleshooting.md): diagnostics and recovery playbook
 - [token-validation.md](token-validation.md): channel token validation behavior
+- [app-server-compatibility.md](app-server-compatibility.md): October 2026 upgrade, local tests, and related projects

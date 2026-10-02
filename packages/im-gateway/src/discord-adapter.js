@@ -428,6 +428,7 @@ export class DiscordAdapter extends BaseAdapter {
     if (
       approvalRequest?.kind === "item/commandExecution/requestApproval"
       || approvalRequest?.kind === "item/fileChange/requestApproval"
+      || approvalRequest?.kind === "item/permissions/requestApproval"
     ) {
       await this.sendMessageRich(context, this.#buildApprovalPromptPayload(context, approvalRequest));
       return;
